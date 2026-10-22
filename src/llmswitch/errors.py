@@ -13,6 +13,8 @@ Classes:
     TimeOutError: Raised when a request times out.
     EmbeddingGenerationError: Raised for embedding generation errors.
     ChatCompletionError: Raised for chat completion errors.
+    ResponsesError: Raised for Responses API errors.
+    ResponseNotFoundError: Raised when a Responses API object is not found by id.
 
 Constants:
     _error_registry: Maps error class names to their classes for lookup.
@@ -106,6 +108,32 @@ class ConfigurationError(LLMSwitchError):
 
     def __init__(self, message: str, **context: Any) -> None:
         super().__init__(message=message, **context)
+
+
+class InvalidResponseRequestError(LLMSwitchError):
+    """Raised when a Responses create request violates the client contract."""
+    status_code = 400
+    error_code = "E_INVALID_RESPONSE_REQUEST"
+
+    def __init__(self, message: str, provider: Optional[str] = None) -> None:
+        super().__init__(message=message, provider=provider)
+
+
+class UnsupportedCapabilityError(LLMSwitchError):
+    """Raised when an explicitly unsupported provider capability is requested."""
+    status_code = 501
+    error_code = "E_UNSUPPORTED_CAPABILITY"
+
+    def __init__(self, *, provider: str, feature: str, model: Optional[str] = None,
+                 api_version: Optional[str] = None) -> None:
+        target = f" for model/deployment '{model}'" if model else ""
+        super().__init__(
+            message=f"Provider '{provider}' does not support Responses capability '{feature}'{target}.",
+            provider=provider,
+            feature=feature,
+            model=model,
+            api_version=api_version,
+        )
 
 
 class ModelNotFoundError(LLMSwitchError):
@@ -254,6 +282,52 @@ class ChatCompletionError(LLMSwitchError):
             status_code=status_code,
             provider=provider,
             user_id=user_id
+        )
+
+
+class ResponsesError(LLMSwitchError):
+    """Raised when a generic error occurs during a Responses API operation."""
+    status_code = 500
+    error_code = "E_RESPONSES"
+
+    def __init__(self, message: str, status_code: Optional[int] = None,
+                 provider: Optional[str] = None, user_id: Optional[str] = None,
+                 operation: Optional[str] = None) -> None:
+        """
+        Args:
+            message (str): Error message.
+            status_code (Optional[int]): HTTP status code.
+            provider (Optional[str]): Provider name.
+            user_id (Optional[str]): User identifier.
+            operation (Optional[str]): Responses operation that failed (create, retrieve, …).
+        """
+        super().__init__(
+            message=f"{message}",
+            status_code=status_code,
+            provider=provider,
+            user_id=user_id,
+            operation=operation,
+        )
+
+
+class ResponseNotFoundError(LLMSwitchError):
+    """Raised when a Responses API object cannot be found by id."""
+    status_code = 404
+    error_code = "E_RESPONSE_NOT_FOUND"
+
+    def __init__(self, response_id: str, provider: Optional[str] = None,
+                 user_id: Optional[str] = None) -> None:
+        """
+        Args:
+            response_id (str): The response identifier that was not found.
+            provider (Optional[str]): Provider name.
+            user_id (Optional[str]): User identifier.
+        """
+        super().__init__(
+            message=f"Response '{response_id}' not found.",
+            response_id=response_id,
+            provider=provider,
+            user_id=user_id,
         )
 
 

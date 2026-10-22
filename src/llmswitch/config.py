@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validat
 RESERVED_CLIENT_OPTIONS = frozenset({
     "api_key", "api_version", "azure_endpoint", "azure_deployment", "base_url", "endpoint",
     "organization", "project", "timeout", "credential", "credentials", "location",
-    "vertexai", "http_options",
+    "vertexai", "http_options", "responses_api_version",
 })
 
 
@@ -33,6 +33,14 @@ class BaseLLMConfig(BaseModel):
     )
     timeout: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False,
                                      description="Request timeout in seconds")
+    responses_capabilities: dict[str, bool] = Field(
+        default_factory=dict,
+        description="Per-feature Responses API overrides; False rejects a feature before dispatch",
+    )
+    mcp_policy: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Explicit policy required before remote MCP or connector tools are sent",
+    )
     client_options: Optional[dict[str, Any]] = Field(
         default=None,
         description="Extra keyword arguments passed to the native SDK client constructor, "
@@ -66,6 +74,10 @@ class AzureOpenAIConfig(BaseLLMConfig):
     endpoint: str = Field(..., min_length=1, description="Azure OpenAI resource endpoint")
     api_version: str = Field(..., min_length=1, description="Azure OpenAI API version")
     deployment_name: str = Field(..., min_length=1, description="Azure OpenAI deployment name")
+    responses_api_version: Optional[str] = Field(
+        default=None,
+        description="API version for responses.* calls; overrides api_version for the Responses API only",
+    )
 
 
 class AzureFoundryConfig(BaseLLMConfig):

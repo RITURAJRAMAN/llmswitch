@@ -14,12 +14,16 @@ from .common import (
     build_config,
     map_chat_error,
     map_embedding_error,
+    map_responses_error,
     normalize_embedding_input,
+    prepare_responses_create,
+    prepare_responses_management,
     provider_kwargs,
     resolve_model,
+    responses_provider_class,
     validate_messages,
 )
-from .registry import CHAT_PROVIDER_REGISTRY, EMBEDDING_PROVIDER_REGISTRY
+from .registry import CHAT_PROVIDER_REGISTRY, EMBEDDING_PROVIDER_REGISTRY, RESPONSES_PROVIDER_REGISTRY
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +103,7 @@ class LLMSwitch:
         self._providers: dict[type, Any] = {}
         self.chat = _Chat(self)
         self.embeddings = _Embeddings(self)
+        self.responses = _Responses(self)
 
     def __repr__(self) -> str:
         return f"LLMSwitch(provider={self.config.provider!r}, model={self.config.model!r})"
@@ -124,6 +129,98 @@ class LLMSwitch:
             if callable(close_fn):
                 close_fn()
         self._providers.clear()
+
+
+class _ResponseInputItems:
+    def __init__(self, responses: "_Responses") -> None:
+        self._responses = responses
+
+    def list(self, response_id: str, **kwargs: Any) -> Any:
+        return self._responses._call("list_input_items", response_id, **kwargs)
+
+
+class _ResponseInputTokens:
+    def __init__(self, responses: "_Responses") -> None:
+        self._responses = responses
+
+    def count(self, **kwargs: Any) -> Any:
+        return self._responses._call("count_input_tokens", **kwargs)
+
+
+class _Conversations:
+    def __init__(self, responses: "_Responses") -> None:
+        self._responses = responses
+
+    def create(self, items: Any = None, **kwargs: Any) -> Any:
+        return self._responses._call("create_conversation", items, **kwargs)
+
+    def retrieve(self, conversation_id: str, **kwargs: Any) -> Any:
+        return self._responses._call("retrieve_conversation", conversation_id, **kwargs)
+
+    def update(self, conversation_id: str, **kwargs: Any) -> Any:
+        return self._responses._call("update_conversation", conversation_id, **kwargs)
+
+    def delete(self, conversation_id: str, **kwargs: Any) -> Any:
+        return self._responses._call("delete_conversation", conversation_id, **kwargs)
+
+    def list_items(self, conversation_id: str, **kwargs: Any) -> Any:
+        return self._responses._call("list_conversation_items", conversation_id, **kwargs)
+
+    def retrieve_item(self, conversation_id: str, item_id: str, **kwargs: Any) -> Any:
+        return self._responses._call("retrieve_conversation_item", conversation_id, item_id, **kwargs)
+
+    def delete_item(self, conversation_id: str, item_id: str, **kwargs: Any) -> Any:
+        return self._responses._call("delete_conversation_item", conversation_id, item_id, **kwargs)
+
+
+class _Responses:
+    """OpenAI-style ``responses`` namespace. Supported for openai and azure_openai."""
+
+    def __init__(self, client: "LLMSwitch") -> None:
+        self._client = client
+        self.input_items = _ResponseInputItems(self)
+        self.input_tokens = _ResponseInputTokens(self)
+        self.conversations = _Conversations(self)
+
+    def create(self, input: Any = None, stream: bool = False, **kwargs: Any) -> Any:  # noqa: A002
+        """Create a model response. With ``stream=True`` returns a generator of response events."""
+        config = self._client.config
+        provider_cls = responses_provider_class(config, RESPONSES_PROVIDER_REGISTRY)
+        prepare_responses_create(config, input, kwargs)
+        provider = self._client._provider(provider_cls)
+        try:
+            return provider.create(input, stream=stream, **kwargs)
+        except Exception as exc:
+            raise map_responses_error(exc, config, "create") from exc
+
+    def stream(self, input: Any = None, **kwargs: Any) -> Any:  # noqa: A002
+        return self.create(input, stream=True, **kwargs)
+
+    def parse(self, input: Any = None, text_format: Any = None, **kwargs: Any) -> Any:  # noqa: A002
+        """Structured output. Pass a Pydantic model class as ``text_format``."""
+        return self.create(input, stream=False, text_format=text_format, **kwargs)
+
+    def retrieve(self, response_id: str, **kwargs: Any) -> Any:
+        return self._call("retrieve", response_id, **kwargs)
+
+    def delete(self, response_id: str, **kwargs: Any) -> Any:
+        return self._call("delete", response_id, **kwargs)
+
+    def cancel(self, response_id: str, **kwargs: Any) -> Any:
+        return self._call("cancel", response_id, **kwargs)
+
+    def compact(self, **kwargs: Any) -> Any:
+        return self._call("compact", **kwargs)
+
+    def _call(self, operation: str, *args: Any, **kwargs: Any) -> Any:
+        config = self._client.config
+        provider_cls = responses_provider_class(config, RESPONSES_PROVIDER_REGISTRY)
+        prepare_responses_management(config, operation, kwargs)
+        provider = self._client._provider(provider_cls)
+        try:
+            return getattr(provider, operation)(*args, **kwargs)
+        except Exception as exc:
+            raise map_responses_error(exc, config, operation) from exc
 
 
 class _Chat:

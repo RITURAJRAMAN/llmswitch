@@ -48,6 +48,7 @@ from ..structured import (
     pydantic_to_response_format,
     unmapped_provider_fields,
 )
+from ._responses_base import AsyncResponsesProviderMixin, SyncResponsesProviderMixin
 from ._shared import (
     audio_from,
     build_openai_usage,
@@ -587,3 +588,27 @@ def _openai_client_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     if kwargs.get("timeout") is not None:
         client_kwargs["timeout"] = kwargs["timeout"]
     return client_kwargs
+
+
+class OpenAIResponsesProvider(SyncResponsesProviderMixin):
+    """Native OpenAI Responses API provider (``client.responses.*``)."""
+
+    provider_name = "openai"
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.endpoint: Optional[str] = kwargs.get("endpoint")
+        self.model: Optional[str] = kwargs.get("deployment_name") or kwargs.get("model")
+        self.timeout: Optional[float] = kwargs.get("timeout")
+        self.client: OpenAI = OpenAI(**merge_client_options(_openai_client_kwargs(kwargs), kwargs.get("client_options")))
+
+
+class AsyncOpenAIResponsesProvider(AsyncResponsesProviderMixin):
+    """Async native OpenAI Responses API provider (``client.responses.*``)."""
+
+    provider_name = "openai"
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.endpoint: Optional[str] = kwargs.get("endpoint")
+        self.model: Optional[str] = kwargs.get("deployment_name") or kwargs.get("model")
+        self.timeout: Optional[float] = kwargs.get("timeout")
+        self.client: AsyncOpenAI = AsyncOpenAI(**merge_client_options(_openai_client_kwargs(kwargs), kwargs.get("client_options")))

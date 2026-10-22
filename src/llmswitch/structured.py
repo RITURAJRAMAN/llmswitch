@@ -7,7 +7,9 @@ surface, plus JSON normalization for provider SDK objects.
 Contents:
     - is_pydantic_model_class: detect ``response_format=MyModel`` (.parse() style).
     - pydantic_to_response_format: build a strict OpenAI-style json_schema dict.
+    - pydantic_to_text_format: build the Responses API ``text.format`` block.
     - deserialize_to_model / populate_parsed: best-effort deserialize into a model.
+    - populate_response_parsed: same, for a unified Responses ``Response``.
     - to_jsonable: recursively normalize provider SDK objects to JSON-safe values.
 
 """
@@ -120,7 +122,8 @@ def is_pydantic_model_class(obj: Any) -> bool:
     True when ``obj`` is a Pydantic ``BaseModel`` *subclass* (not an instance).
 
     This is the signal that a caller passed ``response_format=MyModel`` (the
-    class itself, OpenAI ``.parse()`` style) rather than a plain dict. Providers branch on this to deserialize the model
+    class itself, OpenAI ``.parse()`` style) rather than a ``ResponseFormat``
+    object or a plain dict. Providers branch on this to deserialize the model
     output into ``message.parsed``.
     """
     return isinstance(obj, type) and issubclass(obj, BaseModel)
@@ -194,6 +197,28 @@ def pydantic_to_response_format(model_cls: type[BaseModel]) -> dict[str, Any]:
     }
 
 
+@lru_cache(maxsize=256)
+def pydantic_to_text_format(model_cls: type[BaseModel]) -> dict[str, Any]:
+    """
+    Build the Responses API ``text`` parameter from a Pydantic model class.
+
+    The Responses API takes ``text={"format": {"type": "json_schema", "name": ...,
+    "schema": ..., "strict": ...}}`` — a flattened shape, unlike Chat Completions'
+    nested ``response_format.json_schema``. This reuses the same strict-schema
+    transform and reshapes it.
+    """
+    response_format = pydantic_to_response_format(model_cls)
+    json_schema = response_format.get("json_schema") or {}
+    return {
+        "format": {
+            "type": "json_schema",
+            "name": json_schema.get("name", model_cls.__name__),
+            "schema": json_schema.get("schema", model_cls.model_json_schema()),
+            "strict": json_schema.get("strict", False),
+        }
+    }
+
+
 def deserialize_to_model(model_cls: type[BaseModel], content: Any) -> Optional[BaseModel]:
     """
     Best-effort deserialize a JSON string / dict into ``model_cls``.
@@ -244,3 +269,24 @@ def populate_parsed(chat_completion: Any, model_cls: type[BaseModel]) -> Any:
         if parsed is not None:
             message.parsed = parsed
     return chat_completion
+
+
+def populate_response_parsed(response: Any, model_cls: type[BaseModel]) -> Any:
+    """
+    Fill ``item.parsed`` on a unified Responses ``Response`` when the provider
+    did not return a natively parsed object.
+
+    Deserializes each message item's concatenated ``output_text`` into
+    ``model_cls``, falling back to a function-call item's ``arguments``.
+    Mutates and returns the same object.
+    """
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "parsed", None) is not None:
+            continue
+        if getattr(item, "type", None) == "message":
+            parsed = deserialize_to_model(model_cls, item.text)
+        else:
+            parsed = deserialize_to_model(model_cls, getattr(item, "arguments", None))
+        if parsed is not None:
+            item.parsed = parsed
+    return response

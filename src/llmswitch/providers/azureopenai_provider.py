@@ -51,6 +51,7 @@ from ..structured import (
     to_jsonable,
     unmapped_provider_fields,
 )
+from ._responses_base import AsyncResponsesProviderMixin, SyncResponsesProviderMixin
 from ._shared import (
     audio_from,
     build_openai_usage,
@@ -597,3 +598,83 @@ class AsyncAzureOpenAIChatProvider(BaseChatProvider):
         finally:
             if stream is not None:
                 await close_async_stream(stream)
+
+
+# Azure exposes /responses only from this API version onward; older versions 404.
+MIN_RESPONSES_API_VERSION = "2025-03-01-preview"
+
+
+def _resolve_responses_api_version(kwargs: dict) -> str:
+    """
+    Pick the api-version for the Responses client.
+
+    ``responses_api_version`` wins when set, so a client can keep an older
+    api-version for chat while still reaching /responses. Otherwise the
+    configured api-version is used, upgraded to the minimum supported one when
+    it predates the Responses API.
+    """
+    override = kwargs.get("responses_api_version")
+    if override:
+        return override
+    api_version = kwargs.get("api_version")
+    if not api_version:
+        return MIN_RESPONSES_API_VERSION
+    if api_version.replace("-preview", "") < MIN_RESPONSES_API_VERSION.replace("-preview", ""):
+        logger.warning(
+            "api_version %s predates the Azure Responses API; using %s for responses.* calls. "
+            "Set responses_api_version to override.", api_version, MIN_RESPONSES_API_VERSION)
+        return MIN_RESPONSES_API_VERSION
+    return api_version
+
+
+class AzureOpenAIResponsesProvider(SyncResponsesProviderMixin):
+    """Azure OpenAI Responses API provider (``client.responses.*``)."""
+
+    provider_name = "azure_openai"
+
+    def __init__(self, **kwargs) -> None:
+        self.endpoint = kwargs.get("endpoint")
+        self.deployment_name = kwargs.get("deployment_name")
+        self.api_version = _resolve_responses_api_version(kwargs)
+        # Azure routes by deployment, so the deployment name is the effective model id.
+        self.model = self.deployment_name or kwargs.get("model")
+        self.timeout = kwargs.get("timeout")
+        self.client = AzureOpenAI(**merge_client_options({
+            "api_key": kwargs.get("api_key"),
+            "api_version": self.api_version,
+            "azure_endpoint": self.endpoint,
+            "azure_deployment": self.deployment_name,
+            "max_retries": 0,
+            "timeout": kwargs.get("timeout"),
+        }, kwargs.get("client_options")))
+
+    def _build_kwargs(self, input: Any, kwargs: dict[str, Any]) -> dict[str, Any]:  # noqa: A002
+        payload = super()._build_kwargs(input, kwargs)
+        payload["model"] = self.deployment_name or self.model
+        return payload
+
+
+class AsyncAzureOpenAIResponsesProvider(AsyncResponsesProviderMixin):
+    """Async Azure OpenAI Responses API provider (``client.responses.*``)."""
+
+    provider_name = "azure_openai"
+
+    def __init__(self, **kwargs) -> None:
+        self.endpoint = kwargs.get("endpoint")
+        self.deployment_name = kwargs.get("deployment_name")
+        self.api_version = _resolve_responses_api_version(kwargs)
+        self.model = self.deployment_name or kwargs.get("model")
+        self.timeout = kwargs.get("timeout")
+        self.client = AsyncAzureOpenAI(**merge_client_options({
+            "api_key": kwargs.get("api_key"),
+            "api_version": self.api_version,
+            "azure_endpoint": self.endpoint,
+            "azure_deployment": self.deployment_name,
+            "max_retries": 0,
+            "timeout": kwargs.get("timeout"),
+        }, kwargs.get("client_options")))
+
+    def _build_kwargs(self, input: Any, kwargs: dict[str, Any]) -> dict[str, Any]:  # noqa: A002
+        payload = super()._build_kwargs(input, kwargs)
+        payload["model"] = self.deployment_name or self.model
+        return payload

@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llmswitch-sdk"
-version = "0.1.0"
-description = "One Python client for chat completions and embeddings across OpenAI, Azure OpenAI, Azure AI Foundry, Anthropic and Vertex AI."
+version = "0.1.1"
+description = "One Python client for chat completions, embeddings and the Responses API across OpenAI, Azure OpenAI, Azure AI Foundry, Anthropic and Vertex AI."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "Rituraj Raman" }]
-keywords = ["llm", "openai", "azure", "anthropic", "vertex-ai", "embeddings", "chat-completions"]
+keywords = ["llm", "openai", "azure", "anthropic", "vertex-ai", "embeddings", "chat-completions", "responses-api"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",

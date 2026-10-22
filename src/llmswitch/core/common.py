@@ -19,6 +19,12 @@ from ..errors import (
     ConfigurationError,
     EmbeddingGenerationError,
     LLMSwitchError,
+    ResponsesError,
+)
+from .responses_capabilities import (
+    normalize_response_tool_definitions,
+    validate_response_operation,
+    validate_responses_create_request,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,6 +99,7 @@ def provider_kwargs(config: Any) -> dict[str, Any]:
         "timeout": getattr(config, "timeout", None),
         "enable_prompt_caching": getattr(config, "enable_prompt_caching", None),
         "client_options": getattr(config, "client_options", None),
+        "responses_api_version": getattr(config, "responses_api_version", None),
     }
 
 
@@ -120,3 +127,50 @@ def map_embedding_error(exc: Exception, config: Any) -> LLMSwitchError:
         return AuthenticationError(provider=config.provider)
     return EmbeddingGenerationError(str(exc), status_code=getattr(exc, "status_code", 500),
                                     provider=config.provider)
+
+
+RESPONSES_FEATURES = {
+    "list_input_items": "input_items.list",
+    "count_input_tokens": "input_tokens.count",
+    "create_conversation": "conversations.create",
+    "retrieve_conversation": "conversations.retrieve",
+    "update_conversation": "conversations.update",
+    "delete_conversation": "conversations.delete",
+    "list_conversation_items": "conversations.items.list",
+    "retrieve_conversation_item": "conversations.items.retrieve",
+    "delete_conversation_item": "conversations.items.delete",
+}
+
+
+def responses_provider_class(config: Any, registry: dict[str, type]) -> type:
+    provider_cls = registry.get(config.provider)
+    if provider_cls is None:
+        raise ResponsesError(f"Provider '{config.provider}' does not support the Responses API",
+                             status_code=501, provider=config.provider)
+    return provider_cls
+
+
+def prepare_responses_create(config: Any, input: Any, kwargs: dict[str, Any]) -> None:  # noqa: A002
+    """Validate and normalize a create request in place, before dispatch."""
+    validate_responses_create_request(config, input, kwargs)
+    normalize_response_tool_definitions(kwargs)
+    resolve_model(config, kwargs)
+
+
+def prepare_responses_management(config: Any, operation: str, kwargs: dict[str, Any]) -> None:
+    """Check a management verb is allowed for this target and drop the model where the API has none."""
+    validate_response_operation(config, RESPONSES_FEATURES.get(operation, operation))
+    if operation != "count_input_tokens":
+        kwargs.pop("model", None)
+
+
+def map_responses_error(exc: Exception, config: Any, operation: str) -> LLMSwitchError:
+    if isinstance(exc, LLMSwitchError):
+        return exc
+    if isinstance(exc, ValueError):
+        return ResponsesError(str(exc), status_code=400, provider=config.provider)
+    if isinstance(exc, ConnectionError):
+        return APIConnectionError(config.endpoint, provider=config.provider)
+    if isinstance(exc, PermissionError):
+        return AuthenticationError(provider=config.provider)
+    return ResponsesError(str(exc), status_code=getattr(exc, "status_code", 500), provider=config.provider)

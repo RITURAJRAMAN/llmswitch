@@ -1,20 +1,20 @@
 # llmswitch
 
-One Python client for chat completions and embeddings across OpenAI, Azure OpenAI,
-Azure AI Foundry, Anthropic and Vertex AI. Switch providers by changing the constructor
+One Python client for chat completions, embeddings and the Responses API across OpenAI,
+Azure OpenAI, Azure AI Foundry, Anthropic and Vertex AI. Switch providers by changing the constructor
 arguments; the call sites stay the same.
 
-Supported in 0.1.0: synchronous and asynchronous chat completions (including streaming and
-structured output) and embeddings.
+Supported in 0.1.1: synchronous and asynchronous chat completions (including streaming and
+structured output), embeddings, and the Responses API for OpenAI and Azure OpenAI.
 
 ## Installation
 
 ```bash
-pip install llmswitch-sdk                  # core: OpenAI and Azure OpenAI
-pip install "llmswitch-sdk[anthropic]"       # adds Anthropic
-pip install "llmswitch-sdk[azure-foundry]"   # adds Azure AI Foundry
-pip install "llmswitch-sdk[vertexai]"        # adds Vertex AI
-pip install "llmswitch-sdk[all]"             # every provider
+pip install llmswitch-sdk                    # core: OpenAI and Azure OpenAI
+pip install "llmswitch-sdk[anthropic]"        # adds Anthropic
+pip install "llmswitch-sdk[azure-foundry]"    # adds Azure AI Foundry
+pip install "llmswitch-sdk[vertexai]"         # adds Vertex AI
+pip install "llmswitch-sdk[all]"              # every provider
 ```
 
 Requires Python 3.11 or later.
@@ -146,8 +146,60 @@ Options that the unified constructor sets itself are rejected with a `Configurat
 `organization`, `project`, `timeout`, `credential`, `credentials`, `location`, `vertexai`
 and `http_options`. Use the unified argument for those instead.
 
-Per-call keyword arguments are passed to the provider request unchanged, so provider-specific
-parameters such as `seed`, `top_k` or `extra_body` can be given on `create()`.
+For chat completions and embeddings, per-call keyword arguments are passed to the provider request
+unchanged, so provider-specific parameters such as `seed`, `top_k` or `extra_body` can be given on
+`create()`. Responses requests are validated first, as described below.
+
+## Responses API
+
+The Responses API is available through `client.responses` for `openai` and `azure_openai`:
+
+```python
+from pydantic import BaseModel
+
+client = LLMSwitch(provider="openai", api_key="sk-...", model="gpt-4o")
+
+reply = client.responses.create(input="Summarize the llmswitch README in one line.")
+print(reply.output_text)
+
+for event in client.responses.stream(input="Write a haiku about Python."):
+    if event.type == "response.output_text.delta":
+        print(event.delta, end="")
+
+class City(BaseModel):
+    name: str
+    country: str
+
+parsed = client.responses.parse(input="Largest city in Japan?", text_format=City)
+print(parsed.output_parsed)
+```
+
+Other calls: `retrieve(response_id)`, `delete(response_id)`, `cancel(response_id)`,
+`compact()`, `input_items.list(response_id)`, `input_tokens.count()`, and `conversations`.
+
+Which of these calls work depends on the model and endpoint. Token counting and the conversations
+API are provided by the service and may return an error for a given deployment. `compact()` also
+depends on the service. Errors from the service are raised as `ResponsesError` with the service's
+message.
+
+Responses requests are checked before they are sent. Unknown request fields raise
+`InvalidResponseRequestError`. Remote MCP servers and connectors are rejected unless the client
+allows them, for example:
+
+```python
+client = LLMSwitch(
+    provider="openai",
+    api_key="sk-...",
+    model="gpt-4o",
+    mcp_policy={"enabled": True, "allowed_server_labels": ["docs"]},
+)
+```
+
+Azure OpenAI calls to `/responses` need API version `2025-03-01-preview` or later. Older
+`api_version` values are raised to the minimum automatically. Set `responses_api_version` to choose
+a different version for Responses calls only.
+
+Other providers raise `ResponsesError` with status 501 for Responses calls.
 
 ## Errors
 
@@ -156,6 +208,7 @@ All errors derive from `LLMSwitchError`:
 - `ConfigurationError`: invalid or missing constructor settings.
 - `ChatCompletionError`, `EmbeddingGenerationError`: provider failures. `status_code` carries the HTTP status when known.
 - `AuthenticationError`, `APIConnectionError`, `RateLimitExceededError`, `TimeOutError`, `ContentFilterError`, `ModelNotFoundError`, `InvalidResponseError`.
+- `ResponsesError`: Responses API failures and unsupported providers. `InvalidResponseRequestError` for invalid Responses requests, `UnsupportedCapabilityError` for features turned off for the target.
 
 Calling an operation a provider does not support (for example embeddings on `anthropic`)
 raises `LLMSwitchError` before any request is sent.
@@ -169,7 +222,7 @@ pytest
 ruff check src tests
 ```
 
-The tests use mocks and do not contact any provider. Live tests are not part of 0.1.0.
+The tests use mocks and do not contact any provider.
 
 ## License
 

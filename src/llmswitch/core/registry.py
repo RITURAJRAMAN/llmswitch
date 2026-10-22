@@ -10,30 +10,40 @@ from __future__ import annotations
 CHAT_PROVIDER_REGISTRY: dict[str, type] = {}
 ASYNC_CHAT_PROVIDER_REGISTRY: dict[str, type] = {}
 EMBEDDING_PROVIDER_REGISTRY: dict[str, type] = {}
+RESPONSES_PROVIDER_REGISTRY: dict[str, type] = {}
+ASYNC_RESPONSES_PROVIDER_REGISTRY: dict[str, type] = {}
 
 try:
     from ..providers.openai_provider import (
         AsyncOpenAIChatProvider,
+        AsyncOpenAIResponsesProvider,
         OpenAIChatProvider,
         OpenAIEmbeddingProvider,
+        OpenAIResponsesProvider,
     )
 
     CHAT_PROVIDER_REGISTRY["openai"] = OpenAIChatProvider
     ASYNC_CHAT_PROVIDER_REGISTRY["openai"] = AsyncOpenAIChatProvider
     EMBEDDING_PROVIDER_REGISTRY["openai"] = OpenAIEmbeddingProvider
+    RESPONSES_PROVIDER_REGISTRY["openai"] = OpenAIResponsesProvider
+    ASYNC_RESPONSES_PROVIDER_REGISTRY["openai"] = AsyncOpenAIResponsesProvider
 except ImportError:
     pass
 
 try:
     from ..providers.azureopenai_provider import (
         AsyncAzureOpenAIChatProvider,
+        AsyncAzureOpenAIResponsesProvider,
         AzureOpenAIChatProvider,
         AzureOpenAIEmbeddingProvider,
+        AzureOpenAIResponsesProvider,
     )
 
     CHAT_PROVIDER_REGISTRY["azure_openai"] = AzureOpenAIChatProvider
     ASYNC_CHAT_PROVIDER_REGISTRY["azure_openai"] = AsyncAzureOpenAIChatProvider
     EMBEDDING_PROVIDER_REGISTRY["azure_openai"] = AzureOpenAIEmbeddingProvider
+    RESPONSES_PROVIDER_REGISTRY["azure_openai"] = AzureOpenAIResponsesProvider
+    ASYNC_RESPONSES_PROVIDER_REGISTRY["azure_openai"] = AsyncAzureOpenAIResponsesProvider
 except ImportError:
     pass
 

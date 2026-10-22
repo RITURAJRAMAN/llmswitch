@@ -9,6 +9,9 @@ both providers.
 Provider-specific fields (Azure's ``content_filter_results`` and message
 ``context``) stay in the provider modules; only the identical OpenAI-shaped
 mapping lives here.
+
+Also hosts the Responses API mappers and the OpenAI SDK exception translator
+used by both providers' chat and Responses surfaces.
 """
 
 
@@ -18,6 +21,14 @@ import inspect
 import math
 from typing import Any, Optional, overload
 
+from ..errors import (
+    APIConnectionError,
+    AuthenticationError,
+    InvalidResponseError,
+    RateLimitExceededError,
+    ResponseNotFoundError,
+    TimeOutError,
+)
 from ..models import (
     ChatCompletionAudio,
     ChatCompletionMessageToolCall,
@@ -25,12 +36,26 @@ from ..models import (
     ChoiceDeltaToolCall,
     ChoiceDeltaToolCallFunction,
     ChoiceLogprobs,
+    CompactedResponse,
     CompletionTokensDetails,
     CompletionUsage,
+    Conversation,
+    ConversationDeleted,
     Function,
+    InputTokenCountResponse,
     PromptTokensDetails,
+    Response,
+    ResponseDeleted,
+    ResponseItem,
+    ResponseItemList,
+    ResponseOutputItem,
+    ResponseStreamEvent,
+    ResponseUsage,
     TopLogprob,
+    response_output_item_from_data,
+    response_stream_event_from_data,
 )
+from ..structured import provider_extensions_for, provider_extensions_from_raw, to_jsonable
 
 
 def merge_client_options(defaults: dict[str, Any], client_options: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -81,6 +106,192 @@ def configured_timeout_seconds(timeout: Any, default: int = 60) -> int:
         return max(1, int(math.ceil(timeout_value)))
     except (TypeError, ValueError):
         return default
+
+
+def translate_openai_error(exc: Exception, endpoint: Optional[str], provider: str,
+                           error_cls: type, operation: Optional[str] = None,
+                           timeout_seconds: Any = None,
+                           resource_id: Optional[str] = None) -> Exception:
+    """
+    Translate an OpenAI SDK exception into the library's typed error hierarchy.
+
+    ``error_cls`` is the surface-specific fallback (``ChatCompletionError`` for
+    chat, ``ResponsesError`` for the Responses API) so the same mapping serves
+    both without collapsing their error codes.
+    """
+    import openai
+
+    kwargs: dict[str, Any] = {"provider": provider}
+    if operation is not None:
+        kwargs["operation"] = operation
+
+    if isinstance(exc, openai.RateLimitError):
+        return RateLimitExceededError(get_retry_after_seconds(exc))
+    if isinstance(exc, openai.AuthenticationError):
+        return AuthenticationError(provider=provider)
+    if isinstance(exc, openai.APITimeoutError):
+        return TimeOutError(configured_timeout_seconds(timeout_seconds))
+    if isinstance(exc, openai.NotFoundError) and resource_id:
+        return ResponseNotFoundError(resource_id, provider=provider)
+    if isinstance(exc, openai.BadRequestError):
+        return error_cls(str(exc), status_code=400, **kwargs)
+    if isinstance(exc, openai.APIConnectionError | ConnectionError):
+        return APIConnectionError(endpoint or "https://api.openai.com", provider=provider)
+    if isinstance(exc, PermissionError):
+        return AuthenticationError(provider=provider)
+    if isinstance(exc, ValueError):
+        return InvalidResponseError(str(exc), provider=provider)
+    return error_cls(str(exc), status_code=getattr(exc, "status_code", 500), **kwargs)
+
+
+def _attach_provider_extensions(model: Any, provider: str, raw: Any, mapped_fields: set[str]) -> Any:
+    extensions = provider_extensions_from_raw(provider, raw, mapped_fields)
+    if hasattr(model, "extensions"):
+        model.extensions = extensions
+    return model
+
+
+def build_response_usage(usage: Any) -> Optional[ResponseUsage]:
+    """Map an SDK ``ResponseUsage`` to the unified :class:`ResponseUsage`."""
+    if usage is None:
+        return None
+    return ResponseUsage.model_validate(to_jsonable(usage))
+
+
+def map_response_output(output: Any, provider: str = "openai") -> list[ResponseOutputItem]:
+    """Map an SDK response ``output`` array to unified output items."""
+    items: list[ResponseOutputItem] = []
+    for raw in output or []:
+        data = to_jsonable(raw)
+        if not isinstance(data, dict):
+            continue
+        item = response_output_item_from_data(data)
+        _attach_provider_extensions(item, provider, data, set(type(item).model_fields))
+        # ``parsed`` is a live Pydantic instance from .parse() and must not be JSON-flattened.
+        parsed = getattr(raw, "parsed", None)
+        if parsed is None:
+            for part in getattr(raw, "content", None) or []:
+                parsed = getattr(part, "parsed", None)
+                if parsed is not None:
+                    break
+        if parsed is not None:
+            item.parsed = parsed
+        items.append(item)
+    return items
+
+
+def map_response(response: Any, provider: str = "openai") -> Response:
+    """Map an SDK ``Response`` to the unified :class:`Response`."""
+    data = to_jsonable(response)
+    if not isinstance(data, dict):
+        raise InvalidResponseError("Responses API returned a non-object payload")
+    raw_output = getattr(response, "output", None)
+    raw_usage = getattr(response, "usage", None)
+    if isinstance(response, dict):
+        raw_output = data.get("output")
+        raw_usage = data.get("usage")
+    extensions = provider_extensions_from_raw(
+        provider,
+        response,
+        set(Response.model_fields) | {"output", "usage"},
+    )
+    data.pop("output", None)
+    data.pop("usage", None)
+    mapped = Response.model_validate(data)
+    mapped.output = map_response_output(raw_output, provider=provider)
+    mapped.usage = build_response_usage(raw_usage)
+    mapped.extensions = extensions
+    return mapped
+
+
+def map_compacted_response(response: Any, provider: str = "openai") -> CompactedResponse:
+    """Map an SDK ``CompactedResponse`` to the unified model."""
+    data = to_jsonable(response)
+    if not isinstance(data, dict):
+        raise InvalidResponseError("responses.compact returned a non-object payload")
+    extensions = provider_extensions_from_raw(
+        provider,
+        response,
+        set(CompactedResponse.model_fields) | {"output", "usage"},
+    )
+    data.pop("output", None)
+    data.pop("usage", None)
+    mapped = CompactedResponse.model_validate(data)
+    mapped.output = map_response_output(getattr(response, "output", None), provider=provider)
+    mapped.usage = build_response_usage(getattr(response, "usage", None))
+    mapped.extensions = extensions
+    return mapped
+
+
+def map_response_item(item: Any, provider: str = "openai") -> ResponseItem:
+    """Map a single SDK response item to the unified :class:`ResponseItem`."""
+    data = to_jsonable(item)
+    if not isinstance(data, dict):
+        raise InvalidResponseError("Responses API returned a non-object item payload")
+    mapped = ResponseItem.model_validate(data)
+    return _attach_provider_extensions(mapped, provider, data, set(ResponseItem.model_fields))
+
+
+def map_response_item_page(page: Any, provider: str = "openai") -> ResponseItemList:
+    """Map an SDK ``SyncCursorPage[ResponseItem]`` to a unified :class:`ResponseItemList`."""
+    raw_items = getattr(page, "data", None) or []
+    items = [map_response_item(i, provider=provider) for i in raw_items]
+    mapped = ResponseItemList(
+        object=getattr(page, "object", "list") or "list",
+        data=items,
+        first_id=getattr(page, "first_id", None),
+        last_id=getattr(page, "last_id", None),
+        has_more=bool(getattr(page, "has_more", False)),
+    )
+    return _attach_provider_extensions(mapped, provider, page, set(ResponseItemList.model_fields))
+
+
+def map_input_token_count(count: Any, provider: str = "openai") -> InputTokenCountResponse:
+    """Map an SDK ``InputTokenCountResponse`` to the unified model."""
+    mapped = InputTokenCountResponse.model_validate(to_jsonable(count))
+    return _attach_provider_extensions(mapped, provider, count, set(InputTokenCountResponse.model_fields))
+
+
+def map_response_deleted(deleted: Any, response_id: str, provider: str = "openai") -> ResponseDeleted:
+    """Map an SDK delete result (which may be ``None``) to :class:`ResponseDeleted`."""
+    data = to_jsonable(deleted)
+    if isinstance(data, dict) and data.get("id"):
+        mapped = ResponseDeleted.model_validate(data)
+        return _attach_provider_extensions(mapped, provider, data, set(ResponseDeleted.model_fields))
+    return ResponseDeleted(id=response_id, deleted=True, extensions=provider_extensions_for(provider))
+
+
+def map_conversation(conversation: Any, provider: str = "openai") -> Conversation:
+    """Map an SDK conversation object to the unified model."""
+    mapped = Conversation.model_validate(to_jsonable(conversation))
+    return _attach_provider_extensions(mapped, provider, conversation, set(Conversation.model_fields))
+
+
+def map_conversation_deleted(deleted: Any, conversation_id: str, provider: str = "openai") -> ConversationDeleted:
+    """Map an SDK conversation delete result, including SDK variants returning None."""
+    data = to_jsonable(deleted)
+    if isinstance(data, dict) and data.get("id"):
+        mapped = ConversationDeleted.model_validate(data)
+        return _attach_provider_extensions(mapped, provider, data, set(ConversationDeleted.model_fields))
+    return ConversationDeleted(id=conversation_id, deleted=True, extensions=provider_extensions_for(provider))
+
+
+def map_response_stream_event(event: Any, provider: str = "openai") -> ResponseStreamEvent:
+    """Map an SDK streaming event to the unified :class:`ResponseStreamEvent`."""
+    data = to_jsonable(event)
+    if not isinstance(data, dict):
+        return ResponseStreamEvent(
+            type="unknown",
+            delta=data,
+            extensions=provider_extensions_for(provider),
+        )
+    nested = data.pop("response", None)
+    mapped = response_stream_event_from_data(data)
+    _attach_provider_extensions(mapped, provider, data, set(type(mapped).model_fields))
+    if nested is not None:
+        raw_response = getattr(event, "response", None)
+        mapped.response = map_response(raw_response if raw_response is not None else nested, provider=provider)
+    return mapped
 
 
 def build_openai_usage(usage: Any) -> CompletionUsage:
