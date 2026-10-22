@@ -1,0 +1,1 @@
+DEFAULT_ANTHROPIC_MODEL = "claude-opus-4-5"
