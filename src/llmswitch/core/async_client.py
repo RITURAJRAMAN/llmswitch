@@ -14,7 +14,6 @@ import asyncio
 import logging
 from typing import Any
 
-from ..errors import LLMSwitchError
 from .common import (
     build_config,
     map_chat_error,
@@ -23,6 +22,7 @@ from .common import (
     normalize_embedding_input,
     prepare_responses_create,
     prepare_responses_management,
+    provider_class,
     provider_kwargs,
     resolve_model,
     responses_provider_class,
@@ -48,10 +48,7 @@ class _AsyncChatCompletions:
         """
         config = self._client.config
         validate_messages(messages)
-        provider_cls = ASYNC_CHAT_PROVIDER_REGISTRY.get(config.provider)
-        if provider_cls is None:
-            raise LLMSwitchError(f"Unsupported provider for async chat completion: {config.provider}",
-                                 provider=config.provider)
+        provider_cls = provider_class(config.provider, ASYNC_CHAT_PROVIDER_REGISTRY, "async chat completion")
         if stream:
             kwargs.setdefault("stream_options", {"include_usage": True})
         resolve_model(config, kwargs)
@@ -74,10 +71,7 @@ class _AsyncEmbeddings:
         """Create embeddings without blocking the event loop."""
         config = self._client.config
         inputs = normalize_embedding_input(input)
-        provider_cls = EMBEDDING_PROVIDER_REGISTRY.get(config.provider)
-        if provider_cls is None:
-            raise LLMSwitchError(f"Unsupported provider for embeddings: {config.provider}",
-                                 provider=config.provider)
+        provider_cls = provider_class(config.provider, EMBEDDING_PROVIDER_REGISTRY, "embeddings")
         resolve_model(config, kwargs)
         provider = self._client._provider(provider_cls)
         try:

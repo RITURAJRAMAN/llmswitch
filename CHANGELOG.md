@@ -19,6 +19,12 @@ All notable changes to this project are documented here. The format follows
 - `responses_api_version` for Azure OpenAI, which overrides the API version used for Responses calls.
 - Responses tool helpers: `WebSearchTool`, `FileSearchTool`, `CodeInterpreterTool`, `ImageGenerationTool`, `ComputerTool`, `McpTool`, `ConnectorTool` and `McpApprovalDecision`.
 - Response models and error types: `Response`, `ResponseStreamEvent`, `ResponsesError`, `InvalidResponseRequestError`, `UnsupportedCapabilityError` and `ResponseNotFoundError`.
+- A provider whose SDK fails to import now reports the import error and the upgrade command, instead of "Unsupported provider".
+
+### Changed
+
+- All provider SDKs are installed by default. `pip install llmswitch-sdk` now installs the Anthropic, Azure AI Inference, aiohttp and Google GenAI SDKs along with OpenAI.
+- The `anthropic`, `azure-foundry`, `vertexai` and `all` extras are kept as empty groups so existing install commands keep working.
 
 ## [0.1.0] - 2026-10-22
 

@@ -10,14 +10,14 @@ structured output), embeddings, and the Responses API for OpenAI and Azure OpenA
 ## Installation
 
 ```bash
-pip install llmswitch-sdk                    # core: OpenAI and Azure OpenAI
-pip install "llmswitch-sdk[anthropic]"        # adds Anthropic
-pip install "llmswitch-sdk[azure-foundry]"    # adds Azure AI Foundry
-pip install "llmswitch-sdk[vertexai]"         # adds Vertex AI
-pip install "llmswitch-sdk[all]"              # every provider
+pip install llmswitch-sdk
 ```
 
-Requires Python 3.11 or later.
+This installs every supported provider SDK: OpenAI, Azure OpenAI, Azure AI Foundry, Anthropic and
+Vertex AI. Requires Python 3.11 or later.
+
+The optional extras `anthropic`, `azure-foundry`, `vertexai` and `all` are still accepted, so existing
+install commands keep working, but they add nothing new.
 
 ## Quick start
 

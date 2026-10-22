@@ -21,6 +21,7 @@ from ..errors import (
     LLMSwitchError,
     ResponsesError,
 )
+from .registry import UNAVAILABLE_PROVIDERS
 from .responses_capabilities import (
     normalize_response_tool_definitions,
     validate_response_operation,
@@ -142,12 +143,30 @@ RESPONSES_FEATURES = {
 }
 
 
+def sdk_unavailable_message(provider: str, reason: str) -> str:
+    return (f"Provider '{provider}' could not load its SDK ({reason}). "
+            "Reinstall the package with: pip install --upgrade llmswitch-sdk")
+
+
+def provider_class(provider: str, registry: dict[str, type], operation: str) -> type:
+    """Return the provider class for ``operation``, or raise a message that says why it is missing."""
+    provider_cls = registry.get(provider)
+    if provider_cls is not None:
+        return provider_cls
+    if provider in UNAVAILABLE_PROVIDERS:
+        raise LLMSwitchError(sdk_unavailable_message(provider, UNAVAILABLE_PROVIDERS[provider]), provider=provider)
+    raise LLMSwitchError(f"Unsupported provider for {operation}: {provider}", provider=provider)
+
+
 def responses_provider_class(config: Any, registry: dict[str, type]) -> type:
     provider_cls = registry.get(config.provider)
-    if provider_cls is None:
-        raise ResponsesError(f"Provider '{config.provider}' does not support the Responses API",
-                             status_code=501, provider=config.provider)
-    return provider_cls
+    if provider_cls is not None:
+        return provider_cls
+    if config.provider in UNAVAILABLE_PROVIDERS:
+        reason = UNAVAILABLE_PROVIDERS[config.provider]
+        raise ResponsesError(sdk_unavailable_message(config.provider, reason), status_code=501, provider=config.provider)
+    raise ResponsesError(f"Provider '{config.provider}' does not support the Responses API",
+                         status_code=501, provider=config.provider)
 
 
 def prepare_responses_create(config: Any, input: Any, kwargs: dict[str, Any]) -> None:  # noqa: A002
