@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llmswitch-sdk"
-version = "0.1.2"
+version = "0.1.3"
 description = "One Python client for chat completions, embeddings and the Responses API across OpenAI, Azure OpenAI, Azure AI Foundry, Anthropic and Vertex AI."
 readme = "README.md"
 license = "MIT"
@@ -46,8 +46,11 @@ vertexai = []
 redis = [
     "redis>=8.1.0,<9",
 ]
+langchain = [
+    "langchain-core>=1.6.9,<2",
+]
 all = [
-    "llmswitch-sdk[redis]",
+    "llmswitch-sdk[redis,langchain]",
 ]
 dev = [
     "build>=1.6.1",

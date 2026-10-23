@@ -5,9 +5,10 @@ Azure OpenAI, Azure AI Foundry, Anthropic and Vertex AI, with rate limits, retri
 breaker and backup providers. Switch providers by changing the constructor
 arguments; the call sites stay the same.
 
-Supported in 0.1.2: synchronous and asynchronous chat completions (including streaming and
+Supported in 0.1.3: synchronous and asynchronous chat completions (including streaming and
 structured output), embeddings, the Responses API for OpenAI, Azure OpenAI, Anthropic and Vertex AI, rate limiting,
-retries, a circuit breaker, backup failover and context truncation.
+retries, a circuit breaker, backup failover, context truncation, and a LangChain chat model with a
+bounded tool loop.
 
 ## Installation
 
@@ -23,8 +24,11 @@ only the providers you use are imported.
 
 Shared rate limits across processes need Redis: `pip install "llmswitch-sdk[redis]"`.
 
-The optional extras `anthropic`, `azure-foundry`, `vertexai` and `all` are still accepted, so existing
-install commands keep working, but they add nothing new.
+LangChain support needs `langchain-core`: `pip install "llmswitch-sdk[langchain]"`. See
+[LangChain integration](#langchain-integration).
+
+The optional extras `anthropic`, `azure-foundry` and `vertexai` are still accepted, so existing
+install commands keep working, but they add nothing new. `all` installs Redis and LangChain support.
 
 ## Quick start
 
@@ -238,6 +242,65 @@ What works: text and image input, `instructions`, function tools and `tool_choic
 
 What does not work, because chat completions cannot provide it: server-side state (`previous_response_id`, `conversation`, `store=True`, `background`), stored objects (`retrieve`, `delete`, `cancel`, `compact`, `input_items`, `input_tokens.count`, `conversations`) and hosted tools (web search, file search, code interpreter, MCP and the rest). These raise `UnsupportedCapabilityError` before any request is sent, so keep the conversation history in your application and pass it as `input` items. `client.responses.capabilities().emulated` is `True` for these providers. Fields that have no chat equivalent (`metadata`, `user`, `truncation`, `include`, `reasoning` and similar) are accepted and ignored. Response ids are generated locally and cannot be used to retrieve anything.
 
+## LangChain integration
+
+Install the extra, then use `ChatLLMSwitch` wherever a LangChain chat model is accepted:
+
+```python
+from llmswitch.integrations.langchain import ChatLLMSwitch
+
+llm = ChatLLMSwitch(provider="anthropic", api_key="sk-ant-...", model="claude-opus-4-5", temperature=0.2)
+print(llm.invoke("Say hello in French.").content)
+
+chain = prompt | llm   # any LangChain prompt, parser or runnable composes with it
+```
+
+Options the model understands are fields: `temperature`, `max_tokens`, `stop` and `call_options`
+(extra keyword arguments sent with every request). Every other keyword argument is a switch option,
+passed to `LLMSwitch`, so `provider`, `api_key`, `model`, `backup`, `on_event` and the rest work the
+same way as they do for `LLMSwitch`.
+
+`bind_tools` sends LangChain tools, Pydantic classes, plain functions or OpenAI-style dicts:
+
+```python
+llm_with_tools = llm.bind_tools([get_weather], tool_choice="auto")
+reply = llm_with_tools.invoke("Weather in Paris?")
+reply.tool_calls   # [{"name": "get_weather", "args": {...}, "id": "...", "type": "tool_call"}]
+```
+
+`tool_choice` accepts `"auto"`, `"none"`, `"required"` (or `"any"`), or a tool name to force that tool.
+Arguments that are not valid JSON appear in `reply.invalid_tool_calls` instead of raising.
+
+### Tool loop
+
+`run_tool_loop` runs the tools the model asks for and returns the whole conversation:
+
+```python
+from llmswitch.integrations.langchain import run_tool_loop
+
+history = run_tool_loop(llm, "Weather in Paris, and 17 plus 25?", [get_weather, add], max_steps=4)
+print(history[-1].content)
+```
+
+- Each turn that requests tools runs them in order, and the results go back to the model as tool messages.
+- A tool that raises, an unknown tool name, and arguments that fail the tool's schema are sent back as
+  error tool messages, so the model can recover.
+- `max_steps` is the most model calls allowed. If the model still asks for tools on the last one,
+  `ToolLoopLimitError` is raised.
+- `arun_tool_loop` is the async version. Tools run one after another in both versions.
+
+The loop is deliberately basic. It has no routing between agents, no specialists, no checkpoints and
+no budgets. Those are planned for a later release.
+
+### Closing clients
+
+Call `llm.close()`, or `await llm.aclose()` for async use, to close the provider connections. Put the call
+in a `finally` block, as the examples do.
+
+### Responses through LangChain
+
+`ChatLLMSwitch` uses chat completions only. For the Responses API, use `LLMSwitch` directly.
+
 ## Rate limits, retries and failover
 
 Limits are tracked per `user_id` (default `"global"`):
@@ -338,6 +401,7 @@ All errors derive from `LLMSwitchError`:
 - `ContextLengthExceededError`: the request is too long for the context window and `truncate` is off.
 - `ChatCompletionError`, `EmbeddingGenerationError`: provider failures. `status_code` carries the HTTP status when known.
 - `AuthenticationError`, `APIConnectionError`, `RateLimitExceededError`, `TimeOutError`, `ContentFilterError`, `ModelNotFoundError`, `InvalidResponseError`.
+- `ToolLoopLimitError`: `run_tool_loop` reached `max_steps` while the model still asked for tools.
 - `ResponsesError`: Responses API failures and unsupported providers. `InvalidResponseRequestError` for invalid Responses requests, `UnsupportedCapabilityError` for features turned off for the target.
 
 Every error has `status_code`, `provider`, `user_id` and, for rate limits, `retry_after`. These are `None`
@@ -355,7 +419,8 @@ pytest
 ruff check src tests
 ```
 
-The tests use mocks and do not contact any provider.
+The tests use mocks and do not contact any provider. The LangChain tests skip when `langchain-core`
+is not installed, so `pip install -e ".[redis,dev]"` runs the core suite on its own.
 
 ## License
 

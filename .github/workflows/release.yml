@@ -46,8 +46,28 @@ jobs:
       - name: Test with coverage floor
         run: pytest --cov
 
-  build:
+  test-core-only:
+    # Runs without the langchain extra, to prove the core package does not need LangChain.
     needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install package with the redis extra and dev tools, without LangChain
+        run: python -m pip install -e ".[redis,dev]"
+      - name: Confirm LangChain is not installed
+        run: python -c "import importlib.util, sys; sys.exit(importlib.util.find_spec('langchain_core') is not None)"
+      - name: Test without LangChain
+        run: python -m pytest -q -p no:cacheprovider
+
+  build:
+    needs: [test, test-core-only]
     runs-on: ubuntu-latest
     permissions:
       contents: read

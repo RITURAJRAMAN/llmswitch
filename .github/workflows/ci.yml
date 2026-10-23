@@ -1,0 +1,60 @@
+name: CI
+
+# Runs on every pull request and on pushes to main, so changes (including Dependabot
+# updates) are checked before they land. The release and TestPyPI workflows run the
+# same checks again before anything is published.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Third-party actions are pinned to commit hashes. Dependabot proposes updates.
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package with all extras and dev tools
+        run: python -m pip install -e ".[all,dev]"
+      - name: Lint
+        run: ruff check src tests examples
+      - name: Type check
+        run: mypy
+      - name: Test with coverage floor
+        run: pytest --cov
+
+  test-core-only:
+    # The core package must work without LangChain installed.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install package with the redis extra and dev tools, without LangChain
+        run: python -m pip install -e ".[redis,dev]"
+      - name: Confirm LangChain is not installed
+        run: python -c "import importlib.util, sys; sys.exit(importlib.util.find_spec('langchain_core') is not None)"
+      - name: Test without LangChain
+        run: python -m pytest -q -p no:cacheprovider
