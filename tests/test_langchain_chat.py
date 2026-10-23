@@ -308,3 +308,32 @@ async def test_aclose_closes_both_clients(monkeypatch):
     monkeypatch.setattr(llm._switch, "close", lambda: closed.append("sync"))
     await llm.aclose()
     assert closed == ["async", "sync"]
+
+
+def test_tool_choice_false_means_no_tools():
+    Script.responses = [completion("ok")]
+    model().bind_tools([get_weather], tool_choice=False).invoke("x")
+    assert Script.calls[0]["tool_choice"] == "none"
+
+
+def test_concurrent_first_async_calls_share_one_client():
+    import threading
+
+    llm = model()
+    built = []
+    original = ChatLLMSwitch._async
+
+    results = []
+    barrier = threading.Barrier(8)
+
+    def worker():
+        barrier.wait()
+        results.append(id(original(llm)))
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    built.extend(results)
+    assert len(set(built)) == 1

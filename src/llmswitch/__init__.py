@@ -35,6 +35,7 @@ from .errors import (  # noqa: E402
     ResponseNotFoundError,
     ResponsesError,
     TimeOutError,
+    ToolLoopLimitError,
     UnsupportedCapabilityError,
 )
 from .models import (  # noqa: E402
@@ -85,6 +86,7 @@ __all__ = [
     "RateLimitBackendUnavailableError",
     "TimeOutError",
     "ResponsesError",
+    "ToolLoopLimitError",
     "ResponseNotFoundError",
     "InvalidResponseRequestError",
     "UnsupportedCapabilityError",

@@ -16,6 +16,7 @@ from ..errors import (
     ChatCompletionError,
     EmbeddingGenerationError,
     RateLimitExceededError,
+    TimeOutError,
 )
 from .events import emit
 
@@ -23,7 +24,13 @@ logger = logging.getLogger(__name__)
 
 
 def _is_retryable(exc: Exception) -> bool:
-    """Return True for transient errors that are safe to retry."""
+    """Return True for transient errors that are safe to retry.
+
+    A timeout is not retried: the provider may already have processed the request,
+    so a retry could bill it twice. Connection errors and 5xx responses are retried.
+    """
+    if isinstance(exc, TimeOutError):
+        return False
     if isinstance(exc, (RateLimitExceededError, APIConnectionError)):
         return True
     if isinstance(exc, (ChatCompletionError, EmbeddingGenerationError)):

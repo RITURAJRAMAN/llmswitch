@@ -271,6 +271,7 @@ def _content_to_anthropic_parts(content: Any) -> list[dict[str, Any]]:
         parts: list[dict[str, Any]] = []
         for p in content:
             if not isinstance(p, dict):
+                logger.warning("Anthropic: dropping unsupported content part of type %s", type(p).__name__)
                 continue
             if p.get("type") == "text":
                 parts.append({"type": "text", "text": p.get("text", "")})
@@ -288,6 +289,8 @@ def _content_to_anthropic_parts(content: Any) -> list[dict[str, Any]]:
                         "type": "image",
                         "source": {"type": "url", "url": url},
                     })
+            else:
+                logger.warning("Anthropic: dropping unsupported content part of type %s", p.get("type"))
         return parts or [{"type": "text", "text": ""}]
     return [{"type": "text", "text": str(content)}]
 
@@ -552,6 +555,7 @@ class AnthropicChatProvider(BaseChatProvider):
                 on system messages and tool definitions. Defaults to ``True``.
         """
         self.api_key: str = kwargs.get("api_key", "")
+        self.deployment_name: str | None = kwargs.get("deployment_name") or None
         self.model: str = (
                 kwargs.get("deployment_name")
                 or kwargs.get("model")
@@ -628,12 +632,11 @@ class AnthropicChatProvider(BaseChatProvider):
             if anthropic_tools:
                 anthropic_tools = _inject_cache_control_tools(anthropic_tools)
 
-        # Model selection is fixed at provider initialization time.
-        # Ignore per-request model/deployment_name overrides to keep behavior
-        # deterministic and aligned with the client config.
+        # A configured deployment is a routing contract and always wins. Otherwise a
+        # per-call model overrides the configured one, as it does for the other providers.
+        call_model = kwargs.pop("model", None)
         kwargs.pop("deployment_name", None)
-        kwargs.pop("model", None)
-        request_model = self.model
+        request_model = self.deployment_name or call_model or self.model
         normalize_token_limit(kwargs, "max_tokens")
         req: dict[str, Any] = {
             "model": request_model,
@@ -856,6 +859,7 @@ class AsyncAnthropicChatProvider(AnthropicChatProvider):
 
     def __init__(self, **kwargs: Any) -> None:
         self.api_key: str = kwargs.get("api_key", "")
+        self.deployment_name: str | None = kwargs.get("deployment_name") or None
         self.model: str = (
                 kwargs.get("deployment_name")
                 or kwargs.get("model")

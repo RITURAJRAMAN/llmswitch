@@ -48,8 +48,16 @@ def _image_url(block: dict[str, Any]) -> str:
     raise ValueError(f"Unsupported image content block: {sorted(block)}")
 
 
+# Blocks that describe a provider's own reasoning or tool use. They are not replayed:
+# the tool calls are already sent through ``tool_calls``, and a reasoning block is only
+# valid with the signature the original provider issued, which llmswitch does not keep.
+_NOT_REPLAYED = frozenset({
+    "thinking", "redacted_thinking", "reasoning", "tool_use", "tool_call", "function_call", "server_tool_use",
+})
+
+
 def _content_parts(content: Any) -> list[dict[str, Any]]:
-    """Normalize message content into chat content parts."""
+    """Normalize message content into chat content parts, skipping provider-only reasoning blocks."""
     if isinstance(content, str):
         return [{"type": _TEXT_BLOCK, "text": content}]
     parts: list[dict[str, Any]] = []
@@ -60,6 +68,8 @@ def _content_parts(content: Any) -> list[dict[str, Any]]:
             parts.append({"type": _TEXT_BLOCK, "text": block.get("text", "")})
         elif isinstance(block, dict) and block.get("type") in ("image", "image_url"):
             parts.append({"type": "image_url", "image_url": {"url": _image_url(block)}})
+        elif isinstance(block, dict) and block.get("type") in _NOT_REPLAYED:
+            continue
         else:
             kind = block.get("type") if isinstance(block, dict) else type(block).__name__
             raise ValueError(f"Unsupported message content block: {kind}")
@@ -71,10 +81,13 @@ def _text_only(parts: list[dict[str, Any]]) -> str:
 
 
 def _content_for_role(content: Any, role: str) -> Any:
-    """Keep images as parts for user messages; other roles only take text."""
+    """Keep images as parts for user messages; other roles take text only."""
     parts = _content_parts(content)
-    if role == "user" and any(part["type"] != _TEXT_BLOCK for part in parts):
+    has_images = any(part["type"] != _TEXT_BLOCK for part in parts)
+    if role == "user" and has_images:
         return parts
+    if has_images:
+        raise ValueError(f"Images are only supported in user messages, not {role} messages.")
     return _text_only(parts)
 
 
@@ -83,7 +96,7 @@ def _tool_call_dict(call_id: str | None, name: str | None, arguments: str) -> di
 
 
 def _assistant_dict(message: AIMessage) -> dict[str, Any]:
-    text = _text_only(_content_parts(message.content)) if message.content else ""
+    text = _content_for_role(message.content, "assistant") if message.content else ""
     calls = [
         _tool_call_dict(call["id"], call["name"], json.dumps(call["args"]))
         for call in message.tool_calls

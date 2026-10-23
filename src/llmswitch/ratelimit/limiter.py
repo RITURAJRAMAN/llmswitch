@@ -54,6 +54,7 @@ _POOL_CACHE_LOCK = threading.Lock()
 _MEMORY_WINDOWS: dict[tuple[str, str, str, str, int, int], list[int]] = {}
 _MEMORY_WINDOWS_LOCK = threading.Lock()
 _MEMORY_WINDOW_CAP = 10_000
+_capacity_warned = False
 _MEMORY_NEXT_EXPIRY: int | None = None
 _MEMORY_EXPIRY_SOURCE = _MEMORY_WINDOWS
 _DISABLED_REDIS_URL = "redis://server_disabled"
@@ -81,6 +82,15 @@ def rate_limit_scope(provider: str | None, endpoint: str | None,
     """Return a stable, opaque quota namespace for a provider target."""
     raw = "\x1f".join((provider or "", endpoint or "", deployment_name or "", model or ""))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _log_capacity_eviction() -> None:
+    """Warn once per process that the in-process window table is full."""
+    global _capacity_warned
+    if not _capacity_warned:
+        _capacity_warned = True
+        logger.warning("In-process rate-limit table reached %d entries; evicting the oldest. "
+                       "Use Redis for shared, exact limits with many users.", _MEMORY_WINDOW_CAP)
 
 
 class RateLimitMetrics:
@@ -233,7 +243,11 @@ class RedisRateLimiter:
                     _MEMORY_NEXT_EXPIRY = expiry
         if current not in _MEMORY_WINDOWS:
             if len(_MEMORY_WINDOWS) >= _MEMORY_WINDOW_CAP:
-                raise RateLimitBackendUnavailableError("memory rate-limit capacity")
+                # Full table: drop the oldest entry (dicts keep insertion order) rather than
+                # refusing every new user. That user's window restarts, so the limit is weaker
+                # for that window, but nobody is locked out.
+                _MEMORY_WINDOWS.pop(next(iter(_MEMORY_WINDOWS)))
+                _log_capacity_eviction()
             expiry = (current[5] + 1) * current[4]
             if _MEMORY_NEXT_EXPIRY is None or expiry < _MEMORY_NEXT_EXPIRY:
                 _MEMORY_NEXT_EXPIRY = expiry
@@ -247,6 +261,24 @@ class RedisRateLimiter:
             counts[0] += 1
             counts[1] += tokens
             return counts[0], counts[1]
+
+    def _release_memory_window(self, key: str, request_type: str, tokens: int,
+                               window_seconds: int, scope: str | None = None) -> None:
+        """Give back the reservation made for a denied request."""
+        current = self._memory_key(key, window_seconds, request_type, scope=scope)
+        with _MEMORY_WINDOWS_LOCK:
+            counts = _MEMORY_WINDOWS.get(current)
+            if counts is not None:
+                counts[0] = max(0, counts[0] - 1)
+                counts[1] = max(0, counts[1] - tokens)
+
+    def _release_window(self, rpm_key: str, tpm_key: str, tokens: int) -> None:
+        """Give back the Redis reservation made for a denied request."""
+        assert self.redis is not None  # mode is 'redis'
+        with self.redis.pipeline() as pipe:
+            pipe.decrby(rpm_key, 1)
+            pipe.decrby(tpm_key, tokens)
+            pipe.execute()
 
     def _incr_window(self, rpm_key: str, tpm_key: str, tokens: int, window_seconds: int) -> tuple[int, int]:
         """
@@ -272,10 +304,10 @@ class RedisRateLimiter:
     ) -> tuple[bool, str]:
         """Fixed-window RPM/TPM check.
 
-        Increments the window counters as a *reservation* before evaluating the
-        limit, so a denied request still counts toward its window. Returns
-        ``(allowed, reason)``. Note: fixed windows permit up to ~2x burst across
-        a window boundary.
+        Reserves the request in the window, evaluates the limit, and gives the
+        reservation back when the request is denied, so a denied request does not
+        use up budget. Returns ``(allowed, reason)``. Note: fixed windows permit up
+        to ~2x burst across a window boundary.
         """
         if self.mode in {"disabled", "fail_open", "fail_closed"}:
             return self._backend_unavailable()
@@ -304,6 +336,11 @@ class RedisRateLimiter:
                 reason, allowed, level, msg = "tpm_exceeded", False, "WARNING", "Token limit exceeded"
             else:
                 reason, allowed, level, msg = "allowed", True, "DEBUG", "Rate limit allowed"
+            if not allowed:
+                if self.mode == "memory":
+                    self._release_memory_window(key, request_type, tokens, window_seconds, scope=scope)
+                else:
+                    self._release_window(rpm_key, tpm_key, tokens)
 
             RateLimitMetrics.record_miss() if allowed else RateLimitMetrics.record_hit()
             if not suppress_log:

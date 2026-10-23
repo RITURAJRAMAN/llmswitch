@@ -146,3 +146,12 @@ async def test_async_events_are_reported(vertex):
     await client.chat.completions.create(messages=MESSAGES)
     assert [e["event"] for e in events] == ["request", "response"]
     assert events[0]["provider"] == "vertexai"
+
+
+async def test_an_async_blocked_prompt_is_a_content_filter_error(vertex):
+    from llmswitch import ContentFilterError
+    client, fake = vertex
+    fake.aio.models.generate_content.return_value = genai_types.GenerateContentResponse.model_validate(
+        {"prompt_feedback": {"block_reason": "SAFETY"}})
+    with pytest.raises(ContentFilterError):
+        await client.chat.completions.create(messages=MESSAGES)

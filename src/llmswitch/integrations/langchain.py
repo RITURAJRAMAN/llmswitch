@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from typing import Any
@@ -39,7 +40,7 @@ except ImportError as exc:  # pragma: no cover - exercised by tests that hide la
     ) from exc
 
 from ..core import AsyncLLMSwitch, LLMSwitch
-from ..errors import LLMSwitchError
+from ..errors import ToolLoopLimitError
 
 # LangChain passes some internal keyword arguments (for example ``ls_structured_output_format``).
 # They describe tracing, not the request, so they are not forwarded.
@@ -49,6 +50,8 @@ def _tool_choice(value: Any) -> Any:
     """Translate LangChain's tool_choice spellings into chat completions form."""
     if value is None:
         return None
+    if value is False:
+        return "none"
     if value is True or value == "any":
         return "required"
     if isinstance(value, str):
@@ -76,6 +79,7 @@ class ChatLLMSwitch(BaseChatModel):
     _switch_options: dict[str, Any] = PrivateAttr(default_factory=dict)
     _switch: Any = PrivateAttr(default=None)
     _async_switch: Any = PrivateAttr(default=None)
+    _async_lock: Any = PrivateAttr(default_factory=threading.Lock)
 
     def __init__(self, **kwargs: Any) -> None:
         own_fields = set(type(self).model_fields)
@@ -103,10 +107,14 @@ class ChatLLMSwitch(BaseChatModel):
         self._switch.close()
 
     def _async(self) -> Any:
-        """Build the async client on first use, so sync-only users never create one."""
-        if self._async_switch is None:
-            self._async_switch = AsyncLLMSwitch(**self._switch_options)
-        return self._async_switch
+        """Build the async client on first use, so sync-only users never create one.
+
+        Locked, so concurrent first calls from several threads share one client.
+        """
+        with self._async_lock:
+            if self._async_switch is None:
+                self._async_switch = AsyncLLMSwitch(**self._switch_options)
+            return self._async_switch
 
     def _request(self, stop: list[str] | None, kwargs: dict[str, Any]) -> dict[str, Any]:
         request: dict[str, Any] = dict(self.call_options)
@@ -175,16 +183,6 @@ class ChatLLMSwitch(BaseChatModel):
         return self.bind(tools=formatted, **kwargs)
 
 
-class ToolLoopLimitError(LLMSwitchError):
-    """Raised when the model still asks for tools after ``max_steps`` model calls."""
-    status_code = 400
-    error_code = "E_TOOL_LOOP_LIMIT"
-
-    def __init__(self, max_steps: int) -> None:
-        super().__init__(f"The model still requested tools after {max_steps} model calls.")
-        self.max_steps = max_steps
-
-
 Tool = BaseTool | Callable[..., Any]
 
 
@@ -196,7 +194,10 @@ def _check_steps(max_steps: int) -> None:
 def _tool_map(tools: Sequence[Tool]) -> dict[str, Tool]:
     mapping: dict[str, Tool] = {}
     for tool in tools:
-        name = tool.name if isinstance(tool, BaseTool) else tool.__name__
+        name: str | None = tool.name if isinstance(tool, BaseTool) else getattr(tool, "__name__", None)
+        if not name:
+            raise ValueError("Plain callable tools need a __name__; use a def function or a LangChain tool, "
+                             "not functools.partial.")
         if name in mapping:
             raise ValueError(f"Duplicate tool name: {name}")
         mapping[name] = tool

@@ -21,7 +21,7 @@ from google.genai import errors as google_errors
 from google.genai import types
 
 from ..base import BaseChatProvider
-from ..errors import AuthenticationError, ChatCompletionError, RateLimitExceededError
+from ..errors import AuthenticationError, ChatCompletionError, ContentFilterError, RateLimitExceededError
 from ..models import (
     ChatCompletion,
     ChatCompletionChunk,
@@ -63,8 +63,16 @@ _HTTP_AUTH_CODES = (401, 403)
 GENERATE_CONTENT_CONFIG_FIELDS = set(types.GenerateContentConfig.model_fields.keys())
 
 
+def _blocked_reason(response: Any) -> str | None:
+    """Return why Vertex AI blocked the prompt (for example ``SAFETY``), or None."""
+    reason = getattr(getattr(response, "prompt_feedback", None), "block_reason", None)
+    if not reason:
+        return None
+    return str(getattr(reason, "value", reason)).split(".")[-1]
+
+
 def _raise_mapped_vertex_error(exc: Exception, context: str) -> None:
-    if isinstance(exc, ChatCompletionError):
+    if isinstance(exc, (ChatCompletionError, ContentFilterError)):
         raise exc
     if isinstance(exc, google_errors.ClientError):
         if exc.code == _HTTP_RATE_LIMIT:
@@ -76,6 +84,13 @@ def _raise_mapped_vertex_error(exc: Exception, context: str) -> None:
         raise ChatCompletionError(str(exc), status_code=503, provider="vertexai") from exc
     logger.exception(context)
     raise ChatCompletionError(str(exc), status_code=getattr(exc, "status_code", 500), provider="vertexai") from exc
+
+
+def _raise_if_blocked(response: Any) -> None:
+    """A prompt Vertex AI blocked comes back with no candidates. Report it as a content filter."""
+    reason = _blocked_reason(response)
+    if reason:
+        raise ContentFilterError(f"Vertex AI blocked the prompt ({reason}).", provider="vertexai")
 
 
 def _created_timestamp(response) -> int:
@@ -641,6 +656,7 @@ class VertexAIChatProvider(BaseChatProvider):
         """Map a ``generate_content`` response to a unified ``ChatCompletion``."""
         candidates = getattr(response, "candidates", None) or []
         if not candidates:
+            _raise_if_blocked(response)
             raise ChatCompletionError("No candidates returned from Vertex AI.", 404, "vertexai")
 
         # Native structured outputs: google-genai deserializes the response
@@ -738,6 +754,7 @@ class VertexAIChatProvider(BaseChatProvider):
 
         candidates = getattr(response, "candidates", None) or []
         if not candidates and not getattr(response, "function_calls", None):
+            _raise_if_blocked(response)
             return None
         state.last_response = response
 

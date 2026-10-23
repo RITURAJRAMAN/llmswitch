@@ -222,3 +222,27 @@ def test_the_loop_runs_through_chat_llmswitch(monkeypatch):
     assert result[-1].content == "It is 5."
     assert result[2].content == "5"
     assert sent[1][-1] == {"role": "tool", "tool_call_id": "t1", "content": "5"}
+
+
+def test_a_partial_without_a_name_is_rejected_before_any_model_call():
+    from functools import partial
+
+    def scale(value: int, factor: int) -> int:
+        """Multiply."""
+        return value * factor
+
+    model = Scripted(script=[AIMessage(content="never sent")])
+    with pytest.raises(ValueError, match="need a __name__"):
+        run_tool_loop(model, "x", [partial(scale, factor=2)])
+    assert model.seen == []
+
+
+async def test_the_async_loop_rejects_a_nameless_callable_too():
+    from functools import partial
+
+    def scale(value: int, factor: int) -> int:
+        """Multiply."""
+        return value * factor
+
+    with pytest.raises(ValueError, match="need a __name__"):
+        await arun_tool_loop(Scripted(), "x", [partial(scale, factor=2)])

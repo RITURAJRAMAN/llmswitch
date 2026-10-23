@@ -188,3 +188,29 @@ def test_the_closing_usage_chunk_carries_usage_only():
 def test_the_finish_reason_is_kept_on_the_final_chunk():
     result = to_ai_chunk(chunk(content="", finish="stop"))
     assert result.response_metadata["finish_reason"] == "stop"
+
+
+def test_an_image_in_a_system_message_is_a_clear_error_not_a_crash():
+    with pytest.raises(ValueError, match="only supported in user messages, not system"):
+        to_chat_messages([SystemMessage(content=[{"type": "image_url", "image_url": {"url": "https://x/a.png"}}])])
+
+
+def test_an_image_in_an_assistant_message_is_a_clear_error():
+    with pytest.raises(ValueError, match="not assistant messages"):
+        to_chat_messages([AIMessage(content=[{"type": "image", "url": "https://x/a.png"}])])
+
+
+def test_provider_reasoning_blocks_are_not_replayed():
+    message = AIMessage(content=[
+        {"type": "thinking", "thinking": "let me think", "signature": "sig"},
+        {"type": "text", "text": "Answer."},
+        {"type": "tool_use", "id": "c1", "name": "f", "input": {}},
+    ], tool_calls=[{"name": "f", "args": {}, "id": "c1", "type": "tool_call"}])
+    converted = to_chat_messages([message])[0]
+    assert converted["content"] == "Answer."
+    assert [c["id"] for c in converted["tool_calls"]] == ["c1"]
+
+
+def test_a_redacted_thinking_block_is_skipped_too():
+    message = AIMessage(content=[{"type": "redacted_thinking", "data": "x"}, {"type": "text", "text": "Hi"}])
+    assert to_chat_messages([message])[0]["content"] == "Hi"
