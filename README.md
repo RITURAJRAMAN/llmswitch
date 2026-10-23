@@ -137,6 +137,12 @@ client = LLMSwitch(
 )
 ```
 
+Gemini 2.5 models use part of the output budget for internal reasoning before they write the answer.
+A small limit can therefore end the reply early: the response has `finish_reason="length"` in chat,
+`status="incomplete"` in Responses, and `parse()` may return no parsed value. In testing, a
+`max_output_tokens` of 300 was not enough for a short structured answer, while 2000 was. Set a
+generous limit for Gemini calls, and check `finish_reason` or `status` before trusting the output.
+
 Credentials are never read from the environment or from `.env` files by the library. Load
 them in your application and pass them to the constructor.
 
