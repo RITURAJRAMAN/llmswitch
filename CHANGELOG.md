@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] - 2026-10-23
+
+### Added
+
+- LangChain integration in `llmswitch.integrations.langchain`, installed with the `langchain` extra: `pip install "llmswitch-sdk[langchain]"`. Nothing is imported unless you use it, and a missing `langchain-core` gives the install command.
+- `ChatLLMSwitch`, a LangChain chat model over `LLMSwitch` and `AsyncLLMSwitch`. It supports `invoke`, `ainvoke`, `stream`, `astream`, `bind_tools` (with `tool_choice`), `close` and `aclose`. Rate limits, retries, failover and `on_event` apply to its calls. It uses chat completions, so every provider that supports chat works, including Anthropic and Vertex AI.
+- `run_tool_loop` and `arun_tool_loop`: a bounded tool loop that runs the tools the model asks for and sends the results back. Tool failures, unknown tool names and malformed arguments are returned to the model as error tool messages. `max_steps` limits the model calls, and `ToolLoopLimitError` is raised when the limit is reached.
+- Message conversion between LangChain messages and llmswitch's chat format, including images in OpenAI and LangChain standard shapes.
+- Examples `examples/langchain_chat.py` and `examples/langchain_tool_loop.py`.
+- A CI job, `test-core-only`, that runs the tests without LangChain installed, so the core package is checked on its own.
+
 ## [0.1.2] - 2026-10-23
 
 ### Added
