@@ -54,6 +54,7 @@ from ..structured import (
 from ._responses_base import AsyncResponsesProviderMixin, SyncResponsesProviderMixin
 from ._shared import (
     audio_from,
+    azure_token_limit_name,
     build_openai_usage,
     close_async_stream,
     close_stream,
@@ -66,6 +67,7 @@ from ._shared import (
     map_tool_call_deltas,
     map_tool_calls,
     merge_client_options,
+    normalize_token_limit,
 )
 
 # Name resolves to "llmswitch.providers.azureopenai_provider"
@@ -97,9 +99,6 @@ def _sanitize_completion_kwargs(kwargs: dict[str, Any], model_name: str | None =
         sanitized["response_format"] = dict(response_format)
 
     sanitized.pop("strict", None)
-    effective_model = str(sanitized.get("model") or model_name or "").lower()
-    if effective_model.startswith(("gpt-5", "o1", "o3", "o4")) and "max_tokens" in sanitized:
-        sanitized.setdefault("max_completion_tokens", sanitized.pop("max_tokens"))
     return sanitized
 
 
@@ -119,6 +118,7 @@ class AzureOpenAIChatProvider(BaseChatProvider):
         self.api_key = kwargs.get("api_key")
         self.endpoint = kwargs.get("endpoint")
         self.api_version = kwargs.get("api_version")
+        self._token_limit = azure_token_limit_name(self.api_version)
         self.deployment_name = kwargs.get("deployment_name")
         self.model = kwargs.get("model")
         self.timeout = kwargs.get("timeout")
@@ -134,6 +134,7 @@ class AzureOpenAIChatProvider(BaseChatProvider):
     def create(self, messages: list, stream: bool = False, **kwargs):
         """Dispatch to streaming or non-streaming chat completion."""
         kwargs = _sanitize_completion_kwargs(kwargs, self.model)
+        normalize_token_limit(kwargs, self._token_limit)
         if stream:
             # Streaming has no native .parse() helper — request the schema instead.
             if is_pydantic_model_class(kwargs.get("response_format")):
@@ -431,6 +432,7 @@ class AsyncAzureOpenAIChatProvider(BaseChatProvider):
         self.api_key = kwargs.get("api_key")
         self.endpoint = kwargs.get("endpoint")
         self.api_version = kwargs.get("api_version")
+        self._token_limit = azure_token_limit_name(self.api_version)
         self.deployment_name = kwargs.get("deployment_name")
         self.model = kwargs.get("model")
         self.timeout = kwargs.get("timeout")
@@ -446,6 +448,7 @@ class AsyncAzureOpenAIChatProvider(BaseChatProvider):
     async def create(self, messages: list, stream: bool = False, **kwargs):
         """Dispatch to async streaming or non-streaming completion."""
         kwargs = _sanitize_completion_kwargs(kwargs, self.model)
+        normalize_token_limit(kwargs, self._token_limit)
         if stream:
             if is_pydantic_model_class(kwargs.get("response_format")):
                 kwargs["response_format"] = pydantic_to_response_format(kwargs["response_format"])

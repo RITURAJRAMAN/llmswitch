@@ -45,7 +45,7 @@ from ..structured import (
     provider_extensions_from_raw,
     to_jsonable,
 )
-from ._shared import close_stream, get_retry_after_seconds, merge_client_options
+from ._shared import close_stream, get_retry_after_seconds, merge_client_options, normalize_token_limit
 
 # Name resolves to "llmswitch.providers.vertexai_provider"
 logger = logging.getLogger(__name__)
@@ -68,7 +68,13 @@ def _raise_mapped_vertex_error(exc: Exception, context: str) -> None:
     if isinstance(exc, google_errors.ServerError):
         raise ChatCompletionError(str(exc), status_code=503, provider="vertexai") from exc
     logger.exception(context)
-    raise ChatCompletionError(str(exc), provider="vertexai") from exc
+    raise ChatCompletionError(str(exc), status_code=getattr(exc, "status_code", 500), provider="vertexai") from exc
+
+
+def _created_timestamp(response) -> int:
+    """Unix time the response was created, or now when the SDK response has no ``create_time``."""
+    create_time = getattr(response, "create_time", None)
+    return int(create_time.timestamp()) if create_time is not None else int(time.time())
 
 
 class VertexAIChatProvider(BaseChatProvider):
@@ -573,10 +579,7 @@ class VertexAIChatProvider(BaseChatProvider):
         response_format = self._convert_response_format(config_kwargs.pop("response_format", None))
         config_kwargs.update(response_format)
 
-        if "max_tokens" in config_kwargs and "max_output_tokens" not in config_kwargs:
-            config_kwargs["max_output_tokens"] = config_kwargs.pop("max_tokens")
-        if "max_completion_tokens" in config_kwargs and "max_output_tokens" not in config_kwargs:
-            config_kwargs["max_output_tokens"] = config_kwargs.pop("max_completion_tokens")
+        normalize_token_limit(config_kwargs, "max_output_tokens")
         if "n" in config_kwargs and "candidate_count" not in config_kwargs:
             config_kwargs["candidate_count"] = config_kwargs.pop("n")
         if "stop" in config_kwargs and "stop_sequences" not in config_kwargs:
@@ -673,12 +676,10 @@ class VertexAIChatProvider(BaseChatProvider):
                 {"response_id", "model_version", "candidates", "usage_metadata", "create_time", "parsed"},
             )
             return ChatCompletion(
-                id=getattr(response, "response_id", "vertexai-response"),
+                id=getattr(response, "response_id", None) or "vertexai-response",
                 object="chat.completion",
-                created=int(
-                    time.mktime(getattr(response, "create_time", time.gmtime()).timetuple())
-                ) if hasattr(response, "create_time") else int(time.time()),
-                model=getattr(response, "model_version", self.model),
+                created=_created_timestamp(response),
+                model=getattr(response, "model_version", None) or self.model,
                 choices=choices,
                 usage=self._build_usage(response),
                 extensions=extensions,
@@ -723,12 +724,10 @@ class VertexAIChatProvider(BaseChatProvider):
                     last_response_with_metadata = response
 
                     base_chunk = {
-                        "id": getattr(response, "response_id", "vertexai-response"),
+                        "id": getattr(response, "response_id", None) or "vertexai-response",
                         "object": "chat.completion.chunk",
-                        "created": int(
-                            time.mktime(getattr(response, "create_time", time.gmtime()).timetuple())
-                        ) if hasattr(response, "create_time") else int(time.time()),
-                        "model": getattr(response, "model_version", self.model),
+                        "created": _created_timestamp(response),
+                        "model": getattr(response, "model_version", None) or self.model,
                     }
 
                     chunk_choices = []
@@ -781,11 +780,9 @@ class VertexAIChatProvider(BaseChatProvider):
                     model = self.model
                     response_id = "vertexai-response"
                     if last_response_with_metadata is not None:
-                        response_id = getattr(last_response_with_metadata, "response_id", response_id)
-                        create_time = getattr(last_response_with_metadata, "create_time", None)
-                        if create_time is not None:
-                            created = int(time.mktime(create_time.timetuple()))
-                        model = getattr(last_response_with_metadata, "model_version", self.model)
+                        response_id = getattr(last_response_with_metadata, "response_id", None) or response_id
+                        created = _created_timestamp(last_response_with_metadata)
+                        model = getattr(last_response_with_metadata, "model_version", None) or self.model
                     yield ChatCompletionChunk(
                         id=response_id,
                         object="chat.completion.chunk",

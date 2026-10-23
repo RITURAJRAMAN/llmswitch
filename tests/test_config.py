@@ -49,9 +49,21 @@ def test_non_positive_timeout_is_rejected():
         LLMSwitch(provider="openai", api_key="k", timeout=0)
 
 
-def test_unknown_fields_are_accepted_for_the_unified_constructor():
-    client = LLMSwitch(provider="openai", api_key="k", model="gpt-4o", some_other_provider_field=1)
+def test_fields_that_belong_to_other_providers_are_accepted_by_the_unified_constructor():
+    client = LLMSwitch(provider="openai", api_key="k", model="gpt-4o", location="us-central1", region="eu")
     assert client.config.model == "gpt-4o"
+
+
+def test_a_misspelled_option_is_rejected_with_a_suggestion():
+    with pytest.raises(ConfigurationError, match="'max_retires' \\(did you mean 'max_retries'\\?\\)"):
+        LLMSwitch(provider="openai", api_key="k", model="gpt-4o", max_retires=5)
+
+
+def test_every_unknown_option_is_reported_together():
+    with pytest.raises(ConfigurationError) as info:
+        LLMSwitch(provider="openai", api_key="k", rmp=10, totally_made_up=1)
+    assert info.value.context["details"]["unknown"] == ["rmp", "totally_made_up"]
+    assert "client_options" in str(info.value)
 
 
 def test_config_exposes_deployment_and_model():

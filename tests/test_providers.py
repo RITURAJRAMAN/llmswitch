@@ -9,6 +9,7 @@ import anthropic.types
 import openai.types
 import openai.types.chat
 import pytest
+from conftest import provider_for
 from pydantic import BaseModel
 
 from llmswitch import AsyncLLMSwitch, ChatCompletionError, LLMSwitch
@@ -55,7 +56,7 @@ ANTHROPIC_MESSAGE = {
 
 def test_openai_chat_maps_the_sdk_response():
     client = LLMSwitch(provider="openai", api_key="sk-test", model="gpt-4o")
-    provider = client._provider(OpenAIChatProvider)
+    provider = provider_for(client, OpenAIChatProvider)
     provider.client.chat.completions.create = MagicMock(
         return_value=openai.types.chat.ChatCompletion.model_validate(OPENAI_COMPLETION))
 
@@ -70,7 +71,7 @@ def test_openai_chat_maps_the_sdk_response():
 
 async def test_openai_async_chat_maps_the_sdk_response():
     client = AsyncLLMSwitch(provider="openai", api_key="sk-test", model="gpt-4o")
-    provider = client._provider(AsyncOpenAIChatProvider)
+    provider = provider_for(client, AsyncOpenAIChatProvider)
     provider.client.chat.completions.create = AsyncMock(
         return_value=openai.types.chat.ChatCompletion.model_validate(OPENAI_COMPLETION))
 
@@ -81,7 +82,7 @@ async def test_openai_async_chat_maps_the_sdk_response():
 
 def test_openai_embeddings_map_the_sdk_response_in_order():
     client = LLMSwitch(provider="openai", api_key="sk-test")
-    provider = client._provider(OpenAIEmbeddingProvider)
+    provider = provider_for(client, OpenAIEmbeddingProvider)
     provider.client.embeddings.create = MagicMock(
         return_value=openai.types.CreateEmbeddingResponse.model_validate(OPENAI_EMBEDDINGS))
 
@@ -97,7 +98,7 @@ def test_openai_embeddings_map_the_sdk_response_in_order():
 def test_azure_openai_chat_uses_the_deployment_as_model():
     client = LLMSwitch(provider="azure_openai", api_key="k", endpoint="https://x.openai.azure.com/",
                        api_version="2024-10-21", deployment_name="prod-gpt4o")
-    provider = client._provider(AzureOpenAIChatProvider)
+    provider = provider_for(client, AzureOpenAIChatProvider)
     provider.client.chat.completions.create = MagicMock(
         return_value=openai.types.chat.ChatCompletion.model_validate(OPENAI_COMPLETION))
 
@@ -109,7 +110,7 @@ def test_azure_openai_chat_uses_the_deployment_as_model():
 
 def test_anthropic_chat_maps_the_sdk_message_and_separates_system_prompt():
     client = LLMSwitch(provider="anthropic", api_key="sk-ant-test", model="claude-opus-4-5")
-    provider = client._provider(AnthropicChatProvider)
+    provider = provider_for(client, AnthropicChatProvider)
     provider.client.messages.create = MagicMock(
         return_value=anthropic.types.Message.model_validate(ANTHROPIC_MESSAGE))
 
@@ -127,7 +128,7 @@ def test_anthropic_chat_maps_the_sdk_message_and_separates_system_prompt():
 
 def test_provider_sdk_errors_are_translated_to_switch_errors():
     client = LLMSwitch(provider="openai", api_key="sk-test", model="gpt-4o")
-    provider = client._provider(OpenAIChatProvider)
+    provider = provider_for(client, OpenAIChatProvider)
     provider.client.chat.completions.create = MagicMock(side_effect=RuntimeError("boom"))
 
     with pytest.raises(ChatCompletionError):
@@ -144,7 +145,7 @@ OPENAI_CHUNKS = [
 
 def test_openai_streaming_yields_mapped_chunks():
     client = LLMSwitch(provider="openai", api_key="sk-test", model="gpt-4o")
-    provider = client._provider(OpenAIChatProvider)
+    provider = provider_for(client, OpenAIChatProvider)
     raw_chunks = [openai.types.chat.ChatCompletionChunk.model_validate(chunk) for chunk in OPENAI_CHUNKS]
     provider.client.chat.completions.create = MagicMock(return_value=iter(raw_chunks))
 
@@ -158,7 +159,7 @@ def test_openai_streaming_yields_mapped_chunks():
 
 async def test_openai_async_streaming_yields_mapped_chunks():
     client = AsyncLLMSwitch(provider="openai", api_key="sk-test", model="gpt-4o")
-    provider = client._provider(AsyncOpenAIChatProvider)
+    provider = provider_for(client, AsyncOpenAIChatProvider)
 
     async def raw_stream():
         for chunk in OPENAI_CHUNKS:
@@ -181,7 +182,7 @@ class City(BaseModel):
 
 def test_openai_structured_output_populates_parsed_model():
     client = LLMSwitch(provider="openai", api_key="sk-test", model="gpt-4o")
-    provider = client._provider(OpenAIChatProvider)
+    provider = provider_for(client, OpenAIChatProvider)
     body = {
         **OPENAI_COMPLETION,
         "choices": [{

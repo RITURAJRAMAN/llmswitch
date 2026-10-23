@@ -63,6 +63,8 @@ from ._shared import (
     map_tool_call_deltas,
     map_tool_calls,
     merge_client_options,
+    normalize_token_limit,
+    openai_token_limit_name,
 )
 
 # Name resolves to "llmswitch.providers.openai_provider"
@@ -91,6 +93,7 @@ class OpenAIChatProvider(BaseChatProvider):
         self.project: Optional[str] = kwargs.get("project")
         self.timeout: Optional[float] = kwargs.get("timeout")
 
+        self._token_limit = openai_token_limit_name(self.endpoint)
         self.client: OpenAI = OpenAI(**merge_client_options(_openai_client_kwargs(kwargs), kwargs.get("client_options")))
 
     def create(self, messages: list[dict[str, Any]], stream: bool = False, **kwargs: Any) -> Any:
@@ -100,6 +103,7 @@ class OpenAIChatProvider(BaseChatProvider):
         Returns:
             ChatCompletion or generator of ChatCompletionChunk.
         """
+        normalize_token_limit(kwargs, self._token_limit)
         if stream:
             # Streaming has no native .parse() helper — request the schema instead.
             if is_pydantic_model_class(kwargs.get("response_format")):
@@ -411,10 +415,12 @@ class AsyncOpenAIChatProvider(BaseChatProvider):
         self.project: Optional[str] = kwargs.get("project")
         self.timeout: Optional[float] = kwargs.get("timeout")
 
+        self._token_limit = openai_token_limit_name(self.endpoint)
         self.client: AsyncOpenAI = AsyncOpenAI(**merge_client_options(_openai_client_kwargs(kwargs), kwargs.get("client_options")))
 
     async def create(self, messages: list[dict[str, Any]], stream: bool = False, **kwargs: Any) -> Any:
         """Dispatch to async streaming or non-streaming completion."""
+        normalize_token_limit(kwargs, self._token_limit)
         if stream:
             if is_pydantic_model_class(kwargs.get("response_format")):
                 kwargs["response_format"] = pydantic_to_response_format(kwargs["response_format"])

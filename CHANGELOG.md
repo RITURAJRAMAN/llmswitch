@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] - 2026-10-22
+
+### Added
+
+- Rate limiting per `user_id`, with `rpm` and `tpm` limits for chat and `embedding_rpm` and `embedding_tpm` for embeddings. A request over the limit waits for the window to reopen and fails with `RateLimitExceededError` if the budget is still exhausted. `on_rate_limit="raise"` fails immediately instead of waiting, and `rate_limit_max_wait` raises when the wait would be longer than the given seconds.
+- Optional shared rate limits across processes through Redis: `redis_url` with the `redis` extra. `rate_limit_failure_policy` chooses between in-process fallback, failing open, and failing closed when Redis is unavailable.
+- Retries for transient errors (rate limits, connection errors and 5xx responses) with exponential backoff. `max_retries` and `retry_base_delay` control them, and `retry_deadline` caps how long one provider call keeps retrying.
+- Circuit breaker for each provider deployment, enabled with `circuit_breaker=True` or a dict with `failure_threshold` and `reset_timeout`.
+- Backup provider failover with `backup={"provider": ..., ...}`, used when the primary provider fails with a retryable error.
+- Context handling for chat: `truncate=True` trims messages to fit `completion_context_window`. `context_output_reserve_tokens` and `context_overhead_tokens` reserve room for output and protocol overhead.
+- Batched embeddings with `batching=True` and `batchsize`.
+- `share_clients=True` to reuse one SDK client across clients that have the same configuration.
+- `token_counter` to count tokens with your own function.
+- `on_event` callback that receives `request`, `response`, `error`, `retry` and `failover` events with timing and token usage.
+- `live_logs=True` on a call logs the request at INFO with secrets redacted. It is off by default and works the same for sync and async clients.
+- `max_tokens`, `max_completion_tokens` and `max_output_tokens` are interchangeable on every provider. The library sends the name each provider expects.
+- Every error has `provider`, `user_id` and `retry_after` attributes next to `status_code`.
+- Exceptions `ContextLengthExceededError` and `RateLimitBackendUnavailableError`.
+- Python 3.13 support.
+
+### Changed
+
+- Provider SDKs are loaded the first time a provider is used, so `import llmswitch` takes about 0.2 s instead of about 1.7 s.
+- Unknown constructor options are rejected with a suggestion for the closest valid name, so a typo such as `max_retires` is no longer ignored. Options that belong to another provider are still accepted.
+- Token counting uses `tiktoken`, which is now a core dependency. The encoding is chosen from the model name: OpenAI model names use their own encoding, and any other name uses the newest tiktoken encoding (`o200k_harmony`). Counts for ordinary-sized texts are cached.
+
+### Fixed
+
+- Vertex AI responses without an id, model version or creation time no longer fail. The creation time is now read as UTC.
+- Azure OpenAI deployments with custom names no longer fail when a model needs `max_completion_tokens`.
+- Unrecognized Vertex AI errors keep their `status_code`.
+- Async chat and Responses calls now honor `live_logs`.
+
 ## [0.1.1] - 2026-10-22
 
 ### Added

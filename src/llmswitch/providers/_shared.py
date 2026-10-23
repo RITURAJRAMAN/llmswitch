@@ -20,6 +20,7 @@ from __future__ import annotations
 import inspect
 import math
 from typing import Any, Optional, overload
+from urllib.parse import urlparse
 
 from ..errors import (
     APIConnectionError,
@@ -65,6 +66,43 @@ def merge_client_options(defaults: dict[str, Any], client_options: Optional[dict
     cannot replace the credentials or endpoint chosen by the unified constructor.
     """
     return {**defaults, **(client_options or {})}
+
+
+TOKEN_LIMIT_NAMES = ("max_output_tokens", "max_completion_tokens", "max_tokens")
+
+
+def normalize_token_limit(kwargs: dict[str, Any], target: str) -> None:
+    """Accept any of the three token-limit names and keep only ``target``, in place.
+
+    If several are given, ``target`` wins, then the order of ``TOKEN_LIMIT_NAMES``.
+    """
+    found = {name: kwargs.pop(name) for name in TOKEN_LIMIT_NAMES if name in kwargs}
+    if not found:
+        return
+    value = found.get(target)
+    if value is None:
+        value = next((v for v in found.values() if v is not None), None)
+    if value is not None:
+        kwargs[target] = value
+
+
+def openai_token_limit_name(endpoint: Optional[str]) -> str:
+    """Token-limit name for the OpenAI chat API.
+
+    OpenAI and Azure hosts take ``max_completion_tokens``. Other OpenAI-compatible
+    servers often only know ``max_tokens``, so that name is kept for them.
+    """
+    host = (urlparse(endpoint).hostname or "") if endpoint else ""
+    if not host or host == "openai.com" or host.endswith(".openai.com") or host.endswith(".azure.com"):
+        return "max_completion_tokens"
+    return "max_tokens"
+
+
+def azure_token_limit_name(api_version: Optional[str]) -> str:
+    """Azure OpenAI accepts ``max_completion_tokens`` from API version 2024-09-01 onward."""
+    if api_version and api_version[:10] < "2024-09-01":
+        return "max_tokens"
+    return "max_completion_tokens"
 
 
 def close_stream(stream: Any) -> None:

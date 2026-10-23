@@ -64,7 +64,7 @@ class ComputerTool(_ResponsesTool):
 
 
 class McpTool(_ResponsesTool):
-    """Remote MCP server configuration; adapter policy must explicitly allow it."""
+    """Remote MCP server configuration; switch policy must explicitly allow it."""
 
     type: Literal["mcp"] = "mcp"
     server_label: str

@@ -68,7 +68,7 @@ async def test_async_embeddings_run_the_sync_provider_off_the_event_loop(stubs):
         result = await openai_client().embeddings.create(["a", "bb"])
     finally:
         StubEmbeddings.create = original_create
-    assert result["data"] == [[1.0], [2.0]]
+    assert [item.embedding for item in result.data] == [[1.0], [2.0]]
     assert seen_threads == [True]
 
 
@@ -90,7 +90,7 @@ async def test_aclose_awaits_async_close_hooks(stubs):
     async with openai_client() as client:
         await client.chat.completions.create(messages=MESSAGES)
     assert StubChat.closed is True
-    assert client._providers == {}
+    assert client.chat.completions._provider_cache == {}
 
 
 def test_async_client_construction_is_sync_safe():

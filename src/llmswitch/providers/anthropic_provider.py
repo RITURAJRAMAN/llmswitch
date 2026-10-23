@@ -86,7 +86,7 @@ from ..structured import (
     provider_extensions_from_raw,
     to_jsonable,
 )
-from ._shared import merge_client_options
+from ._shared import merge_client_options, normalize_token_limit
 
 logger = logging.getLogger(__name__)
 
@@ -633,12 +633,11 @@ class AnthropicChatProvider(BaseChatProvider):
         kwargs.pop("deployment_name", None)
         kwargs.pop("model", None)
         request_model = self.model
+        normalize_token_limit(kwargs, "max_tokens")
         req: dict[str, Any] = {
             "model": request_model,
             "messages": anthropic_messages,
-            "max_tokens": kwargs.pop("max_tokens", None)
-                          or kwargs.pop("max_completion_tokens", None)
-                          or 4096,
+            "max_tokens": kwargs.pop("max_tokens", None) or 4096,
         }
         if system_blocks:
             req["system"] = system_blocks

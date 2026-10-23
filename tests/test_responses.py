@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import openai.types.responses as sdk
 import pytest
+from conftest import provider_for
 from pydantic import BaseModel
 
 from llmswitch import (
@@ -64,7 +65,7 @@ def azure_client(**overrides):
 
 def test_create_returns_a_mapped_response_and_forwards_parameters():
     client = openai_client()
-    provider = client._provider(OpenAIResponsesProvider)
+    provider = provider_for(client, OpenAIResponsesProvider)
     provider.client.responses.create = MagicMock(return_value=sdk.Response.model_validate(RESPONSE))
 
     result = client.responses.create(input="hello", temperature=0.2)
@@ -77,7 +78,7 @@ def test_create_returns_a_mapped_response_and_forwards_parameters():
 
 async def test_async_create_returns_a_mapped_response():
     client = AsyncLLMSwitch(provider="openai", api_key="sk-test", model="gpt-4o")
-    provider = client._provider(AsyncOpenAIResponsesProvider)
+    provider = provider_for(client, AsyncOpenAIResponsesProvider)
     provider.client.responses.create = AsyncMock(return_value=sdk.Response.model_validate(RESPONSE))
 
     result = await client.responses.create(input="hello")
@@ -87,7 +88,7 @@ async def test_async_create_returns_a_mapped_response():
 
 def test_parse_sends_the_pydantic_schema_as_text_format():
     client = openai_client()
-    provider = client._provider(OpenAIResponsesProvider)
+    provider = provider_for(client, OpenAIResponsesProvider)
     provider.client.responses.parse = MagicMock(return_value=sdk.Response.model_validate(RESPONSE))
 
     client.responses.parse(input="Largest city in Japan?", text_format=City)
@@ -97,7 +98,7 @@ def test_parse_sends_the_pydantic_schema_as_text_format():
 
 def test_model_override_is_ignored_when_a_deployment_is_configured():
     client = azure_client()
-    provider = client._provider(AzureOpenAIResponsesProvider)
+    provider = provider_for(client, AzureOpenAIResponsesProvider)
     provider.client.responses.create = MagicMock(return_value=sdk.Response.model_validate(RESPONSE))
 
     client.responses.create(input="hello", model="other")
@@ -107,7 +108,7 @@ def test_model_override_is_ignored_when_a_deployment_is_configured():
 
 def test_retrieve_and_delete_use_the_provider_verbs():
     client = openai_client()
-    provider = client._provider(OpenAIResponsesProvider)
+    provider = provider_for(client, OpenAIResponsesProvider)
     provider.client.responses.retrieve = MagicMock(return_value=sdk.Response.model_validate(RESPONSE))
     provider.client.responses.delete = MagicMock(return_value=MagicMock(id="resp_1", deleted=True, object="response"))
 
@@ -118,7 +119,7 @@ def test_retrieve_and_delete_use_the_provider_verbs():
 
 def test_streaming_yields_mapped_events():
     client = openai_client()
-    provider = client._provider(OpenAIResponsesProvider)
+    provider = provider_for(client, OpenAIResponsesProvider)
     event = sdk.ResponseTextDeltaEvent.model_validate({
         "type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0,
         "content_index": 0, "delta": "hi", "sequence_number": 1, "logprobs": [],
@@ -148,7 +149,7 @@ def test_remote_mcp_tool_requires_an_explicit_policy():
 def test_remote_mcp_tool_is_allowed_by_policy():
     client = LLMSwitch(provider="openai", api_key="sk-test", model="gpt-4o",
                        mcp_policy={"enabled": True, "allowed_server_labels": ["docs"]})
-    provider = client._provider(OpenAIResponsesProvider)
+    provider = provider_for(client, OpenAIResponsesProvider)
     provider.client.responses.create = MagicMock(return_value=sdk.Response.model_validate(RESPONSE))
     tool = {"type": "mcp", "server_label": "docs", "server_url": "https://example.com/mcp"}
 
@@ -189,11 +190,11 @@ def test_azure_responses_override_wins():
 
 def test_azure_responses_client_uses_the_responses_version():
     client = azure_client(api_version="2024-10-21")
-    sdk_client = client._provider(AzureOpenAIResponsesProvider).client
+    sdk_client = provider_for(client, AzureOpenAIResponsesProvider).client
     assert sdk_client._api_version == MIN_RESPONSES_API_VERSION
 
 
 async def test_async_azure_responses_provider_is_registered():
     client = AsyncLLMSwitch(provider="azure_openai", api_key="k", endpoint="https://x.openai.azure.com/",
                             api_version="2025-04-01-preview", deployment_name="prod-gpt5")
-    assert isinstance(client._provider(AsyncAzureOpenAIResponsesProvider), AsyncAzureOpenAIResponsesProvider)
+    assert isinstance(provider_for(client, AsyncAzureOpenAIResponsesProvider), AsyncAzureOpenAIResponsesProvider)

@@ -5,6 +5,7 @@ from llmswitch.core.registry import (
     CHAT_PROVIDER_REGISTRY,
     EMBEDDING_PROVIDER_REGISTRY,
 )
+from llmswitch.models import CreateEmbeddingResponse, Embedding, Usage
 
 
 class StubChat:
@@ -21,6 +22,8 @@ class StubChat:
         StubChat.calls.append({"messages": messages, "stream": stream, **kwargs})
         if StubChat.error is not None:
             raise StubChat.error
+        if stream:
+            return iter([{"ok": True, "stream": True}])
         return {"ok": True, "stream": stream}
 
     def parse(self, messages, response_format, **kwargs):
@@ -54,7 +57,13 @@ class StubEmbeddings:
         StubEmbeddings.calls.append({"input": list(input), **kwargs})
         if StubEmbeddings.error is not None:
             raise StubEmbeddings.error
-        return {"data": [[float(len(text))] for text in input], "model": kwargs.get("model")}
+        return CreateEmbeddingResponse(
+            data=[Embedding(embedding=[float(len(text))], index=i, object="embedding") for i, text in enumerate(input)],
+            model=kwargs.get("model") or "stub",
+            object="list",
+            usage=Usage(prompt_tokens=0, total_tokens=0),
+            created=0,
+        )
 
 
 async def _agen():
@@ -74,3 +83,15 @@ def stubs(monkeypatch):
     for name in ("openai", "azure_openai", "azure_foundry"):
         monkeypatch.setitem(EMBEDDING_PROVIDER_REGISTRY, name, StubEmbeddings)
     return StubChat, StubEmbeddings
+
+
+def provider_for(client, provider_cls):
+    """Return the cached provider instance for ``provider_cls`` from the namespace that uses it."""
+    name = provider_cls.__name__
+    if "Responses" in name:
+        namespace = client.responses
+    elif "Embedding" in name:
+        namespace = client.embeddings
+    else:
+        namespace = client.chat.completions
+    return namespace._instantiate_provider(client.config, provider_cls)

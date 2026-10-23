@@ -8,7 +8,7 @@ OpenAI, Azure OpenAI, Azure AI Foundry, Anthropic and Vertex AI.
 """
 import logging
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
@@ -24,11 +24,13 @@ from .errors import (  # noqa: E402
     ChatCompletionError,
     ConfigurationError,
     ContentFilterError,
+    ContextLengthExceededError,
     EmbeddingGenerationError,
     InvalidResponseError,
     InvalidResponseRequestError,
     LLMSwitchError,
     ModelNotFoundError,
+    RateLimitBackendUnavailableError,
     RateLimitExceededError,
     ResponseNotFoundError,
     ResponsesError,
@@ -79,6 +81,8 @@ __all__ = [
     "EmbeddingGenerationError",
     "InvalidResponseError",
     "ContentFilterError",
+    "ContextLengthExceededError",
+    "RateLimitBackendUnavailableError",
     "TimeOutError",
     "ResponsesError",
     "ResponseNotFoundError",

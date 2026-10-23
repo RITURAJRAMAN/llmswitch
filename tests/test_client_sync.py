@@ -1,4 +1,5 @@
 import pytest
+from conftest import StubChat, provider_for
 
 from llmswitch import (
     APIConnectionError,
@@ -45,15 +46,15 @@ def test_deployment_name_takes_precedence_over_per_call_model(stubs):
 
 def test_streaming_requests_usage_in_the_final_chunk(stubs):
     StubChat, _ = stubs
-    result = openai_client().chat.completions.create(messages=MESSAGES, stream=True)
-    assert result == {"ok": True, "stream": True}
+    chunks = list(openai_client().chat.completions.create(messages=MESSAGES, stream=True))
+    assert chunks == [{"ok": True, "stream": True}]
     assert StubChat.calls[-1]["stream_options"] == {"include_usage": True}
 
 
 def test_caller_stream_options_are_not_overwritten(stubs):
     StubChat, _ = stubs
-    openai_client().chat.completions.create(messages=MESSAGES, stream=True,
-                                            stream_options={"include_usage": False})
+    list(openai_client().chat.completions.create(messages=MESSAGES, stream=True,
+                                                 stream_options={"include_usage": False}))
     assert StubChat.calls[-1]["stream_options"] == {"include_usage": False}
 
 
@@ -95,14 +96,14 @@ def test_embeddings_accept_a_single_string(stubs):
     _, StubEmbeddings = stubs
     result = openai_client().embeddings.create("hello")
     assert StubEmbeddings.calls[-1]["input"] == ["hello"]
-    assert result["data"] == [[5.0]]
+    assert result.data[0].embedding == [5.0]
 
 
 def test_embeddings_preserve_input_order(stubs):
     _, StubEmbeddings = stubs
     result = openai_client().embeddings.create(["a", "bbb", "cc"])
     assert StubEmbeddings.calls[-1]["input"] == ["a", "bbb", "cc"]
-    assert result["data"] == [[1.0], [3.0], [2.0]]
+    assert [item.embedding for item in result.data] == [[1.0], [3.0], [2.0]]
 
 
 def test_embeddings_use_configured_model(stubs):
@@ -189,10 +190,10 @@ def test_embedding_errors_map_to_embedding_generation_error(stubs):
 def test_provider_client_is_built_once_and_reused(stubs):
     client = openai_client()
     client.chat.completions.create(messages=MESSAGES)
-    first = client._providers[next(iter(client._providers))]
+    first = provider_for(client, StubChat)
     client.chat.completions.create(messages=MESSAGES)
-    assert len(client._providers) == 1
-    assert client._provider(type(first)) is first
+    assert len(client.chat.completions._provider_cache) == 1
+    assert provider_for(client, StubChat) is first
 
 
 def test_close_closes_provider_clients_and_context_manager_closes(stubs):
@@ -200,4 +201,4 @@ def test_close_closes_provider_clients_and_context_manager_closes(stubs):
     with openai_client() as client:
         client.chat.completions.create(messages=MESSAGES)
     assert StubChat.closed is True
-    assert client._providers == {}
+    assert client.chat.completions._provider_cache == {}

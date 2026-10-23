@@ -1,11 +1,13 @@
 # llmswitch
 
 One Python client for chat completions, embeddings and the Responses API across OpenAI,
-Azure OpenAI, Azure AI Foundry, Anthropic and Vertex AI. Switch providers by changing the constructor
+Azure OpenAI, Azure AI Foundry, Anthropic and Vertex AI, with rate limits, retries, a circuit
+breaker and backup providers. Switch providers by changing the constructor
 arguments; the call sites stay the same.
 
-Supported in 0.1.1: synchronous and asynchronous chat completions (including streaming and
-structured output), embeddings, and the Responses API for OpenAI and Azure OpenAI.
+Supported in 0.1.2: synchronous and asynchronous chat completions (including streaming and
+structured output), embeddings, the Responses API for OpenAI and Azure OpenAI, rate limiting,
+retries, a circuit breaker, backup failover and context truncation.
 
 ## Installation
 
@@ -14,7 +16,12 @@ pip install llmswitch-sdk
 ```
 
 This installs every supported provider SDK: OpenAI, Azure OpenAI, Azure AI Foundry, Anthropic and
-Vertex AI. Requires Python 3.11 or later.
+Vertex AI. Supports Python 3.11, 3.12 and 3.13.
+
+A provider's SDK is loaded the first time you use that provider, so `import llmswitch` is fast and
+only the providers you use are imported.
+
+Shared rate limits across processes need Redis: `pip install "llmswitch-sdk[redis]"`.
 
 The optional extras `anthropic`, `azure-foundry`, `vertexai` and `all` are still accepted, so existing
 install commands keep working, but they add nothing new.
@@ -113,6 +120,10 @@ client = LLMSwitch(
 When `deployment_name` is set it is always used as the model. A per-call `model` argument
 only overrides the configured model when no deployment is configured.
 
+Token limits can be given as `max_tokens`, `max_completion_tokens` or `max_output_tokens` on every
+provider. The library sends the name that provider expects. This matters for newer OpenAI models,
+which reject `max_tokens`, and for Anthropic, which requires it.
+
 Vertex AI example:
 
 ```python
@@ -145,6 +156,10 @@ Options that the unified constructor sets itself are rejected with a `Configurat
 `api_key`, `api_version`, `azure_endpoint`, `azure_deployment`, `base_url`, `endpoint`,
 `organization`, `project`, `timeout`, `credential`, `credentials`, `location`, `vertexai`
 and `http_options`. Use the unified argument for those instead.
+
+Constructor options are checked. A name that no provider defines, such as the typo `max_retires`,
+raises a `ConfigurationError` that suggests the closest valid name. Options that belong to another
+provider are accepted, so one set of settings works with any provider.
 
 For chat completions and embeddings, per-call keyword arguments are passed to the provider request
 unchanged, so provider-specific parameters such as `seed`, `top_k` or `extra_body` can be given on
@@ -201,14 +216,110 @@ a different version for Responses calls only.
 
 Other providers raise `ResponsesError` with status 501 for Responses calls.
 
+## Rate limits, retries and failover
+
+Limits are tracked per `user_id` (default `"global"`):
+
+```python
+client = LLMSwitch(
+    provider="openai",
+    api_key="sk-...",
+    model="gpt-4o",
+    user_id="team-search",
+    rpm=60,                 # requests per minute
+    tpm=200_000,            # tokens per minute
+    embedding_rpm=300,
+    embedding_tpm=1_000_000,
+)
+```
+
+A request over the limit waits for the window to reopen. If the budget is still exhausted, it fails
+with `RateLimitExceededError`. By default the limits live in the process. To share them across
+processes, set `redis_url`. If Redis is unavailable, `rate_limit_failure_policy` decides what happens:
+`"memory_fallback"` (default) uses in-process limits, `"fail_open"` allows the request, and
+`"fail_closed"` raises `RateLimitBackendUnavailableError`.
+
+To fail instead of waiting, set `on_rate_limit="raise"`. To wait only for short delays, set
+`rate_limit_max_wait` (seconds): a longer wait raises `RateLimitExceededError` immediately.
+
+Transient errors are retried: rate limits, connection errors and 5xx responses. `max_retries`
+(default 3) and `retry_base_delay` control the exponential backoff. `retry_deadline` (seconds) caps how
+long one provider call keeps retrying: when the next wait would pass it, the last error is raised.
+
+```python
+client = LLMSwitch(
+    provider="openai",
+    api_key="sk-...",
+    model="gpt-4o",
+    max_retries=2,
+    circuit_breaker={"failure_threshold": 5, "reset_timeout": 30},
+    backup={"provider": "azure_openai", "api_key": "...", "endpoint": "...",
+            "api_version": "2024-10-21", "deployment_name": "gpt-4o"},
+)
+```
+
+The circuit breaker stops calls to a deployment after repeated failures and retries it after
+`reset_timeout` seconds. `backup` is used when the primary provider fails with a retryable error.
+The backup provider must support the same operation.
+
+`client_options` retries are separate: `max_retries` inside `client_options` is passed to the SDK,
+while `max_retries` on the client is the library's retry loop.
+
+Chat requests can be trimmed to fit the context window with `truncate=True` (set
+`completion_context_window`). Without it, a request that is too long raises
+`ContextLengthExceededError`. Embeddings can be sent in batches:
+
+```python
+vectors = client.embeddings.create(texts, batching=True, batchsize=32)
+```
+
+Pass `share_clients=True` to reuse one SDK client across clients with the same configuration.
+
+Token counts use `tiktoken`. OpenAI model names use their own encoding, and any other name uses the
+newest tiktoken encoding, so counts for other providers are estimates. To count with your own
+function, pass `token_counter=fn`, where `fn(text, model_name)` returns an integer. It is used for
+limits and context checks; truncation still cuts text with tiktoken.
+
+## Observability
+
+Pass `on_event` to receive a dict for each step of a call:
+
+```python
+def log_event(event):
+    print(event["event"], event["operation"], event["provider"], event.get("latency"))
+
+client = LLMSwitch(provider="openai", api_key="sk-...", model="gpt-4o", on_event=log_event)
+```
+
+| `event` | When | Extra fields |
+|---|---|---|
+| `request` | a call is about to be sent | `stream` |
+| `response` | the call returned (for a stream, once it is established) | `stream`, `latency`, `usage` |
+| `error` | the call failed | `error`, `status_code`, `latency` |
+| `retry` | a transient error is about to be retried | `attempt`, `max_retries`, `delay`, `error`, `status_code` |
+| `failover` | the primary provider failed and the backup is used | `error`, `status_code`, and `from_provider` and `to_provider` for calls that are not streams |
+
+Every event also has `operation` (`chat.completions`, `embeddings`, `responses`, or
+`responses.management` with a `verb` such as `retrieve`), `provider` and `model`. The callback runs on the calling thread. If it raises, the error is logged and the call
+continues.
+
+Request details are not logged by default. Pass `live_logs=True` on a call to log it at INFO. The
+messages or input are replaced with a placeholder, and the other parameters are logged with secrets
+redacted, so keep sensitive text out of parameters such as `instructions` when you turn it on.
+
 ## Errors
 
 All errors derive from `LLMSwitchError`:
 
 - `ConfigurationError`: invalid or missing constructor settings.
+- `RateLimitBackendUnavailableError`: Redis is unavailable and `rate_limit_failure_policy` is `"fail_closed"`.
+- `ContextLengthExceededError`: the request is too long for the context window and `truncate` is off.
 - `ChatCompletionError`, `EmbeddingGenerationError`: provider failures. `status_code` carries the HTTP status when known.
 - `AuthenticationError`, `APIConnectionError`, `RateLimitExceededError`, `TimeOutError`, `ContentFilterError`, `ModelNotFoundError`, `InvalidResponseError`.
 - `ResponsesError`: Responses API failures and unsupported providers. `InvalidResponseRequestError` for invalid Responses requests, `UnsupportedCapabilityError` for features turned off for the target.
+
+Every error has `status_code`, `provider`, `user_id` and, for rate limits, `retry_after`. These are `None`
+when the value is not known.
 
 Calling an operation a provider does not support (for example embeddings on `anthropic`)
 raises `LLMSwitchError` before any request is sent.

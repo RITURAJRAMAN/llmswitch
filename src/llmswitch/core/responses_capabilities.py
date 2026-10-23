@@ -46,7 +46,7 @@ class ResponseCapabilities(BaseModel):
 class ResponseCreateRequest(BaseModel):
     """Strict, provider-neutral shape for a Responses ``create`` request.
 
-    This model validates the stable adapter contract. ``extra_body`` remains an
+    This model validates the stable switch contract. ``extra_body`` remains an
     intentional escape hatch for newly released provider fields until they are
     represented in a later capability-matrix revision.
     """
@@ -197,7 +197,7 @@ _AZURE_FEATURES = {
 
 
 def resolve_response_capabilities(config: Any) -> ResponseCapabilities:
-    """Resolve the static and user-overridden contract for one adapter target."""
+    """Resolve the static and user-overridden contract for one switch target."""
     provider = getattr(config, "provider", None)
     if provider == "openai":
         features = dict(_OPENAI_FEATURES)
@@ -294,3 +294,20 @@ def normalize_response_tool_definitions(kwargs: dict[str, Any]) -> None:
         tool.model_dump(exclude_none=True) if isinstance(tool, BaseModel) else tool
         for tool in tools
     ]
+
+
+def is_side_effecting_response_request(kwargs: dict[str, Any], input: Any = None) -> bool:
+    """Return whether a Responses request can create provider-side side effects."""
+    if kwargs.get("background"):
+        return True
+    if isinstance(input, list) and any(
+        (item.get("type") if isinstance(item, dict) else getattr(item, "type", None)) == "mcp_approval_response"
+        for item in input
+    ):
+        return True
+    return any(
+        isinstance(tool, dict) and tool.get("type") in {
+            "mcp", "computer", "code_interpreter", "image_generation",
+        }
+        for tool in kwargs.get("tools") or []
+    )

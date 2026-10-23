@@ -20,10 +20,10 @@ Constants:
     _error_registry: Maps error class names to their classes for lookup.
 """
 
-
 import json
 from typing import Any, Optional
 
+# A registry to automatically map error names to their classes for deserialization
 _error_registry: dict[str, type["LLMSwitchError"]] = {}
 
 
@@ -50,6 +50,21 @@ class LLMSwitchError(Exception):
         self.status_code: int = status_code if status_code is not None else self.status_code
         self.error_code: str = error_code if error_code is not None else self.error_code
         self.context: dict[str, Any] = kwargs  # Extra context for debugging
+
+    @property
+    def provider(self) -> Optional[str]:
+        """The provider that raised the error, when known."""
+        return self.context.get("provider")
+
+    @property
+    def user_id(self) -> Optional[str]:
+        """The ``user_id`` the request was made for, when known."""
+        return self.context.get("user_id")
+
+    @property
+    def retry_after(self) -> Optional[int]:
+        """Seconds to wait before retrying, for rate-limit errors."""
+        return self.context.get("retry_after")
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """
@@ -101,8 +116,10 @@ class LLMSwitchError(Exception):
         return obj
 
 
+# --- Specific Error Classes ---
+
 class ConfigurationError(LLMSwitchError):
-    """Raised when the switch configuration is invalid."""
+    """Raised when switch or failover configuration is invalid."""
     status_code = 400
     error_code = "E_CONFIGURATION"
 
@@ -111,7 +128,7 @@ class ConfigurationError(LLMSwitchError):
 
 
 class InvalidResponseRequestError(LLMSwitchError):
-    """Raised when a Responses create request violates the client contract."""
+    """Raised when a Responses create request violates the switch contract."""
     status_code = 400
     error_code = "E_INVALID_RESPONSE_REQUEST"
 
@@ -135,6 +152,36 @@ class UnsupportedCapabilityError(LLMSwitchError):
             api_version=api_version,
         )
 
+
+class ContextLengthExceededError(LLMSwitchError):
+    """Raised when a request cannot fit within its configured context budget."""
+    status_code = 400
+    error_code = "E_CONTEXT_LENGTH_EXCEEDED"
+
+    def __init__(self, *, input_tokens: int, input_budget: int,
+                 context_window: int, reserved_output_tokens: int,
+                 overhead_tokens: int) -> None:
+        super().__init__(
+            message=(
+                f"Request input requires {input_tokens} tokens but only {input_budget} are available "
+                f"within context window {context_window} after reserving {reserved_output_tokens} output "
+                f"and {overhead_tokens} overhead tokens."
+            ),
+            input_tokens=input_tokens,
+            input_budget=input_budget,
+            context_window=context_window,
+            reserved_output_tokens=reserved_output_tokens,
+            overhead_tokens=overhead_tokens,
+        )
+
+
+class RateLimitBackendUnavailableError(LLMSwitchError):
+    """Raised when fail-closed rate limiting cannot contact its configured backend."""
+    status_code = 503
+    error_code = "E_RATE_LIMIT_BACKEND_UNAVAILABLE"
+
+    def __init__(self, backend: str = "redis") -> None:
+        super().__init__(message=f"Rate-limit backend '{backend}' is unavailable.", backend=backend)
 
 class ModelNotFoundError(LLMSwitchError):
     """Raised when a requested model is not found in the system."""

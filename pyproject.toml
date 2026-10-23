@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llmswitch-sdk"
-version = "0.1.1"
+version = "0.1.2"
 description = "One Python client for chat completions, embeddings and the Responses API across OpenAI, Azure OpenAI, Azure AI Foundry, Anthropic and Vertex AI."
 readme = "README.md"
 license = "MIT"
@@ -17,6 +17,7 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
 ]
 
@@ -27,6 +28,7 @@ dependencies = [
     "azure-ai-inference==1.0.0b9",
     "aiohttp>=3.14.5,<4.0.0",
     "google-genai>=2.32.0,<3",
+    "tiktoken>=0.14.0,<0.15",
 ]
 
 [project.urls]
@@ -41,11 +43,18 @@ Changelog = "https://github.com/RITURAJRAMAN/llmswitch/blob/main/CHANGELOG.md"
 anthropic = []
 azure-foundry = []
 vertexai = []
-all = []
+redis = [
+    "redis>=8.1.0,<9",
+]
+all = [
+    "llmswitch-sdk[redis]",
+]
 dev = [
     "build>=1.6.1",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "mypy>=2.4.0",
     "ruff>=0.17.1",
     "twine>=7.0.0",
 ]
@@ -69,3 +78,34 @@ src = ["src"]
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B"]
 ignore = ["E501"]
+
+[tool.coverage.run]
+source = ["llmswitch"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 60
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/llmswitch"]
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+# The provider modules wrap SDK response types that are unions, and their annotations are
+# still thin. They are not type-checked yet; everything else in the package is.
+[[tool.mypy.overrides]]
+module = [
+    "llmswitch.providers.openai_provider",
+    "llmswitch.providers.azureopenai_provider",
+    "llmswitch.providers.azurefoundry_provider",
+    "llmswitch.providers.anthropic_provider",
+    "llmswitch.providers.vertexai_provider",
+]
+ignore_errors = true

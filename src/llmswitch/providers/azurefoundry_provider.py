@@ -67,7 +67,7 @@ from ..structured import (
     provider_extensions_from_raw,
     pydantic_to_response_format,
 )
-from ._shared import close_async_stream, close_stream, merge_client_options
+from ._shared import close_async_stream, close_stream, merge_client_options, normalize_token_limit
 
 # Initialize logger for this module
 # Name resolves to "llmswitch.providers.azurefoundry_provider"
@@ -114,11 +114,8 @@ class _AzureFoundryMessageConverterMixin:
         request_kwargs = dict(kwargs)
         request_kwargs.pop("parallel_tool_calls", None)
         request_kwargs.pop("stream_options", None)
-        # Azure AI Inference uses max_tokens; map the OpenAI-o-series alias transparently
-        if "max_completion_tokens" in request_kwargs and "max_tokens" not in request_kwargs:
-            request_kwargs["max_tokens"] = request_kwargs.pop("max_completion_tokens")
-        else:
-            request_kwargs.pop("max_completion_tokens", None)
+        # Azure AI Inference uses max_tokens
+        normalize_token_limit(request_kwargs, "max_tokens")
         return request_kwargs
 
     def _convert_messages(self, messages: list[dict[str, Any]]) -> list[Any]:
