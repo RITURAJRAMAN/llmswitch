@@ -142,10 +142,11 @@ class UnsupportedCapabilityError(LLMSwitchError):
     error_code = "E_UNSUPPORTED_CAPABILITY"
 
     def __init__(self, *, provider: str, feature: str, model: Optional[str] = None,
-                 api_version: Optional[str] = None) -> None:
+                 api_version: Optional[str] = None, detail: Optional[str] = None) -> None:
         target = f" for model/deployment '{model}'" if model else ""
+        extra = f" {detail}" if detail else ""
         super().__init__(
-            message=f"Provider '{provider}' does not support Responses capability '{feature}'{target}.",
+            message=f"Provider '{provider}' does not support Responses capability '{feature}'{target}.{extra}",
             provider=provider,
             feature=feature,
             model=model,

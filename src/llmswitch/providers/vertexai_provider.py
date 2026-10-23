@@ -45,7 +45,14 @@ from ..structured import (
     provider_extensions_from_raw,
     to_jsonable,
 )
-from ._shared import close_stream, get_retry_after_seconds, merge_client_options, normalize_token_limit
+from ._responses_emulation import AsyncEmulatedResponsesProvider, SyncEmulatedResponsesProvider
+from ._shared import (
+    close_async_stream,
+    close_stream,
+    get_retry_after_seconds,
+    merge_client_options,
+    normalize_token_limit,
+)
 
 # Name resolves to "llmswitch.providers.vertexai_provider"
 logger = logging.getLogger(__name__)
@@ -75,6 +82,16 @@ def _created_timestamp(response) -> int:
     """Unix time the response was created, or now when the SDK response has no ``create_time``."""
     create_time = getattr(response, "create_time", None)
     return int(create_time.timestamp()) if create_time is not None else int(time.time())
+
+
+class _StreamState:
+    """Running state while mapping one Vertex AI response stream."""
+
+    def __init__(self, config: Any) -> None:
+        self.last_usage: CompletionUsage | None = None
+        self.last_response: Any = None
+        self.requested_count: int = getattr(config, "candidate_count", None) or 1
+        self.seen_candidates: set[int] = set()
 
 
 class VertexAIChatProvider(BaseChatProvider):
@@ -620,17 +637,56 @@ class VertexAIChatProvider(BaseChatProvider):
         }
         return contents, types.GenerateContentConfig(**filtered_config_kwargs)
 
+    def _map_completion(self, response: Any) -> ChatCompletion:
+        """Map a ``generate_content`` response to a unified ``ChatCompletion``."""
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            raise ChatCompletionError("No candidates returned from Vertex AI.", 404, "vertexai")
+
+        # Native structured outputs: google-genai deserializes the response
+        # into the response_schema model and exposes it as response.parsed.
+        choices = []
+        for index, candidate in enumerate(candidates):
+            text, function_calls = self._extract_text_and_function_calls(candidate)
+            if len(candidates) == 1 and not function_calls:
+                function_calls = list(getattr(response, "function_calls", None) or [])
+            mapped_tool_calls = self._map_tool_calls(function_calls)
+            finish_reason = self._normalize_finish_reason(
+                getattr(candidate, "finish_reason", "stop"),
+                has_tool_calls=bool(mapped_tool_calls),
+            )
+            role = self._normalize_role(getattr(getattr(candidate, "content", None), "role", None))
+            choices.append(
+                Choice(
+                    index=getattr(candidate, "index", None) if getattr(candidate, "index", None) is not None else index,
+                    message=ChatCompletionMessage(
+                        role=role, content=text or None, tool_calls=mapped_tool_calls,
+                        parsed=getattr(response, "parsed", None) if index == 0 else None,
+                    ),
+                    finish_reason=finish_reason,
+                    logprobs=self._map_logprobs(candidate),
+                    content_filter_results=getattr(candidate, "safety_ratings", None),
+                    citation_metadata=to_jsonable(getattr(candidate, "citation_metadata", None)),
+                    grounding_metadata=to_jsonable(getattr(candidate, "grounding_metadata", None)),
+                )
+            )
+        extensions = provider_extensions_from_raw(
+            "vertexai",
+            response,
+            {"response_id", "model_version", "candidates", "usage_metadata", "create_time", "parsed"},
+        )
+        return ChatCompletion(
+            id=getattr(response, "response_id", None) or "vertexai-response",
+            object="chat.completion",
+            created=_created_timestamp(response),
+            model=getattr(response, "model_version", None) or self.model,
+            choices=choices,
+            usage=self._build_usage(response),
+            extensions=extensions,
+        )
+
     def _non_streaming_create(self, messages: list, **kwargs):
-        """
-        Handles non-streaming chat completion requests to Vertex AI.
-        Args:
-            messages (list): List of message dicts for prompt construction.
-            **kwargs: Additional model/config parameters.
-        Returns:
-            ChatCompletion: Standardized response object.
-        Raises:
-            ChatCompletionError: If no candidates are returned or API error occurs.
-        """
+        """Non-streaming chat completion; maps API errors to library errors."""
         try:
             contents, config = self._build_request(messages, kwargs)
             response = self.client.models.generate_content(
@@ -638,160 +694,15 @@ class VertexAIChatProvider(BaseChatProvider):
                 contents=contents,
                 config=config,
             )
-
-            candidates = getattr(response, "candidates", None) or []
-            if not candidates:
-                raise ChatCompletionError("No candidates returned from Vertex AI.", 404, "vertexai")
-
-            # Native structured outputs: google-genai deserializes the response
-            # into the response_schema model and exposes it as response.parsed.
-            choices = []
-            for index, candidate in enumerate(candidates):
-                text, function_calls = self._extract_text_and_function_calls(candidate)
-                if len(candidates) == 1 and not function_calls:
-                    function_calls = list(getattr(response, "function_calls", None) or [])
-                mapped_tool_calls = self._map_tool_calls(function_calls)
-                finish_reason = self._normalize_finish_reason(
-                    getattr(candidate, "finish_reason", "stop"),
-                    has_tool_calls=bool(mapped_tool_calls),
-                )
-                role = self._normalize_role(getattr(getattr(candidate, "content", None), "role", None))
-                choices.append(
-                    Choice(
-                        index=getattr(candidate, "index", None) if getattr(candidate, "index", None) is not None else index,
-                        message=ChatCompletionMessage(
-                            role=role, content=text or None, tool_calls=mapped_tool_calls,
-                            parsed=getattr(response, "parsed", None) if index == 0 else None,
-                        ),
-                        finish_reason=finish_reason,
-                        logprobs=self._map_logprobs(candidate),
-                        content_filter_results=getattr(candidate, "safety_ratings", None),
-                        citation_metadata=to_jsonable(getattr(candidate, "citation_metadata", None)),
-                        grounding_metadata=to_jsonable(getattr(candidate, "grounding_metadata", None)),
-                    )
-                )
-            extensions = provider_extensions_from_raw(
-                "vertexai",
-                response,
-                {"response_id", "model_version", "candidates", "usage_metadata", "create_time", "parsed"},
-            )
-            return ChatCompletion(
-                id=getattr(response, "response_id", None) or "vertexai-response",
-                object="chat.completion",
-                created=_created_timestamp(response),
-                model=getattr(response, "model_version", None) or self.model,
-                choices=choices,
-                usage=self._build_usage(response),
-                extensions=extensions,
-            )
-
+            return self._map_completion(response)
         except Exception as e:
             _raise_mapped_vertex_error(e, "Chat completion error")
 
     def _streaming_create(self, messages: list, **kwargs):
-        """
-        Handles streaming chat completion requests to Vertex AI.
-        Yields ChatCompletionChunk objects for each streamed response part.
-        Args:
-            messages (list): List of message dicts for prompt construction.
-            **kwargs: Additional model/config parameters.
-        Returns:
-            generator: Yields ChatCompletionChunk objects.
-        Raises:
-            ChatCompletionError: If API error occurs.
-        """
+        """Streaming chat completion; returns a generator of ``ChatCompletionChunk``."""
         try:
             contents, config = self._build_request(messages, kwargs)
             model = kwargs.pop("model", self.model)
-
-            def stream_generator(response_stream):
-                """
-                Generator for streaming Vertex AI responses.
-                Iterates over response_stream and yields formatted ChatCompletionChunk objects.
-                """
-                last_usage = None
-                last_response_with_metadata = None
-                requested_count = getattr(config, "candidate_count", None) or 1
-                seen_candidates: set[int] = set()
-
-                for response in response_stream:
-                    if getattr(response, "usage_metadata", None):
-                        last_usage = self._build_usage(response)
-
-                    candidates = getattr(response, "candidates", None) or []
-                    if not candidates and not getattr(response, "function_calls", None):
-                        continue
-                    last_response_with_metadata = response
-
-                    base_chunk = {
-                        "id": getattr(response, "response_id", None) or "vertexai-response",
-                        "object": "chat.completion.chunk",
-                        "created": _created_timestamp(response),
-                        "model": getattr(response, "model_version", None) or self.model,
-                    }
-
-                    chunk_choices = []
-                    for position, candidate in enumerate(candidates or [None]):
-                        index = getattr(candidate, "index", None)
-                        if index is None:
-                            index = position
-                        if candidate is not None:
-                            seen_candidates.add(index)
-                        text, function_calls = self._extract_text_and_function_calls(candidate) if candidate else ("", [])
-                        if len(candidates) <= 1 and not function_calls:
-                            function_calls = list(getattr(response, "function_calls", None) or [])
-                        mapped_tool_calls = self._map_delta_tool_calls(function_calls)
-                        finish_reason = self._normalize_finish_reason(
-                            getattr(candidate, "finish_reason", None) if candidate else None,
-                            has_tool_calls=bool(mapped_tool_calls),
-                        )
-                        role = self._normalize_role(
-                            getattr(getattr(candidate, "content", None), "role", None) if candidate else None)
-                        if not (text or mapped_tool_calls or finish_reason is not None):
-                            continue
-                        chunk_choices.append(
-                            ChunkDelta(
-                                index=index,
-                                delta=ChoiceDelta(role=role, content=text or None, tool_calls=mapped_tool_calls),
-                                finish_reason=finish_reason,
-                                content_filter_results=getattr(candidate, "safety_ratings", None) if candidate else None,
-                                citation_metadata=to_jsonable(
-                                    getattr(candidate, "citation_metadata", None)) if candidate else None,
-                                grounding_metadata=to_jsonable(
-                                    getattr(candidate, "grounding_metadata", None)) if candidate else None,
-                            )
-                        )
-                    if chunk_choices:
-                        yield ChatCompletionChunk(
-                            **base_chunk,
-                            choices=chunk_choices,
-                            usage=None,
-                            extensions=provider_extensions_for("vertexai"),
-                        )
-
-                if requested_count > 1 and len(seen_candidates) < requested_count:
-                    raise ChatCompletionError(
-                        f"Vertex AI streaming returned {len(seen_candidates)} of {requested_count} requested candidates.",
-                        provider="vertexai",
-                    )
-
-                if last_usage:
-                    created = int(time.time())
-                    model = self.model
-                    response_id = "vertexai-response"
-                    if last_response_with_metadata is not None:
-                        response_id = getattr(last_response_with_metadata, "response_id", None) or response_id
-                        created = _created_timestamp(last_response_with_metadata)
-                        model = getattr(last_response_with_metadata, "model_version", None) or self.model
-                    yield ChatCompletionChunk(
-                        id=response_id,
-                        object="chat.completion.chunk",
-                        created=created,
-                        model=model,
-                        choices=[],
-                        usage=last_usage,
-                        extensions=provider_extensions_for("vertexai"),
-                    )
 
             def _wrapped():
                 response_stream = None
@@ -801,7 +712,14 @@ class VertexAIChatProvider(BaseChatProvider):
                         contents=contents,
                         config=config,
                     )
-                    yield from stream_generator(response_stream)
+                    state = _StreamState(config)
+                    for response in response_stream:
+                        chunk = self._map_stream_response(response, state)
+                        if chunk is not None:
+                            yield chunk
+                    final = self._finish_stream(state)
+                    if final is not None:
+                        yield final
                 except Exception as e:
                     _raise_mapped_vertex_error(e, "Streaming chat completion error")
                 finally:
@@ -812,3 +730,154 @@ class VertexAIChatProvider(BaseChatProvider):
 
         except Exception as e:
             _raise_mapped_vertex_error(e, "Streaming chat completion error")
+
+    def _map_stream_response(self, response: Any, state: _StreamState) -> ChatCompletionChunk | None:
+        """Map one streamed response to a chunk, or ``None`` when it carries nothing to emit."""
+        if getattr(response, "usage_metadata", None):
+            state.last_usage = self._build_usage(response)
+
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates and not getattr(response, "function_calls", None):
+            return None
+        state.last_response = response
+
+        chunk_choices = []
+        for position, candidate in enumerate(candidates or [None]):
+            index = getattr(candidate, "index", None)
+            if index is None:
+                index = position
+            if candidate is not None:
+                state.seen_candidates.add(index)
+            text, function_calls = self._extract_text_and_function_calls(candidate) if candidate else ("", [])
+            if len(candidates) <= 1 and not function_calls:
+                function_calls = list(getattr(response, "function_calls", None) or [])
+            mapped_tool_calls = self._map_delta_tool_calls(function_calls)
+            finish_reason = self._normalize_finish_reason(
+                getattr(candidate, "finish_reason", None) if candidate else None,
+                has_tool_calls=bool(mapped_tool_calls),
+            )
+            role = self._normalize_role(
+                getattr(getattr(candidate, "content", None), "role", None) if candidate else None)
+            if not (text or mapped_tool_calls or finish_reason is not None):
+                continue
+            chunk_choices.append(
+                ChunkDelta(
+                    index=index,
+                    delta=ChoiceDelta(role=role, content=text or None, tool_calls=mapped_tool_calls),
+                    finish_reason=finish_reason,
+                    content_filter_results=getattr(candidate, "safety_ratings", None) if candidate else None,
+                    citation_metadata=to_jsonable(
+                        getattr(candidate, "citation_metadata", None)) if candidate else None,
+                    grounding_metadata=to_jsonable(
+                        getattr(candidate, "grounding_metadata", None)) if candidate else None,
+                )
+            )
+        if not chunk_choices:
+            return None
+        return ChatCompletionChunk(
+            id=getattr(response, "response_id", None) or "vertexai-response",
+            object="chat.completion.chunk",
+            created=_created_timestamp(response),
+            model=getattr(response, "model_version", None) or self.model,
+            choices=chunk_choices,
+            usage=None,
+            extensions=provider_extensions_for("vertexai"),
+        )
+
+    def _finish_stream(self, state: _StreamState) -> ChatCompletionChunk | None:
+        """Validate the candidate count and build the closing usage chunk, if usage was reported."""
+        if state.requested_count > 1 and len(state.seen_candidates) < state.requested_count:
+            raise ChatCompletionError(
+                f"Vertex AI streaming returned {len(state.seen_candidates)} of {state.requested_count} "
+                "requested candidates.",
+                provider="vertexai",
+            )
+        if not state.last_usage:
+            return None
+        created = int(time.time())
+        model = self.model
+        response_id = "vertexai-response"
+        if state.last_response is not None:
+            response_id = getattr(state.last_response, "response_id", None) or response_id
+            created = _created_timestamp(state.last_response)
+            model = getattr(state.last_response, "model_version", None) or self.model
+        return ChatCompletionChunk(
+            id=response_id,
+            object="chat.completion.chunk",
+            created=created,
+            model=model,
+            choices=[],
+            usage=state.last_usage,
+            extensions=provider_extensions_for("vertexai"),
+        )
+
+
+class AsyncVertexAIChatProvider(VertexAIChatProvider):
+    """Async Vertex AI chat on the google-genai ``aio`` client; request and response mapping are shared."""
+
+    async def create(self, messages: list, stream: bool = False, **kwargs):  # type: ignore[override]
+        parse_model = kwargs.get("response_format")
+        if not is_pydantic_model_class(parse_model):
+            parse_model = None
+        if stream:
+            return await self._astreaming_create(messages, **kwargs)
+        result = await self._anon_streaming_create(messages, **kwargs)
+        if parse_model is not None:
+            populate_parsed(result, parse_model)
+        return result
+
+    async def _anon_streaming_create(self, messages: list, **kwargs):
+        try:
+            contents, config = self._build_request(messages, kwargs)
+            response = await self.client.aio.models.generate_content(
+                model=kwargs.pop("model", self.model),
+                contents=contents,
+                config=config,
+            )
+            return self._map_completion(response)
+        except Exception as e:
+            _raise_mapped_vertex_error(e, "Chat completion error")
+
+    async def _astreaming_create(self, messages: list, **kwargs):
+        try:
+            contents, config = self._build_request(messages, kwargs)
+            model = kwargs.pop("model", self.model)
+            response_stream = await self.client.aio.models.generate_content_stream(
+                model=model, contents=contents, config=config,
+            )
+        except Exception as e:
+            _raise_mapped_vertex_error(e, "Streaming chat completion error")
+
+        async def _wrapped():
+            try:
+                state = _StreamState(config)
+                async for response in response_stream:
+                    chunk = self._map_stream_response(response, state)
+                    if chunk is not None:
+                        yield chunk
+                final = self._finish_stream(state)
+                if final is not None:
+                    yield final
+            except Exception as e:
+                _raise_mapped_vertex_error(e, "Streaming chat completion error")
+            finally:
+                await close_async_stream(response_stream)
+
+        return _wrapped()
+
+    async def aclose(self) -> None:
+        await self.client.aio.aclose()
+
+
+class VertexAIResponsesProvider(SyncEmulatedResponsesProvider):
+    """Responses API emulated on top of Vertex AI chat completions."""
+
+    chat_cls = VertexAIChatProvider
+    provider_name = "vertexai"
+
+
+class AsyncVertexAIResponsesProvider(AsyncEmulatedResponsesProvider):
+    """Async Responses API emulated on top of Vertex AI chat completions."""
+
+    chat_cls = AsyncVertexAIChatProvider
+    provider_name = "vertexai"

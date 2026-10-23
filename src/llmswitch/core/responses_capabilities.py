@@ -24,10 +24,11 @@ class ResponseCapabilities(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    provider: Literal["openai", "azure_openai"]
+    provider: Literal["openai", "azure_openai", "anthropic", "vertexai"]
     model: str | None = None
     api_version: str | None = None
     features: Mapping[str, CapabilityStatus]
+    emulated: bool = False
 
     def status(self, feature: str) -> CapabilityStatus:
         """Return a feature's support level, defaulting to unknown."""
@@ -196,6 +197,20 @@ _AZURE_FEATURES = {
 }
 
 
+# Anthropic and Vertex AI have no Responses API: create is emulated on top of chat completions, so
+# everything that needs server-side state, stored objects or hosted tools is unavailable.
+_EMULATED_FEATURES = {
+    **{feature: CapabilityStatus.UNSUPPORTED for feature in _OPENAI_FEATURES},
+    "previous_response_id": CapabilityStatus.UNSUPPORTED,
+    "store": CapabilityStatus.UNSUPPORTED,
+    "prompt": CapabilityStatus.UNSUPPORTED,
+    "create": CapabilityStatus.SUPPORTED,
+    "tool.function": CapabilityStatus.SUPPORTED,
+}
+_EMULATED_DETAIL = ("Responses on this provider are emulated on top of chat completions: server-side state, "
+                    "stored objects and hosted tools are not available.")
+
+
 def resolve_response_capabilities(config: Any) -> ResponseCapabilities:
     """Resolve the static and user-overridden contract for one switch target."""
     provider = getattr(config, "provider", None)
@@ -209,6 +224,10 @@ def resolve_response_capabilities(config: Any) -> ResponseCapabilities:
         features = dict(_AZURE_FEATURES)
         model = getattr(config, "deployment_name", None) or getattr(config, "model", None)
         api_version = getattr(config, "responses_api_version", None) or getattr(config, "api_version", None)
+    elif provider in ("anthropic", "vertexai"):
+        model = getattr(config, "deployment_name", None) or getattr(config, "model", None)
+        return ResponseCapabilities(provider=provider, model=model, features=dict(_EMULATED_FEATURES),
+                                    emulated=True)
     else:
         raise UnsupportedCapabilityError(provider=str(provider), feature="responses")
 
@@ -226,6 +245,7 @@ def validate_response_operation(config: Any, operation: str) -> ResponseCapabili
             feature=operation,
             model=capabilities.model,
             api_version=capabilities.api_version,
+            detail=_EMULATED_DETAIL if capabilities.emulated else None,
         )
     return capabilities
 
@@ -255,11 +275,18 @@ def validate_responses_create_request(
                 feature=feature,
                 model=capabilities.model,
                 api_version=capabilities.api_version,
+                detail=_EMULATED_DETAIL if capabilities.emulated else None,
             )
     if request.background:
         validate_response_operation(config, "background")
     if request.conversation is not None:
         validate_response_operation(config, "conversation")
+    if request.previous_response_id is not None:
+        validate_response_operation(config, "previous_response_id")
+    if request.store:
+        validate_response_operation(config, "store")
+    if request.prompt is not None:
+        validate_response_operation(config, "prompt")
     for tool in request.tools or []:
         if tool["type"] == "mcp":
             _validate_mcp_policy(config, tool)

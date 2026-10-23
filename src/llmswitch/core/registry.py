@@ -67,17 +67,27 @@ ASYNC_CHAT_PROVIDER_REGISTRY = _LazyRegistry({
     "azure_openai": ("azureopenai_provider", "AsyncAzureOpenAIChatProvider"),
     "azure_foundry": ("azurefoundry_provider", "AsyncAzureFoundryChatProvider"),
     "anthropic": ("anthropic_provider", "AsyncAnthropicChatProvider"),
+    "vertexai": ("vertexai_provider", "AsyncVertexAIChatProvider"),
 })
 EMBEDDING_PROVIDER_REGISTRY = _LazyRegistry({
     "openai": ("openai_provider", "OpenAIEmbeddingProvider"),
     "azure_openai": ("azureopenai_provider", "AzureOpenAIEmbeddingProvider"),
     "azure_foundry": ("azurefoundry_provider", "AzureFoundryEmbeddingProvider"),
 })
+# Providers without an entry here run their sync embedding provider in a worker thread.
+ASYNC_EMBEDDING_PROVIDER_REGISTRY = _LazyRegistry({
+    "azure_foundry": ("azurefoundry_provider", "AsyncAzureFoundryEmbeddingProvider"),
+})
 RESPONSES_PROVIDER_REGISTRY = _LazyRegistry({
     "openai": ("openai_provider", "OpenAIResponsesProvider"),
     "azure_openai": ("azureopenai_provider", "AzureOpenAIResponsesProvider"),
+    # Emulated on top of chat completions: no server-side state or hosted tools.
+    "anthropic": ("anthropic_provider", "AnthropicResponsesProvider"),
+    "vertexai": ("vertexai_provider", "VertexAIResponsesProvider"),
 })
 ASYNC_RESPONSES_PROVIDER_REGISTRY = _LazyRegistry({
     "openai": ("openai_provider", "AsyncOpenAIResponsesProvider"),
     "azure_openai": ("azureopenai_provider", "AsyncAzureOpenAIResponsesProvider"),
+    "anthropic": ("anthropic_provider", "AsyncAnthropicResponsesProvider"),
+    "vertexai": ("vertexai_provider", "AsyncVertexAIResponsesProvider"),
 })

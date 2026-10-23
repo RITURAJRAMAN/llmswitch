@@ -6,7 +6,7 @@ breaker and backup providers. Switch providers by changing the constructor
 arguments; the call sites stay the same.
 
 Supported in 0.1.2: synchronous and asynchronous chat completions (including streaming and
-structured output), embeddings, the Responses API for OpenAI and Azure OpenAI, rate limiting,
+structured output), embeddings, the Responses API for OpenAI, Azure OpenAI, Anthropic and Vertex AI, rate limiting,
 retries, a circuit breaker, backup failover and context truncation.
 
 ## Installation
@@ -99,7 +99,9 @@ print(parsed.choices[0].message.parsed)
 | `azure_openai` | `api_key`, `endpoint`, `api_version`, `deployment_name` | yes / yes | yes |
 | `azure_foundry` | `api_key`, `endpoint`, `api_version`, `deployment_name` | yes / yes | yes |
 | `anthropic` | `api_key` | yes / yes | no |
-| `vertexai` | `location`, `credentials_path` | yes / no | no |
+| `vertexai` | `location`, `credentials_path` | yes / yes | no |
+
+Async embeddings use the provider's native async client for `azure_foundry`; `openai` and `azure_openai` run in a worker thread.
 
 Optional settings: `timeout` (seconds) for every provider; `endpoint`, `organization` and
 `project` for `openai`; `endpoint` and `enable_prompt_caching` (default `True`) for `anthropic`;
@@ -167,7 +169,7 @@ unchanged, so provider-specific parameters such as `seed`, `top_k` or `extra_bod
 
 ## Responses API
 
-The Responses API is available through `client.responses` for `openai` and `azure_openai`:
+The Responses API is available through `client.responses` for `openai`, `azure_openai`, `anthropic` and `vertexai`. OpenAI and Azure OpenAI use the service's own Responses API; Anthropic and Vertex AI [are emulated](#responses-on-anthropic-and-vertex-ai) on top of chat completions.
 
 ```python
 from pydantic import BaseModel
@@ -214,7 +216,21 @@ Azure OpenAI calls to `/responses` need API version `2025-03-01-preview` or late
 `api_version` values are raised to the minimum automatically. Set `responses_api_version` to choose
 a different version for Responses calls only.
 
-Other providers raise `ResponsesError` with status 501 for Responses calls.
+`azure_foundry` has no Responses API and raises `ResponsesError` with status 501.
+
+### Responses on Anthropic and Vertex AI
+
+For `anthropic` and `vertexai`, `client.responses.create()` (and `stream()`, `parse()`, and the async client) translate the request into a chat completion and the result back into a `Response`, so the same code runs on every Responses-capable provider:
+
+```python
+client = LLMSwitch(provider="anthropic", api_key="sk-ant-...", model="claude-opus-4-5")
+reply = client.responses.create(input="Hello", instructions="Be brief.")
+print(reply.output_text, reply.usage.total_tokens)
+```
+
+What works: text and image input, `instructions`, function tools and `tool_choice`, function-call round trips (`function_call` and `function_call_output` items), `text` formats and `text_format` for structured output, `temperature`, `top_p`, `max_output_tokens`, streaming, and the usual rate limits, retries and failover. Streams produce the Responses events (`response.created`, `response.output_text.delta`, `response.function_call_arguments.delta`, the `.done` events, and `response.completed` or `response.incomplete`). A response cut off by the token limit has `status="incomplete"`.
+
+What does not work, because chat completions cannot provide it: server-side state (`previous_response_id`, `conversation`, `store=True`, `background`), stored objects (`retrieve`, `delete`, `cancel`, `compact`, `input_items`, `input_tokens.count`, `conversations`) and hosted tools (web search, file search, code interpreter, MCP and the rest). These raise `UnsupportedCapabilityError` before any request is sent, so keep the conversation history in your application and pass it as `input` items. `client.responses.capabilities().emulated` is `True` for these providers. Fields that have no chat equivalent (`metadata`, `user`, `truncation`, `include`, `reasoning` and similar) are accepted and ignored. Response ids are generated locally and cannot be used to retrieve anything.
 
 ## Rate limits, retries and failover
 

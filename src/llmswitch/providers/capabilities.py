@@ -88,7 +88,7 @@ _MANIFESTS: dict[str, ProviderCapabilityManifest] = {
             "chat.sync": CapabilitySupport.SUPPORTED,
             "chat.async": CapabilitySupport.SUPPORTED,
             "embeddings": CapabilitySupport.UNSUPPORTED,
-            "responses": CapabilitySupport.UNSUPPORTED,
+            "responses": CapabilitySupport.SUPPORTED,
         }),
         features=MappingProxyType({
             "streaming": CapabilitySupport.SUPPORTED,
@@ -102,9 +102,9 @@ _MANIFESTS: dict[str, ProviderCapabilityManifest] = {
         provider="vertexai",
         operations=MappingProxyType({
             "chat.sync": CapabilitySupport.SUPPORTED,
-            "chat.async": CapabilitySupport.UNSUPPORTED,
+            "chat.async": CapabilitySupport.SUPPORTED,
             "embeddings": CapabilitySupport.UNSUPPORTED,
-            "responses": CapabilitySupport.UNSUPPORTED,
+            "responses": CapabilitySupport.SUPPORTED,
         }),
         features=MappingProxyType({
             "streaming": CapabilitySupport.SUPPORTED,

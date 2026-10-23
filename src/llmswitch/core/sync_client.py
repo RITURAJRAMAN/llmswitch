@@ -35,7 +35,7 @@ from ..errors import (
     ResponsesError,
     TimeOutError,
 )
-from ..models import CreateEmbeddingResponse, ProviderExtensions, Usage
+from ..models import CreateEmbeddingResponse
 from ..providers.capabilities import require_operation
 from ..ratelimit import BatchUtility, RedisRateLimiter
 from ..ratelimit.limiter import rate_limit_scope
@@ -49,6 +49,7 @@ from .common import (
     responses_provider_class,
     validate_messages,
 )
+from .embedding_flow import EmbeddingAccumulator
 from .events import emit, traced
 from .execution import build_execution_plan, reserve_rate_limit
 from .failover import (
@@ -405,10 +406,7 @@ class _Embeddings(ProviderCache):
                 token_counts, batchsize, target_config.embedding_tpm,
                 batching=batching, restore_order=restore_order,
             )
-            all_results = []
-            usages = []
-            extensions: list[tuple[list[int], ProviderExtensions]] = []
-            response_model = target_plan.target.resolved_model
+            acc = EmbeddingAccumulator(target_config.provider, target_plan.target.resolved_model, restore_order)
             request_kwargs = dict(target_plan.provider_request)
             for batch_idx, indices in enumerate(batches):
                 if batching:
@@ -427,51 +425,15 @@ class _Embeddings(ProviderCache):
                         base_delay=target_config.retry_base_delay,
                         max_delay=DEFAULT_RETRY_MAX_DELAY, deadline=self.config.retry_deadline, **request_kwargs,
                     )
-                    data = getattr(result, "data", result)
-                    if len(data) != len(indices):
-                        raise EmbeddingGenerationError(
-                            f"Provider returned {len(data)} embeddings for {len(indices)} inputs"
-                        )
-                    for index, embedding in zip(indices, data, strict=True):
-                        embedding.index = index
-                        all_results.append(embedding)
-                    usage = getattr(result, "usage", None)
-                    if usage is not None:
-                        usages.append(usage)
-                    extension = getattr(result, "extensions", None)
-                    if extension is not None:
-                        extensions.append((indices, extension))
-                    response_model = getattr(result, "model", None) or response_model
+                    acc.add(result, indices)
                 except Exception as exc:
                     raise_embedding_error(target_config, exc)
 
-            if restore_order:
-                all_results.sort(key=lambda item: item.index)
-            prompt_tokens = sum(getattr(usage, "prompt_tokens", 0) for usage in usages)
-            total_tokens = sum(getattr(usage, "total_tokens", 0) for usage in usages)
             self.rate_limiter.update_token_usage(
-                user_key, max(0, total_tokens - sum(token_counts)), self.window_seconds,
+                user_key, max(0, acc.total_tokens - sum(token_counts)), self.window_seconds,
                 request_type="embedding", scope=target_plan.target.limiter_scope_key,
             )
-            aggregated_extensions = None
-            if len(extensions) == 1:
-                aggregated_extensions = extensions[0][1]
-            elif extensions:
-                aggregated_extensions = ProviderExtensions(
-                    provider=target_config.provider,
-                    fields={"batches": [
-                        {"input_indices": indices, "fields": extension.fields}
-                        for indices, extension in extensions
-                    ]},
-                )
-            return CreateEmbeddingResponse(
-                data=all_results,
-                model=response_model,
-                object="list",
-                usage=Usage(prompt_tokens=prompt_tokens, total_tokens=total_tokens),
-                extensions=aggregated_extensions,
-                created=int(time.time()),
-            )
+            return acc.build()
 
         try:
             return run_target(self.config, plan, provider_cls)

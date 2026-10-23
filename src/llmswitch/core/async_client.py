@@ -3,7 +3,8 @@ core.async_client
 
 Asynchronous chat handler and the public ``AsyncLLMSwitch`` entry point.
 Chat completions use the provider's native async client; embeddings are exposed
-via ``.embeddings`` and run in a worker thread (their providers are synchronous).
+via ``.embeddings``: Azure AI Foundry uses its native async client, and the other providers
+run their synchronous embedding provider in a worker thread.
 
 Non-blocking I/O
 ----------------
@@ -35,13 +36,14 @@ from ..errors import (
     APIConnectionError,
     ChatCompletionError,
     ConfigurationError,
+    EmbeddingGenerationError,
     LLMSwitchError,
     RateLimitExceededError,
     ResponsesError,
     TimeOutError,
 )
 from ..providers.capabilities import require_operation
-from ..ratelimit import RedisRateLimiter
+from ..ratelimit import BatchUtility, RedisRateLimiter
 from ..ratelimit.limiter import rate_limit_scope
 from .circuit_breaker import get_breaker, provider_call
 from .common import (
@@ -49,11 +51,13 @@ from .common import (
     normalize_embedding_input,
     provider_class,
     raise_chat_error,
+    raise_embedding_error,
     responses_provider_class,
     validate_messages,
 )
+from .embedding_flow import EmbeddingAccumulator
 from .events import emit, traced
-from .execution import areserve_rate_limit
+from .execution import areserve_rate_limit, build_execution_plan
 from .failover import (
     build_backup_execution_plan,
     prepare_backup_provider,
@@ -63,13 +67,19 @@ from .failover import (
 from .planning import plan_chat, plan_responses
 from .preprocess import (
     ProviderCache,
+    apply_model_priority,
     prepare_messages,
     prepare_response_input,
     prepare_target_messages,
     prepare_target_response_input,
 )
 from .redaction import redact_sensitive
-from .registry import ASYNC_CHAT_PROVIDER_REGISTRY, ASYNC_RESPONSES_PROVIDER_REGISTRY
+from .registry import (
+    ASYNC_CHAT_PROVIDER_REGISTRY,
+    ASYNC_EMBEDDING_PROVIDER_REGISTRY,
+    ASYNC_RESPONSES_PROVIDER_REGISTRY,
+    EMBEDDING_PROVIDER_REGISTRY,
+)
 from .responses_capabilities import (
     is_side_effecting_response_request,
     normalize_response_tool_definitions,
@@ -77,7 +87,7 @@ from .responses_capabilities import (
     validate_responses_create_request,
 )
 from .responses_management import prepare_management_call, raise_response_error
-from .retry import _async_retry_call, _is_retryable
+from .retry import _async_retry_call, _is_retryable, _retry_call
 from .streaming import (
     AsyncStreamSession,
     StreamHandle,
@@ -705,38 +715,130 @@ class _AsyncChat:
         self.completions = _AsyncChatCompletions(config, rate_limiter)
 
 
-class _AsyncEmbeddings:
+class _AsyncEmbeddings(ProviderCache):
     """
-    Async embeddings facade. Embedding providers are synchronous, so each call is
-    run in a worker thread via ``asyncio.to_thread`` — keeping the event loop free
-    while rate-limit waits, tiktoken, and provider HTTP run off-loop. Mirrors the
-    ``LLMSwitch.embeddings.create`` signature.
+    Async embeddings facade with the same pipeline as ``_Embeddings``: rate limiting,
+    batching, retries, and backup failover. Providers with a native async embedding
+    class (see ``ASYNC_EMBEDDING_PROVIDER_REGISTRY``) are awaited directly; the others
+    run their sync provider in a worker thread. Blocking tokenization and limiter
+    calls always run off the event loop.
     """
 
     def __init__(self, config: Any, rate_limiter: "RedisRateLimiter") -> None:
-        from .sync_client import _Embeddings  # local import avoids any load-order coupling
-        self._embeddings = _Embeddings(config, rate_limiter)
+        self.config = config
+        self.rate_limiter = rate_limiter
+        self.batch_utility = BatchUtility()
+        self.window_seconds = DEFAULT_WINDOW_SECONDS
+        self._provider_cache: dict[tuple[type, tuple[Any, ...]], Any] = {}
 
-    async def create(self, input: str | list[str], batching: bool = False, batchsize: int = 32,
-                     **kwargs: Any):  # noqa: A002
+    @staticmethod
+    def _target_class(provider: str) -> tuple[type, bool]:
+        """Return the embedding provider class and whether it is natively async."""
+        if provider in ASYNC_EMBEDDING_PROVIDER_REGISTRY:
+            return ASYNC_EMBEDDING_PROVIDER_REGISTRY[provider], True
+        return provider_class(provider, EMBEDDING_PROVIDER_REGISTRY, "embeddings"), False
+
+    @traced("embeddings")
+    async def create(self, input: str | list[str], batching: bool = False, batchsize: int = 32,  # noqa: A002
+                     **kwargs: Any):
+        """Create embeddings. See ``_Embeddings.create`` for the parameters."""
         input = normalize_embedding_input(input)
-        """Create embeddings off the event loop. See ``_Embeddings.create``."""
-        return await asyncio.to_thread(
-            self._embeddings.create, input, batching=batching, batchsize=batchsize, **kwargs
+        if batchsize <= 0:
+            raise ValueError("batchsize must be positive")
+        live_logs = kwargs.pop("live_logs", False)
+        retry_override: int | None = kwargs.pop("max_retries", None)
+        restore_order = kwargs.pop("restore_order", True)
+        provider_class(self.config.provider, EMBEDDING_PROVIDER_REGISTRY, "embeddings")
+        require_operation(self.config.provider, "embeddings")
+        validate_backup_for_registry(self.config, EMBEDDING_PROVIDER_REGISTRY)
+        if live_logs:
+            logger.info("Embedding request: %s", json.dumps(redact_sensitive(
+                {"provider": self.config.provider, "input": "<hidden>", "kwargs": kwargs})))
+        apply_model_priority(self.config, kwargs)
+        plan = build_execution_plan(
+            self.config, operation="embeddings", normalized_request={"embedding_input": input, **kwargs},
         )
+        user_key = getattr(self.config, "user_id", "global")
 
-    async def aclose(self) -> None:
-        """Close cached embedding provider clients (off the event loop)."""
-        await asyncio.to_thread(self._embeddings.close)
+        async def run_target(target_config: Any, target_plan: Any) -> Any:
+            model = target_plan.target.resolved_model
+            provider_cls, native = self._target_class(target_config.provider)
+
+            def count_all() -> list[int]:
+                counts: dict[str, int] = {}
+                for text in input:
+                    if text not in counts:
+                        counts[text] = self.rate_limiter.count_tokens(text, model_name=model)
+                return [counts[text] for text in input]
+
+            token_counts = await asyncio.to_thread(count_all)
+            batches = self.batch_utility.plan_batches(
+                token_counts, batchsize, target_config.embedding_tpm,
+                batching=batching, restore_order=restore_order,
+            )
+            acc = EmbeddingAccumulator(target_config.provider, model, restore_order)
+            request_kwargs = dict(target_plan.provider_request)
+            for batch_idx, indices in enumerate(batches):
+                if batching:
+                    self.batch_utility.print_progress_bar(batch_idx + 1, len(batches))
+                await areserve_rate_limit(
+                    self.rate_limiter, user_key, target_config.embedding_rpm, target_config.embedding_tpm,
+                    self.window_seconds, sum(token_counts[i] for i in indices),
+                    request_type="embedding", suppress_log=batching, scope=target_plan.target.limiter_scope_key,
+                )
+                try:
+                    provider = self._instantiate_provider(target_config, provider_cls)
+                    texts = [input[i] for i in indices]
+                    retry_options = {
+                        "max_retries": retry_override if retry_override is not None else target_config.max_retries,
+                        "base_delay": target_config.retry_base_delay,
+                        "max_delay": DEFAULT_RETRY_MAX_DELAY, "deadline": self.config.retry_deadline,
+                    }
+                    if native:
+                        result = await _async_retry_call(provider.create, texts, **retry_options, **request_kwargs)
+                    else:
+                        result = await asyncio.to_thread(
+                            _retry_call, provider.create, texts, **retry_options, **request_kwargs)
+                    acc.add(result, indices)
+                except Exception as exc:
+                    raise_embedding_error(target_config, exc)
+            await asyncio.to_thread(
+                self.rate_limiter.update_token_usage,
+                user_key, max(0, acc.total_tokens - sum(token_counts)), self.window_seconds,
+                "embedding", target_plan.target.limiter_scope_key,
+            )
+            return acc.build()
+
+        try:
+            return await run_target(self.config, plan)
+        except (EmbeddingGenerationError, APIConnectionError, RateLimitExceededError, TimeOutError) as primary_err:
+            if not getattr(self.config, "backup", None):
+                raise
+            logger.warning("Primary embedding provider failed (%s), failing over to backup.", primary_err)
+            emit("failover", from_provider=self.config.provider,
+                 to_provider=(getattr(self.config, "backup", None) or {}).get("provider"),
+                 error=type(primary_err).__name__, status_code=getattr(primary_err, "status_code", None))
+            try:
+                backup_execution = build_backup_execution_plan(
+                    self.config, operation="embeddings", normalized_request={"embedding_input": input, **kwargs},
+                )
+                if backup_execution is None:
+                    raise LLMSwitchError("Backup provider configuration is missing")
+                backup_config, backup_plan = backup_execution
+                require_operation(backup_config.provider, "embeddings")
+                return await run_target(backup_config, backup_plan)
+            except Exception as backup_err:
+                logger.error("Backup embedding provider also failed: %s", backup_err)
+                raise primary_err from backup_err
 
 
 class AsyncLLMSwitch:
     """
     Async entry point mimicking the OpenAI async client. Chat completions use the
-    provider's native async client; ``.embeddings`` runs the (synchronous) embedding
-    providers in a worker thread so the event loop stays free.
+    provider's native async client. ``.embeddings`` uses the native async client for
+    azure_foundry and a worker thread for the other providers, so the event loop stays free.
 
-    Providers with native async chat: azure_openai, azure_foundry, openai, anthropic.
+    Providers with native async chat: azure_openai, azure_foundry, openai, anthropic, vertexai.
 
     Usage::
 
@@ -781,11 +883,11 @@ class AsyncLLMSwitch:
         self.embeddings = _AsyncEmbeddings(self.config, self.rate_limiter)
         self.responses = _AsyncResponses(self.config, self.rate_limiter)
         self.chat.completions._on_event = on_event
-        self.embeddings._embeddings._on_event = on_event
+        self.embeddings._on_event = on_event
         self.responses._on_event = on_event
         if share_clients:
             self.chat.completions._share_clients = True
-            self.embeddings._embeddings._share_clients = True
+            self.embeddings._share_clients = True
             self.responses._share_clients = True
         if circuit_breaker:
             self.chat.completions._breaker_enabled = True

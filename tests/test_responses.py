@@ -132,13 +132,6 @@ def test_streaming_yields_mapped_events():
     assert events[0].delta == "hi"
 
 
-def test_unsupported_provider_raises_501():
-    client = LLMSwitch(provider="anthropic", api_key="sk-ant-test", model="claude-opus-4-5")
-    with pytest.raises(ResponsesError) as info:
-        client.responses.create(input="hello")
-    assert info.value.status_code == 501
-
-
 def test_remote_mcp_tool_requires_an_explicit_policy():
     client = openai_client()
     tool = {"type": "mcp", "server_label": "docs", "server_url": "https://example.com/mcp"}

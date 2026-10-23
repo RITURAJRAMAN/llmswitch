@@ -15,6 +15,9 @@ All notable changes to this project are documented here. The format follows
 - Backup provider failover with `backup={"provider": ..., ...}`, used when the primary provider fails with a retryable error.
 - Context handling for chat: `truncate=True` trims messages to fit `completion_context_window`. `context_output_reserve_tokens` and `context_overhead_tokens` reserve room for output and protocol overhead.
 - Batched embeddings with `batching=True` and `batchsize`.
+- Responses API for Anthropic and Vertex AI, emulated on top of chat completions, sync and async. Text and image input, function tools, structured output and streaming events work; server-side state, stored objects and hosted tools raise `UnsupportedCapabilityError`. A native OpenAI or Azure OpenAI primary can fail over to an emulated backup and the reverse.
+- Async chat for Vertex AI. `AsyncLLMSwitch` now supports `vertexai` through the google-genai async client, including streaming, tool calls and structured output. It shares its request and response mapping with the sync provider.
+- Native async embeddings for Azure AI Foundry. `AsyncLLMSwitch.embeddings` awaits the SDK's async client for `azure_foundry` and keeps the same rate limiting, batching, retries and failover. The other providers still run in a worker thread.
 - `share_clients=True` to reuse one SDK client across clients that have the same configuration.
 - `token_counter` to count tokens with your own function.
 - `on_event` callback that receives `request`, `response`, `error`, `retry` and `failover` events with timing and token usage.

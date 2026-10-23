@@ -40,12 +40,6 @@ async def test_async_invalid_messages_are_rejected(stubs):
         await openai_client().chat.completions.create(messages=[])
 
 
-async def test_async_chat_is_unsupported_for_vertexai():
-    client = AsyncLLMSwitch(provider="vertexai", location="us-central1", credentials_path="/tmp/sa.json")
-    with pytest.raises(LLMSwitchError, match="Unsupported provider for async chat completion: vertexai"):
-        await client.chat.completions.create(messages=MESSAGES)
-
-
 async def test_async_chat_errors_are_mapped(stubs):
     StubChat, _ = stubs
     StubChat.error = ValueError("bad request")

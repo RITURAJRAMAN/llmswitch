@@ -19,6 +19,7 @@ from typing import Any
 
 from azure.ai.inference import ChatCompletionsClient, EmbeddingsClient
 from azure.ai.inference.aio import ChatCompletionsClient as AsyncChatCompletionsClient
+from azure.ai.inference.aio import EmbeddingsClient as AsyncEmbeddingsClient
 from azure.ai.inference.models import (
     AssistantMessage,
     ChatCompletionsToolCall,
@@ -662,7 +663,66 @@ class AsyncAzureFoundryChatProvider(_AzureFoundryMessageConverterMixin, BaseChat
                 await close_async_stream(stream)
 
 
-class AzureFoundryEmbeddingProvider(BaseEmbeddingProvider):
+class _AzureFoundryEmbeddingMixin:
+    """Request options, response mapping and error translation shared by the sync and async providers."""
+
+    endpoint: str | None
+    model: str | None
+
+    def _client_options(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        return merge_client_options({
+            "endpoint": self.endpoint,
+            "credential": AzureKeyCredential(kwargs.get("api_key")),
+            "api_version": kwargs.get("api_version", "2024-05-01-preview"),
+            "retry_total": 0,
+            "connection_timeout": kwargs.get("timeout"),
+            "read_timeout": kwargs.get("timeout"),
+        }, kwargs.get("client_options"))
+
+    def _map_response(self, response: Any) -> CreateEmbeddingResponse:
+        data = [
+            Embedding(
+                index=getattr(item, "index", None),
+                embedding=getattr(item, "embedding", None),
+                object=getattr(item, "object", "embedding")
+            )
+            for item in response.data
+        ]
+        usage = Usage(
+            prompt_tokens=getattr(response.usage, "prompt_tokens", 0),
+            total_tokens=getattr(response.usage, "total_tokens", 0),
+            completion_tokens=getattr(response.usage, "completion_tokens", 0)
+        )
+        extensions = provider_extensions_from_raw(
+            "azure_foundry",
+            response,
+            {"object", "model", "data", "usage"},
+        )
+        return CreateEmbeddingResponse(
+            object=getattr(response, "object", "list"),
+            created=int(time.time()),
+            model=getattr(response, "model", None),
+            data=data,
+            usage=usage,
+            extensions=extensions,
+        )
+
+    def _translate_error(self, e: Exception) -> Exception:
+        if isinstance(e, ConnectionError):
+            logger.error("Connection error in embedding creation: %s | Exception: %s", self.endpoint, e)
+            return APIConnectionError(self.endpoint)
+        if isinstance(e, PermissionError):
+            logger.error("Authentication error in embedding creation | Exception: %s", e)
+            return AuthenticationError()
+        if isinstance(e, ValueError):
+            logger.error("Invalid response in embedding creation | Exception: %s", e)
+            return InvalidResponseError(str(e))
+        status_code = getattr(e, "status_code", 500)
+        logger.error("Embedding generation error | Exception: %s", e)
+        return EmbeddingGenerationError(str(e), status_code=status_code)
+
+
+class AzureFoundryEmbeddingProvider(_AzureFoundryEmbeddingMixin, BaseEmbeddingProvider):
     """
     Azure Foundry Embedding Provider.
     Adapts Azure-hosted OpenAI embedding models into unified LLM Switch response format.
@@ -676,18 +736,11 @@ class AzureFoundryEmbeddingProvider(BaseEmbeddingProvider):
         """
         self.endpoint: str = kwargs.get("endpoint")
         self.model: str = kwargs.get("deployment_name") or kwargs.get("model")
-        self.client: EmbeddingsClient = EmbeddingsClient(**merge_client_options({
-            "endpoint": self.endpoint,
-            "credential": AzureKeyCredential(kwargs.get("api_key")),
-            "api_version": kwargs.get("api_version", "2024-05-01-preview"),
-            "retry_total": 0,
-            "connection_timeout": kwargs.get("timeout"),
-            "read_timeout": kwargs.get("timeout"),
-        }, kwargs.get("client_options")))
+        self.client: EmbeddingsClient = EmbeddingsClient(**self._client_options(kwargs))
 
     def create(self, input: list[str], **kwargs) -> CreateEmbeddingResponse:  # noqa: A002
         """
-        Create embeddings for the given input using Azure OpenAI.
+        Create embeddings for the given input.
         Args:
             input (list[str]): List of input strings to embed.
             **kwargs: Additional parameters for embedding creation.
@@ -695,52 +748,26 @@ class AzureFoundryEmbeddingProvider(BaseEmbeddingProvider):
             CreateEmbeddingResponse: The embedding response object.
         """
         try:
-            response = self.client.embed(
-                model=kwargs.pop("model", self.model),
-                input=input,
-                **kwargs,
-            )
-
-            # Map response to unified model
-            data = [
-                Embedding(
-                    index=getattr(item, "index", None),
-                    embedding=getattr(item, "embedding", None),
-                    object=getattr(item, "object", "embedding")
-                )
-                for item in response.data
-            ]
-
-            usage = Usage(
-                prompt_tokens=getattr(response.usage, "prompt_tokens", 0),
-                total_tokens=getattr(response.usage, "total_tokens", 0),
-                completion_tokens=getattr(response.usage, "completion_tokens", 0)
-            )
-            extensions = provider_extensions_from_raw(
-                "azure_foundry",
-                response,
-                {"object", "model", "data", "usage"},
-            )
-
-            return CreateEmbeddingResponse(
-                object=getattr(response, "object", "list"),
-                created=int(time.time()),
-                model=getattr(response, "model", None),
-                data=data,
-                usage=usage,
-                extensions=extensions,
-            )
-
-        except ConnectionError as e:
-            logger.error("Connection error in embedding creation: %s | Exception: %s", self.endpoint, e)
-            raise APIConnectionError(self.endpoint) from e
-        except PermissionError as e:
-            logger.error("Authentication error in embedding creation | Exception: %s", e)
-            raise AuthenticationError() from e
-        except ValueError as e:
-            logger.error("Invalid response in embedding creation | Exception: %s", e)
-            raise InvalidResponseError(str(e)) from e
+            response = self.client.embed(model=kwargs.pop("model", self.model), input=input, **kwargs)
+            return self._map_response(response)
         except Exception as e:
-            status_code = getattr(e, "status_code", 500)
-            logger.error("Embedding generation error | Exception: %s", e)
-            raise EmbeddingGenerationError(str(e), status_code=status_code) from e
+            raise self._translate_error(e) from e
+
+
+class AsyncAzureFoundryEmbeddingProvider(_AzureFoundryEmbeddingMixin, BaseEmbeddingProvider):
+    """Async Azure Foundry embeddings, on the SDK's native ``aio`` client."""
+
+    def __init__(self, **kwargs):
+        self.endpoint: str = kwargs.get("endpoint")
+        self.model: str = kwargs.get("deployment_name") or kwargs.get("model")
+        self.client = AsyncEmbeddingsClient(**self._client_options(kwargs))
+
+    async def create(self, input: list[str], **kwargs) -> CreateEmbeddingResponse:  # noqa: A002
+        try:
+            response = await self.client.embed(model=kwargs.pop("model", self.model), input=input, **kwargs)
+            return self._map_response(response)
+        except Exception as e:
+            raise self._translate_error(e) from e
+
+    async def aclose(self) -> None:
+        await self.client.close()

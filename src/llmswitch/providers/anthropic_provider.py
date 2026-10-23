@@ -86,6 +86,7 @@ from ..structured import (
     provider_extensions_from_raw,
     to_jsonable,
 )
+from ._responses_emulation import AsyncEmulatedResponsesProvider, SyncEmulatedResponsesProvider
 from ._shared import merge_client_options, normalize_token_limit
 
 logger = logging.getLogger(__name__)
@@ -997,3 +998,17 @@ class AsyncAnthropicChatProvider(AnthropicChatProvider):
 
         except Exception as e:
             _raise_mapped_anthropic_error(e, context="Async Anthropic streaming error", timeout_seconds=self.timeout)
+
+
+class AnthropicResponsesProvider(SyncEmulatedResponsesProvider):
+    """Responses API emulated on top of Anthropic chat completions."""
+
+    chat_cls = AnthropicChatProvider
+    provider_name = "anthropic"
+
+
+class AsyncAnthropicResponsesProvider(AsyncEmulatedResponsesProvider):
+    """Async Responses API emulated on top of Anthropic chat completions."""
+
+    chat_cls = AsyncAnthropicChatProvider
+    provider_name = "anthropic"
