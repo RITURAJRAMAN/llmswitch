@@ -13,6 +13,16 @@ All notable changes to this project are documented here. The format follows
 - `run_tool_loop` and `arun_tool_loop`: a bounded tool loop that runs the tools the model asks for and sends the results back. Tool failures, unknown tool names and malformed arguments are returned to the model as error tool messages. `max_steps` limits the model calls, and `ToolLoopLimitError` is raised when the limit is reached.
 - Message conversion between LangChain messages and llmswitch's chat format, including images in OpenAI and LangChain standard shapes.
 - Examples `examples/langchain_chat.py` and `examples/langchain_tool_loop.py`.
+- Fixed in this release, found in review of 0.1.2 behaviour:
+  - A stream the caller stops early no longer leaves the circuit breaker stuck half-open. Every later call used to fail until the process restarted.
+  - The in-process rate-limit table no longer refuses every new user once it holds 10,000 windows. It drops the oldest window and logs a warning once.
+  - A denied request gives back its reservation, so it no longer uses up the window budget.
+  - Anthropic honours a per-call `model` when no `deployment_name` is set, as the other providers do. A configured deployment still wins.
+  - A prompt that Vertex AI blocks raises `ContentFilterError`, instead of a 404 for non-streaming calls or an empty stream.
+  - Timeouts are no longer retried, because the provider may already have processed the request. Connection errors and 5xx responses are still retried.
+  - Credential headers `x-api-key`, `x-goog-api-key`, `proxy-authorization` and `cookie` are redacted in `live_logs` output.
+  - Anthropic logs a warning when it drops a content part it does not support.
+  - `ToolLoopLimitError` is exported from `llmswitch`, and `ChatLLMSwitch` raises a clear error for image content outside user messages.
 - A CI job, `test-core-only`, that runs the tests without LangChain installed, so the core package is checked on its own.
 
 ## [0.1.2] - 2026-10-23

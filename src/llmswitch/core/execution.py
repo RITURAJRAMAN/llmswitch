@@ -155,7 +155,8 @@ def build_execution_plan(
     deployment_name = getattr(config, "deployment_name", None)
     provider = config.provider
     if provider == "anthropic" and operation in ("chat.completions", "responses"):
-        model = deployment_name or getattr(config, "model", None) or DEFAULT_ANTHROPIC_MODEL
+        model = (deployment_name or request.generation.get("model") or getattr(config, "model", None)
+                 or DEFAULT_ANTHROPIC_MODEL)
     else:
         model = deployment_name or request.generation.get("model") or getattr(config, "model", None)
     target = TargetDescriptor(

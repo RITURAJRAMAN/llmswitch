@@ -122,6 +122,14 @@ class SyncStreamSession:
     def __iter__(self) -> "SyncStreamSession":
         return self
 
+    def __del__(self) -> None:
+        # A consumer that stops early never reaches the end of the stream. Release the
+        # breaker's half-open probe here, or the breaker would refuse every later call.
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001 - never raise from a finalizer
+            pass
+
     def _close_handle(self, handle: StreamHandle | None) -> None:
         if handle is None:
             return
@@ -349,6 +357,16 @@ class AsyncStreamSession:
 
     def __aiter__(self) -> "AsyncStreamSession":
         return self
+
+    def __del__(self) -> None:
+        # Async cleanup cannot be awaited from a finalizer, so release only the breaker probe.
+        # The stream itself is closed by the event loop when it is garbage-collected.
+        handle = getattr(self, "_active", None)
+        if handle is not None and getattr(handle, "breaker", None) is not None:
+            try:
+                handle.breaker.abandon_probe()
+            except Exception:  # noqa: BLE001 - never raise from a finalizer
+                pass
 
     async def _close_handle(self, handle: StreamHandle | None) -> None:
         if handle is None:

@@ -453,3 +453,13 @@ def detect_content_filter_error(exc: Exception, provider: Optional[str] = None,
             filter_results=_extract_filter_results(body),
         )
     return None
+
+
+class ToolLoopLimitError(LLMSwitchError):
+    """Raised when the model still asks for tools after ``max_steps`` model calls."""
+    status_code = 400
+    error_code = "E_TOOL_LOOP_LIMIT"
+
+    def __init__(self, max_steps: int) -> None:
+        super().__init__(f"The model still requested tools after {max_steps} model calls.")
+        self.max_steps = max_steps

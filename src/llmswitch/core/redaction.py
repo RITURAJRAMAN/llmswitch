@@ -11,11 +11,11 @@ from typing import Any
 # match — not substring — so benign keys like ``max_tokens`` are not caught by
 # ``token``.
 _SENSITIVE_KEYS: frozenset[str] = frozenset({
-    "api_key", "apikey", "api-key",
+    "api_key", "apikey", "api-key", "x-api-key", "x-goog-api-key", "openai-api-key",
     "endpoint", "azure_endpoint", "base_url",
     "redis_url",
     "credentials", "credentials_path",
-    "authorization", "auth",
+    "authorization", "auth", "proxy-authorization", "cookie", "set-cookie",
     "password", "passwd",
     "secret", "client_secret",
     "token", "access_token", "refresh_token", "id_token",

@@ -292,6 +292,16 @@ print(history[-1].content)
 The loop is deliberately basic. It has no routing between agents, no specialists, no checkpoints and
 no budgets. Those are planned for a later release.
 
+### Message conversion limits
+
+- Images are supported in user messages only. An image in a system, assistant or tool message raises
+  `ValueError` with a clear message.
+- A provider's own reasoning blocks (for example Anthropic `thinking` and `redacted_thinking`) and its
+  native tool-use blocks are not sent back. Tool calls are sent through `tool_calls`. If you turn on
+  extended thinking with tools, a provider can reject a continued tool loop, because the signed thinking
+  block is missing from the history.
+- `tool_choice=False` means no tools, the same as `"none"`.
+
 ### Closing clients
 
 Call `llm.close()`, or `await llm.aclose()` for async use, to close the provider connections. Put the call
@@ -324,11 +334,20 @@ processes, set `redis_url`. If Redis is unavailable, `rate_limit_failure_policy`
 `"memory_fallback"` (default) uses in-process limits, `"fail_open"` allows the request, and
 `"fail_closed"` raises `RateLimitBackendUnavailableError`.
 
+A request that is denied does not use up budget: its reservation is given back, so a later request
+that fits in the window is still allowed. In-process limits keep at most 10,000 user windows. When that
+table is full, the oldest window is dropped and a warning is logged once. That user's window then
+restarts, so the limit is weaker for that window, but no user is refused for lack of room. Use Redis
+for exact limits with many users.
+
+Streams that do not report token usage count zero completion tokens against `tpm`.
+
 To fail instead of waiting, set `on_rate_limit="raise"`. To wait only for short delays, set
 `rate_limit_max_wait` (seconds): a longer wait raises `RateLimitExceededError` immediately.
 
-Transient errors are retried: rate limits, connection errors and 5xx responses. `max_retries`
-(default 3) and `retry_base_delay` control the exponential backoff. `retry_deadline` (seconds) caps how
+Transient errors are retried: rate limits, connection errors and 5xx responses. Timeouts are not
+retried, because the provider may already have processed the request and a retry could bill it twice.
+`max_retries` (default 3) and `retry_base_delay` control the exponential backoff. `retry_deadline` (seconds) caps how
 long one provider call keeps retrying: when the next wait would pass it, the last error is raised.
 
 ```python
@@ -346,6 +365,10 @@ client = LLMSwitch(
 The circuit breaker stops calls to a deployment after repeated failures and retries it after
 `reset_timeout` seconds. `backup` is used when the primary provider fails with a retryable error.
 The backup provider must support the same operation.
+
+Embedding failover is all or nothing. If the primary fails part-way through a batched request, the
+backup embeds the whole input again, so every vector comes from one model. Mixing vectors from two
+embedding models would make them incomparable.
 
 `client_options` retries are separate: `max_retries` inside `client_options` is passed to the SDK,
 while `max_retries` on the client is the library's retry loop.

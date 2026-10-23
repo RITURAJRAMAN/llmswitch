@@ -81,3 +81,31 @@ def test_streaming_yields_the_text_in_order(vertex):
 
     text = "".join(chunk.choices[0].delta.content or "" for chunk in chunks if chunk.choices)
     assert text == "Hello"
+
+
+def blocked(reason="SAFETY"):
+    return genai_types.GenerateContentResponse.model_validate({"prompt_feedback": {"block_reason": reason}})
+
+
+def test_a_blocked_prompt_is_a_content_filter_error_not_a_404(vertex):
+    from llmswitch import ContentFilterError
+    client, fake = vertex
+    fake.models.generate_content.return_value = blocked()
+    with pytest.raises(ContentFilterError, match="blocked the prompt \\(SAFETY\\)"):
+        client.chat.completions.create(messages=MESSAGES)
+
+
+def test_a_blocked_prompt_is_reported_mid_stream_instead_of_an_empty_reply(vertex):
+    from llmswitch import ContentFilterError
+    client, fake = vertex
+    fake.models.generate_content_stream.return_value = iter([blocked("PROHIBITED_CONTENT")])
+    with pytest.raises(ContentFilterError, match="PROHIBITED_CONTENT"):
+        list(client.chat.completions.create(messages=MESSAGES, stream=True))
+
+
+def test_a_response_with_no_candidates_and_no_block_is_still_a_404(vertex):
+    client, fake = vertex
+    fake.models.generate_content.return_value = genai_types.GenerateContentResponse.model_validate({})
+    with pytest.raises(ChatCompletionError) as info:
+        client.chat.completions.create(messages=MESSAGES)
+    assert info.value.status_code == 404
