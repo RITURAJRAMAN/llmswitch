@@ -116,7 +116,7 @@ def test_it_is_a_chat_model():
 def test_identifying_params_name_the_provider_and_model():
     llm = model()
     assert llm._llm_type == "llmswitch"
-    assert llm._identifying_params == {"provider": "openai", "model": "gpt-4o"}
+    assert llm._identifying_params == {"provider": "openai", "model": "gpt-4o", "api": "chat"}
 
 
 def test_a_model_without_a_provider_is_rejected():

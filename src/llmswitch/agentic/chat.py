@@ -20,7 +20,7 @@ import json
 import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 
 try:
     from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
@@ -32,7 +32,14 @@ try:
     from langchain_core.utils.function_calling import convert_to_openai_tool
     from pydantic import Field, PrivateAttr
 
-    from .messages import to_ai_chunk, to_ai_message, to_chat_messages
+    from .messages import (
+        response_event_to_chunk,
+        response_to_ai_message,
+        to_ai_chunk,
+        to_ai_message,
+        to_chat_messages,
+        to_response_input,
+    )
 except ImportError as exc:  # pragma: no cover - exercised by tests that hide the optional dependency
     raise ImportError(
         "The agentic features need the agentic extra. Install it with: "
@@ -45,6 +52,9 @@ from ..errors import ToolLoopLimitError
 # The framework passes some internal keyword arguments (for example ``ls_structured_output_format``).
 # They describe tracing, not the request, so they are not forwarded.
 _INTERNAL_PREFIX = "ls_"
+
+# The Responses API is available from these providers only.
+_RESPONSES_PROVIDERS = frozenset({"openai", "azure_openai"})
 
 def _tool_choice(value: Any) -> Any:
     """Translate the tool_choice spellings used by the agentic model into chat completions form."""
@@ -80,6 +90,7 @@ class ChatLLMSwitch(BaseChatModel):
     max_tokens: int | None = None
     stop: list[str] | None = None
     call_options: dict[str, Any] = Field(default_factory=dict)
+    api: Literal["chat", "responses"] = "chat"
 
     _switch_options: dict[str, Any] = PrivateAttr(default_factory=dict)
     _switch: Any = PrivateAttr(default=None)
@@ -89,6 +100,12 @@ class ChatLLMSwitch(BaseChatModel):
         own_fields = set(type(self).model_fields)
         switch_options = {key: kwargs.pop(key) for key in list(kwargs) if key not in own_fields}
         super().__init__(**kwargs)
+        if self.api == "responses":
+            provider = switch_options.get("provider")
+            if provider not in _RESPONSES_PROVIDERS:
+                raise ValueError("api='responses' is supported only for provider='openai' or 'azure_openai'.")
+            if self.stop:
+                raise ValueError("stop sequences are not supported with api='responses'.")
         self._switch_options = switch_options
         self._switch = LLMSwitch(**switch_options)
 
@@ -98,7 +115,8 @@ class ChatLLMSwitch(BaseChatModel):
 
     @property
     def _identifying_params(self) -> dict[str, Any]:
-        return {"provider": self._switch_options.get("provider"), "model": self._switch_options.get("model")}
+        return {"provider": self._switch_options.get("provider"), "model": self._switch_options.get("model"),
+                "api": self.api}
 
     def close(self) -> None:
         """Close the sync client and its provider connections."""
@@ -136,20 +154,55 @@ class ChatLLMSwitch(BaseChatModel):
             request[key] = _tool_choice(value) if key == "tool_choice" else value
         return {key: value for key, value in request.items() if value is not None}
 
+    def _responses_request(self, stop: list[str] | None, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """The request for the Responses API: its token limit name and flat tool shapes differ from chat."""
+        if stop or self.stop:
+            raise ValueError("stop sequences are not supported with api='responses'.")
+        request = self._request(None, kwargs)
+        for chat_name in ("max_tokens", "max_completion_tokens"):
+            if chat_name in request:
+                request.setdefault("max_output_tokens", request.pop(chat_name))
+                request.pop(chat_name, None)
+        if "tools" in request:
+            request["tools"] = [_responses_tool(tool) for tool in request["tools"]]
+        choice = request.get("tool_choice")
+        if isinstance(choice, dict) and choice.get("type") == "function":
+            request["tool_choice"] = {"type": "function", "name": choice["function"]["name"]}
+        return request
+
     def _generate(self, messages: list[BaseMessage], stop: list[str] | None = None,
                   run_manager: CallbackManagerForLLMRun | None = None, **kwargs: Any) -> ChatResult:
+        if self.api == "responses":
+            response = self._switch.responses.create(
+                input=to_response_input(messages), **self._responses_request(stop, kwargs))
+            return ChatResult(generations=[ChatGeneration(message=response_to_ai_message(response))])
         completion = self._switch.chat.completions.create(
             messages=to_chat_messages(messages), **self._request(stop, kwargs))
         return ChatResult(generations=[ChatGeneration(message=to_ai_message(completion))])
 
     async def _agenerate(self, messages: list[BaseMessage], stop: list[str] | None = None,
                          run_manager: AsyncCallbackManagerForLLMRun | None = None, **kwargs: Any) -> ChatResult:
+        if self.api == "responses":
+            response = await self._async().responses.create(
+                input=to_response_input(messages), **self._responses_request(stop, kwargs))
+            return ChatResult(generations=[ChatGeneration(message=response_to_ai_message(response))])
         completion = await self._async().chat.completions.create(
             messages=to_chat_messages(messages), **self._request(stop, kwargs))
         return ChatResult(generations=[ChatGeneration(message=to_ai_message(completion))])
 
     def _stream(self, messages: list[BaseMessage], stop: list[str] | None = None,
                 run_manager: CallbackManagerForLLMRun | None = None, **kwargs: Any) -> Iterator[ChatGenerationChunk]:
+        if self.api == "responses":
+            events = self._switch.responses.create(
+                input=to_response_input(messages), stream=True, **self._responses_request(stop, kwargs))
+            for event in events:
+                message = response_event_to_chunk(event)
+                if message is None:
+                    continue
+                if run_manager is not None and message.content:
+                    run_manager.on_llm_new_token(message.content, chunk=ChatGenerationChunk(message=message))
+                yield ChatGenerationChunk(message=message)
+            return
         stream = self._switch.chat.completions.create(
             messages=to_chat_messages(messages), stream=True, **self._request(stop, kwargs))
         for chunk in stream:
@@ -161,6 +214,17 @@ class ChatLLMSwitch(BaseChatModel):
     async def _astream(self, messages: list[BaseMessage], stop: list[str] | None = None,
                        run_manager: AsyncCallbackManagerForLLMRun | None = None,
                        **kwargs: Any) -> AsyncIterator[ChatGenerationChunk]:
+        if self.api == "responses":
+            events = await self._async().responses.create(
+                input=to_response_input(messages), stream=True, **self._responses_request(stop, kwargs))
+            async for event in events:
+                message = response_event_to_chunk(event)
+                if message is None:
+                    continue
+                if run_manager is not None and message.content:
+                    await run_manager.on_llm_new_token(message.content, chunk=ChatGenerationChunk(message=message))
+                yield ChatGenerationChunk(message=message)
+            return
         stream = await self._async().chat.completions.create(
             messages=to_chat_messages(messages), stream=True, **self._request(stop, kwargs))
         async for chunk in stream:
@@ -186,6 +250,13 @@ class ChatLLMSwitch(BaseChatModel):
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
         return self.bind(tools=formatted, **kwargs)
+
+
+def _responses_tool(tool: Mapping[str, Any]) -> dict[str, Any]:
+    """Flatten a chat-style function tool into the Responses shape (name and schema at the top level)."""
+    if tool.get("type") != "function" or "function" not in tool:
+        return dict(tool)
+    return {"type": "function", **tool["function"]}
 
 
 Tool = BaseTool | Callable[..., Any]

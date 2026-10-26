@@ -7,11 +7,14 @@ Nothing here makes a network call, so each function can be tested on its own.
 - Agentic message objects -> chat message dicts (``to_chat_messages``)
 - ``ChatCompletion`` -> ``AIMessage`` (``to_ai_message``)
 - ``ChatCompletionChunk`` -> ``AIMessageChunk`` (``to_ai_chunk``)
+- Agentic message objects -> Responses input items (``to_response_input``)
+- ``Response`` -> ``AIMessage`` (``response_to_ai_message``)
+- Responses stream events -> ``AIMessageChunk`` or ``None`` (``response_event_to_chunk``)
 """
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from langchain_core.messages import (
@@ -27,7 +30,8 @@ from langchain_core.messages import (
     UsageMetadata,
 )
 
-from ..models import ChatCompletion, ChatCompletionChunk
+from ..errors import ResponsesError
+from ..models import ChatCompletion, ChatCompletionChunk, Response, ResponseStreamEvent
 
 _TEXT_BLOCK = "text"
 
@@ -214,3 +218,187 @@ def to_ai_chunk(chunk: ChatCompletionChunk) -> AIMessageChunk:
         usage_metadata=_usage_metadata(chunk.usage),
         response_metadata={"model_name": chunk.model, "finish_reason": finish_reason, "id": chunk.id},
     )
+
+
+# --- Responses API ----------------------------------------------------------------------------------
+
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    """Read a field from a model object or a plain dict, whichever the SDK layer produced."""
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _response_content(content: Any, role: str) -> Any:
+    """Input content for a Responses message: text, or input parts for user images."""
+    if isinstance(content, str) or content is None:
+        return content or ""
+    parts: list[dict[str, Any]] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append({"type": "input_text", "text": block})
+        elif isinstance(block, dict) and block.get("type") == _TEXT_BLOCK:
+            parts.append({"type": "input_text", "text": block.get("text", "")})
+        elif isinstance(block, dict) and block.get("type") in ("image", "image_url"):
+            if role != "user":
+                raise ValueError(f"Images are only supported in user messages, not {role} messages.")
+            parts.append({"type": "input_image", "image_url": _image_url(block)})
+        elif isinstance(block, dict) and block.get("type") in _NOT_REPLAYED:
+            continue
+        else:
+            kind = block.get("type") if isinstance(block, dict) else type(block).__name__
+            raise ValueError(f"Unsupported message content block: {kind}")
+    if role != "user" or all(part["type"] == "input_text" for part in parts):
+        return "".join(part["text"] for part in parts if part["type"] == "input_text")
+    return parts
+
+
+def to_response_input(messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
+    """Convert agentic messages to Responses input items.
+
+    Each call is stateless: the whole history is sent every time, and nothing is stored on
+    the server. Tool calls go back as ``function_call`` items and results as
+    ``function_call_output`` items, both matched by ``call_id``.
+    """
+    items: list[dict[str, Any]] = []
+    for message in messages:
+        if isinstance(message, SystemMessage):
+            items.append({"role": "system", "content": _response_content(message.content, "system")})
+        elif isinstance(message, HumanMessage):
+            items.append({"role": "user", "content": _response_content(message.content, "user")})
+        elif isinstance(message, AIMessage):
+            text = _response_content(message.content, "assistant") if message.content else ""
+            if text:
+                items.append({"role": "assistant", "content": text})
+            for call in list(message.tool_calls) + list(message.invalid_tool_calls):
+                args = call.get("args")
+                # Valid calls hold parsed arguments; invalid ones keep the raw text, which is sent as written.
+                arguments = args if isinstance(args, str) else json.dumps(args or {})
+                items.append({"type": "function_call", "call_id": call.get("id") or "",
+                              "name": call.get("name") or "", "arguments": arguments})
+        elif isinstance(message, ToolMessage):
+            items.append({"type": "function_call_output", "call_id": message.tool_call_id,
+                          "output": _response_content(message.content, "tool") if message.content else ""})
+        else:
+            raise ValueError(f"Unsupported message type: {type(message).__name__}")
+    return items
+
+
+def _parse_arguments_for_response(raw: Any) -> tuple[bool, Any]:
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        return True, {}
+    if isinstance(raw, dict):
+        return True, raw
+    return _parse_arguments(raw)
+
+
+def _summary_text(summary: Any) -> str:
+    return "".join(_field(part, "text", "") or "" for part in summary or [])
+
+
+def _response_usage(usage: Any) -> UsageMetadata | None:
+    if usage is None:
+        return None
+    metadata = UsageMetadata(
+        input_tokens=_field(usage, "input_tokens", 0) or 0,
+        output_tokens=_field(usage, "output_tokens", 0) or 0,
+        total_tokens=_field(usage, "total_tokens", 0) or 0,
+    )
+    cached = getattr(usage, "cached_tokens", 0) or 0
+    if cached:
+        metadata["input_token_details"] = {"cache_read": cached}
+    reasoning = getattr(usage, "reasoning_tokens", 0) or 0
+    if reasoning:
+        metadata["output_token_details"] = {"reasoning": reasoning}
+    return metadata
+
+
+def response_to_ai_message(response: Response) -> AIMessage:
+    """Convert a Responses API response to an ``AIMessage``.
+
+    Text comes from message items, function calls become tool calls (or invalid tool calls
+    when their arguments are not a JSON object), reasoning summaries go to
+    ``additional_kwargs["reasoning_content"]``, and any other output item (for example a
+    hosted tool call) is kept unchanged in ``additional_kwargs["responses_output_items"]``.
+    """
+    texts: list[str] = []
+    tool_calls: list[ToolCall] = []
+    invalid: list[InvalidToolCall] = []
+    reasoning: list[str] = []
+    other_items: list[dict[str, Any]] = []
+    for item in response.output:
+        kind = _field(item, "type")
+        if kind == "message":
+            text = "".join(
+                _field(part, "text", "") or "" for part in _field(item, "content", None) or []
+                if _field(part, "type") == "output_text"
+            )
+            if text:
+                texts.append(text)
+        elif kind == "function_call":
+            call_id = _field(item, "call_id") or _field(item, "id") or ""
+            name = _field(item, "name") or ""
+            ok, value = _parse_arguments_for_response(_field(item, "arguments"))
+            if ok:
+                tool_calls.append(ToolCall(name=name, args=value, id=call_id))
+            else:
+                invalid.append(InvalidToolCall(type="invalid_tool_call", name=name,
+                                               args=_field(item, "arguments"), id=call_id, error=value))
+        elif kind == "reasoning":
+            summary = _summary_text(_field(item, "summary", None))
+            if summary:
+                reasoning.append(summary)
+        else:
+            other_items.append(item.model_dump(exclude_none=True) if hasattr(item, "model_dump")
+                               else dict(item))
+    additional: dict[str, Any] = {}
+    if reasoning:
+        additional["reasoning_content"] = reasoning
+    if other_items:
+        additional["responses_output_items"] = other_items
+    metadata: dict[str, Any] = {"model_name": response.model, "id": response.id, "status": response.status}
+    if response.incomplete_details is not None:
+        metadata["incomplete_reason"] = response.incomplete_details.reason
+    return AIMessage(
+        content="".join(texts),
+        tool_calls=tool_calls,
+        invalid_tool_calls=invalid,
+        usage_metadata=_response_usage(response.usage),
+        additional_kwargs=additional,
+        response_metadata=metadata,
+    )
+
+
+def response_event_to_chunk(event: ResponseStreamEvent) -> AIMessageChunk | None:
+    """Convert one Responses stream event to a chunk, or ``None`` for events with nothing to show.
+
+    Text and reasoning deltas, function-call starts and argument deltas, and the terminal
+    event (which carries usage) are converted. A failed response raises ``ResponsesError``
+    with the provider's message, so a failure is never mistaken for an empty reply.
+    """
+    kind = event.type
+    if kind == "response.output_text.delta":
+        return AIMessageChunk(content=event.delta or "")
+    if kind == "response.reasoning_summary_text.delta":
+        return AIMessageChunk(content="", additional_kwargs={"reasoning_delta": event.delta or ""})
+    if kind == "response.output_item.added":
+        item = event.item
+        if _field(item, "type") == "function_call":
+            return AIMessageChunk(content="", tool_call_chunks=[ToolCallChunk(
+                name=_field(item, "name"), args="", id=_field(item, "call_id") or _field(item, "id"),
+                index=event.output_index or 0)])
+        return None
+    if kind == "response.function_call_arguments.delta":
+        return AIMessageChunk(content="", tool_call_chunks=[ToolCallChunk(
+            name=None, args=event.delta or "", id=None, index=event.output_index or 0)])
+    if kind in ("response.completed", "response.incomplete"):
+        response = event.response
+        metadata: dict[str, Any] = {"id": getattr(response, "id", None), "status": getattr(response, "status", None)}
+        return AIMessageChunk(content="", usage_metadata=_response_usage(event.usage),
+                              response_metadata=metadata)
+    if kind == "response.failed":
+        error = event.response.error if event.response is not None else None
+        message = (getattr(error, "message", None) if error is not None else None) or "The response failed."
+        raise ResponsesError(message)
+    return None
+
