@@ -27,6 +27,7 @@ import asyncio
 import inspect
 import json
 import logging
+import multiprocessing
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -50,6 +51,7 @@ from .events import AgentEventHandler, notify
 logger = logging.getLogger(__name__)
 
 ErrorKind = Literal["none", "parse", "not_found", "timeout", "tool_error"]
+Isolation = Literal["thread", "process"]
 Tool = BaseTool | Callable[..., Any]
 StartHook = Callable[[int], None]
 ResultHook = Callable[[int, "ToolExecutionResult"], None]
@@ -153,8 +155,64 @@ def _call_sync(tool: Tool, args: dict[str, Any]) -> Any:
     return result
 
 
-def _call_with_timeout(tool: Tool, args: dict[str, Any], timeout_s: float) -> Any:
-    """Run a sync tool on its own thread and wait up to ``timeout_s`` for it."""
+class _ChildError(Exception):
+    """A tool raised inside its own process. ``str()`` is the message reported to the model."""
+
+
+def process_isolation_available() -> bool:
+    """Whether this platform can run tools in forked processes (every POSIX system can)."""
+    return "fork" in multiprocessing.get_all_start_methods()
+
+
+def _child_main(connection: Any, tool: Tool, args: dict[str, Any]) -> None:
+    """Runs in the forked child: call the tool and send back its value, or the failure."""
+    try:
+        connection.send(("ok", _call_sync(tool, args)))
+    except BaseException as exc:  # noqa: BLE001 - every failure is reported to the parent
+        try:
+            connection.send(("error", f"{type(exc).__name__}: {exc}"))
+        except Exception:  # noqa: BLE001 - the pipe itself failed; the parent sees EOF
+            pass
+    finally:
+        connection.close()
+
+
+def _call_in_process(tool: Tool, args: dict[str, Any], timeout_s: float) -> Any:
+    """Run a sync tool in a forked child process, and kill the child when it outlives ``timeout_s``.
+
+    Killing the process stops the tool's work, which a thread cannot do. The value and the arguments
+    cross the process boundary, so they must be picklable; the tool itself is inherited by the fork.
+    """
+    context = multiprocessing.get_context("fork")
+    reader, writer = context.Pipe(duplex=False)
+    process = context.Process(target=_child_main, args=(writer, tool, args), daemon=True)
+    try:
+        process.start()
+    except BaseException:
+        reader.close()
+        writer.close()
+        raise
+    writer.close()
+    try:
+        if not reader.poll(timeout_s):
+            raise FuturesTimeoutError()
+        status, payload = reader.recv()
+    except EOFError:
+        raise _ChildError("the tool process ended without a result") from None
+    finally:
+        reader.close()
+        if process.is_alive():
+            process.kill()
+        process.join()
+    if status == "error":
+        raise _ChildError(payload)
+    return payload
+
+
+def _call_with_timeout(tool: Tool, args: dict[str, Any], timeout_s: float, isolation: Isolation = "thread") -> Any:
+    """Run a sync tool and wait up to ``timeout_s`` for it: on its own thread, or in its own process."""
+    if isolation == "process":
+        return _call_in_process(tool, args, timeout_s)
     pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llmswitch-tool")
     try:
         future = pool.submit(copy_context().run, _call_sync, tool, args)
@@ -163,22 +221,35 @@ def _call_with_timeout(tool: Tool, args: dict[str, Any], timeout_s: float) -> An
         pool.shutdown(wait=False, cancel_futures=True)
 
 
+def _rejected(call_id: str, name: str, args: dict[str, Any], kind: ErrorKind, message: str,
+              handler: AgentEventHandler | None, step: int) -> ToolExecutionResult:
+    """A call refused before it runs. It still gets a start and an error event, so event consumers see it."""
+    notify(handler, "on_tool_start", step, name, args)
+    notify(handler, "on_tool_error", step, name, message, 0.0)
+    return _failed(call_id, name, args, kind, message)
+
+
+def _failure_message(exc: Exception) -> str:
+    """The text reported for a failed tool. A failure inside a tool process is already formatted."""
+    return str(exc) if isinstance(exc, _ChildError) else f"{type(exc).__name__}: {exc}"
+
+
 def _run_sync_call(call: Mapping[str, Any], tool_map: Mapping[str, Tool], timeout_s: float,
                    handler: AgentEventHandler | None, step: int,
-                   before: Callable[[], None] | None) -> ToolExecutionResult:
+                   before: Callable[[], None] | None, isolation: Isolation = "thread") -> ToolExecutionResult:
     call_id, name = _call_id(call), call.get("name") or ""
     ok, args, error = parse_arguments(call.get("args"))
     if not ok:
-        return _failed(call_id, name, {}, "parse", error or "Malformed arguments")
+        return _rejected(call_id, name, {}, "parse", error or "Malformed arguments", handler, step)
     tool = tool_map.get(name)
     if tool is None:
-        return _failed(call_id, name, args, "not_found", f"Tool not found: {name}")
+        return _rejected(call_id, name, args, "not_found", f"Tool not found: {name}", handler, step)
     notify(handler, "on_tool_start", step, name, args)
     if before is not None:
         before()
     started = time.monotonic()
     try:
-        value = _call_with_timeout(tool, args, timeout_s)
+        value = _call_with_timeout(tool, args, timeout_s, isolation)
     except FuturesTimeoutError:
         duration = time.monotonic() - started
         message = f"Tool '{name}' timed out after {timeout_s}s"
@@ -186,7 +257,7 @@ def _run_sync_call(call: Mapping[str, Any], tool_map: Mapping[str, Tool], timeou
         return _failed(call_id, name, args, "timeout", message, duration)
     except Exception as exc:  # noqa: BLE001 - any tool failure is reported back to the model
         duration = time.monotonic() - started
-        message = f"{type(exc).__name__}: {exc}"
+        message = _failure_message(exc)
         notify(handler, "on_tool_error", step, name, message, duration)
         return _failed(call_id, name, args, "tool_error", message, duration)
     duration = time.monotonic() - started
@@ -197,8 +268,9 @@ def _run_sync_call(call: Mapping[str, Any], tool_map: Mapping[str, Tool], timeou
 def _execute_sync(call: Mapping[str, Any], tool_map: Mapping[str, Tool], timeout_s: float,
                   handler: AgentEventHandler | None, step: int,
                   before: Callable[[], None] | None = None,
-                  after: Callable[[ToolExecutionResult], None] | None = None) -> ToolExecutionResult:
-    result = _run_sync_call(call, tool_map, timeout_s, handler, step, before)
+                  after: Callable[[ToolExecutionResult], None] | None = None,
+                  isolation: Isolation = "thread") -> ToolExecutionResult:
+    result = _run_sync_call(call, tool_map, timeout_s, handler, step, before, isolation)
     if after is not None:
         after(result)
     return result
@@ -215,6 +287,7 @@ def execute_tool_calls(
     handler: AgentEventHandler | None = None,
     on_start: StartHook | None = None,
     on_result: ResultHook | None = None,
+    isolation: Isolation = "thread",
 ) -> list[ToolExecutionResult]:
     """Run tool calls, in parallel up to ``max_concurrency`` when ``parallel`` is set.
 
@@ -232,7 +305,7 @@ def execute_tool_calls(
         results = []
         for index, call in enumerate(tool_calls):
             before, after = hooks(index)
-            results.append(_execute_sync(call, tool_map, timeout_s, handler, step, before, after))
+            results.append(_execute_sync(call, tool_map, timeout_s, handler, step, before, after, isolation))
         return results
     workers = max(1, min(max_concurrency, len(tool_calls)))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="llmswitch-agent") as pool:
@@ -240,11 +313,20 @@ def execute_tool_calls(
         for index, call in enumerate(tool_calls):
             before, after = hooks(index)
             futures.append(pool.submit(copy_context().run, _execute_sync, call, tool_map, timeout_s, handler, step,
-                                       before, after))
+                                       before, after, isolation))
         return [future.result() for future in futures]
 
 
-async def _call_async(tool: Tool, args: dict[str, Any]) -> Any:
+def _is_sync_tool(tool: Tool) -> bool:
+    if isinstance(tool, BaseTool):
+        return getattr(tool, "coroutine", None) is None
+    return not inspect.iscoroutinefunction(tool)
+
+
+async def _call_async(tool: Tool, args: dict[str, Any], timeout_s: float, isolation: Isolation = "thread") -> Any:
+    if isolation == "process" and _is_sync_tool(tool):
+        # The thread waits for the tool process, and that wait ends at the limit, when the process is killed.
+        return await asyncio.to_thread(_call_in_process, tool, args, timeout_s)
     if isinstance(tool, BaseTool):
         return await tool.ainvoke(args)
     if inspect.iscoroutinefunction(tool):
@@ -256,8 +338,9 @@ async def _call_async(tool: Tool, args: dict[str, Any]) -> Any:
 async def _execute_async(call: Mapping[str, Any], tool_map: Mapping[str, Tool], timeout_s: float,
                          handler: AgentEventHandler | None, step: int, semaphore: asyncio.Semaphore,
                          before: Callable[[], None] | None = None,
-                         after: Callable[[ToolExecutionResult], None] | None = None) -> ToolExecutionResult:
-    result = await _run_async_call(call, tool_map, timeout_s, handler, step, semaphore, before)
+                         after: Callable[[ToolExecutionResult], None] | None = None,
+                         isolation: Isolation = "thread") -> ToolExecutionResult:
+    result = await _run_async_call(call, tool_map, timeout_s, handler, step, semaphore, before, isolation)
     if after is not None:
         after(result)
     return result
@@ -265,21 +348,21 @@ async def _execute_async(call: Mapping[str, Any], tool_map: Mapping[str, Tool], 
 
 async def _run_async_call(call: Mapping[str, Any], tool_map: Mapping[str, Tool], timeout_s: float,
                           handler: AgentEventHandler | None, step: int, semaphore: asyncio.Semaphore,
-                          before: Callable[[], None] | None) -> ToolExecutionResult:
+                          before: Callable[[], None] | None, isolation: Isolation = "thread") -> ToolExecutionResult:
     call_id, name = _call_id(call), call.get("name") or ""
     ok, args, error = parse_arguments(call.get("args"))
     if not ok:
-        return _failed(call_id, name, {}, "parse", error or "Malformed arguments")
+        return _rejected(call_id, name, {}, "parse", error or "Malformed arguments", handler, step)
     tool = tool_map.get(name)
     if tool is None:
-        return _failed(call_id, name, args, "not_found", f"Tool not found: {name}")
+        return _rejected(call_id, name, args, "not_found", f"Tool not found: {name}", handler, step)
     async with semaphore:
         notify(handler, "on_tool_start", step, name, args)
         if before is not None:
             before()
         started = time.monotonic()
         try:
-            value = await asyncio.wait_for(_call_async(tool, args), timeout_s)
+            value = await asyncio.wait_for(_call_async(tool, args, timeout_s, isolation), timeout_s)
         except TimeoutError:
             duration = time.monotonic() - started
             message = f"Tool '{name}' timed out after {timeout_s}s"
@@ -287,7 +370,7 @@ async def _run_async_call(call: Mapping[str, Any], tool_map: Mapping[str, Tool],
             return _failed(call_id, name, args, "timeout", message, duration)
         except Exception as exc:  # noqa: BLE001 - any tool failure is reported back to the model
             duration = time.monotonic() - started
-            message = f"{type(exc).__name__}: {exc}"
+            message = _failure_message(exc)
             notify(handler, "on_tool_error", step, name, message, duration)
             return _failed(call_id, name, args, "tool_error", message, duration)
     duration = time.monotonic() - started
@@ -306,6 +389,7 @@ async def aexecute_tool_calls(
     handler: AgentEventHandler | None = None,
     on_start: StartHook | None = None,
     on_result: ResultHook | None = None,
+    isolation: Isolation = "thread",
 ) -> list[ToolExecutionResult]:
     """Async :func:`execute_tool_calls`, bounded by a semaphore. Results keep the input order."""
     if not tool_calls:
@@ -321,12 +405,13 @@ async def aexecute_tool_calls(
         results = []
         for index, call in enumerate(tool_calls):
             before, after = hooks(index)
-            results.append(await _execute_async(call, tool_map, timeout_s, handler, step, semaphore, before, after))
+            results.append(await _execute_async(call, tool_map, timeout_s, handler, step, semaphore, before, after,
+                                                isolation))
         return results
     tasks = []
     for index, call in enumerate(tool_calls):
         before, after = hooks(index)
-        tasks.append(_execute_async(call, tool_map, timeout_s, handler, step, semaphore, before, after))
+        tasks.append(_execute_async(call, tool_map, timeout_s, handler, step, semaphore, before, after, isolation))
     return list(await asyncio.gather(*tasks))
 
 
@@ -376,6 +461,7 @@ def retry_failed_tool_calls(
     handler: AgentEventHandler | None = None,
     on_start: StartHook | None = None,
     on_result: ResultHook | None = None,
+    isolation: Isolation = "thread",
 ) -> list[ToolExecutionResult]:
     """Retry the retryable failures, up to ``attempts`` extra rounds, sleeping ``backoff_seconds`` between them."""
     current = list(results)
@@ -388,7 +474,7 @@ def retry_failed_tool_calls(
         fresh = execute_tool_calls(
             step=step, tool_calls=[tool_calls[i] for i in indices], tool_map=tool_map, timeout_s=timeout_s,
             parallel=parallel, max_concurrency=max_concurrency, handler=handler,
-            on_start=_mapped(on_start, indices), on_result=_mapped(on_result, indices),
+            on_start=_mapped(on_start, indices), on_result=_mapped(on_result, indices), isolation=isolation,
         )
         for index, result in zip(indices, fresh, strict=True):
             result.attempts = current[index].attempts + 1
@@ -412,6 +498,7 @@ async def aretry_failed_tool_calls(
     handler: AgentEventHandler | None = None,
     on_start: StartHook | None = None,
     on_result: ResultHook | None = None,
+    isolation: Isolation = "thread",
 ) -> list[ToolExecutionResult]:
     """Async :func:`retry_failed_tool_calls`."""
     current = list(results)
@@ -424,7 +511,7 @@ async def aretry_failed_tool_calls(
         fresh = await aexecute_tool_calls(
             step=step, tool_calls=[tool_calls[i] for i in indices], tool_map=tool_map, timeout_s=timeout_s,
             parallel=parallel, max_concurrency=max_concurrency, handler=handler,
-            on_start=_mapped(on_start, indices), on_result=_mapped(on_result, indices),
+            on_start=_mapped(on_start, indices), on_result=_mapped(on_result, indices), isolation=isolation,
         )
         for index, result in zip(indices, fresh, strict=True):
             result.attempts = current[index].attempts + 1

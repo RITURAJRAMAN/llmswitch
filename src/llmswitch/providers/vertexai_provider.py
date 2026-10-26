@@ -36,6 +36,7 @@ from ..models import (
     ChunkDelta,
     CompletionUsage,
     Function,
+    ProviderExtensions,
     TopLogprob,
 )
 from ..structured import (
@@ -61,6 +62,32 @@ _HTTP_RATE_LIMIT = 429
 _HTTP_AUTH_CODES = (401, 403)
 
 GENERATE_CONTENT_CONFIG_FIELDS = set(types.GenerateContentConfig.model_fields.keys())
+
+
+def _thought_signatures(candidate: Any) -> list[str | None]:
+    """The thought signature of each function call in a candidate, in order, as base64 text (or None)."""
+    parts = getattr(getattr(candidate, "content", None), "parts", []) or []
+    signatures: list[str | None] = []
+    for part in parts:
+        if getattr(part, "function_call", None) is None:
+            continue
+        raw = getattr(part, "thought_signature", None)
+        signatures.append(base64.b64encode(raw).decode("ascii") if isinstance(raw, bytes) else None)
+    return signatures
+
+
+def _replayed_thought_signatures(msg: dict[str, Any]) -> dict[str, str]:
+    """The signatures an earlier assistant turn kept for its function calls, keyed by tool call id."""
+    extensions = msg.get("extensions")
+    if isinstance(extensions, ProviderExtensions):
+        provider, fields = extensions.provider, extensions.fields
+    elif isinstance(extensions, dict):
+        provider, fields = extensions.get("provider"), extensions.get("fields") or {}
+    else:
+        return {}
+    if provider != "vertexai":
+        return {}
+    return dict(fields.get("thought_signatures") or {})
 
 
 def _blocked_reason(response: Any) -> str | None:
@@ -497,12 +524,15 @@ class VertexAIChatProvider(BaseChatProvider):
                     if not function_name:
                         continue
                     tool_call_name_by_id[tool_call_id] = function_name
-                    parts.append(
-                        types.Part.from_function_call(
-                            name=function_name,
-                            args=self._parse_tool_arguments(function_data.get("arguments")),
-                        )
+                    part = types.Part.from_function_call(
+                        name=function_name,
+                        args=self._parse_tool_arguments(function_data.get("arguments")),
                     )
+                    signature = _replayed_thought_signatures(message).get(tool_call_id)
+                    if signature:
+                        # Gemini requires the signature of each function call, sent back unchanged.
+                        part.thought_signature = base64.b64decode(signature)
+                    parts.append(part)
                 if parts:
                     contents.append(types.Content(role="model", parts=parts))
                 continue
@@ -672,12 +702,19 @@ class VertexAIChatProvider(BaseChatProvider):
                 has_tool_calls=bool(mapped_tool_calls),
             )
             role = self._normalize_role(getattr(getattr(candidate, "content", None), "role", None))
+            signatures = {
+                self._tool_call_id(position): signature
+                for position, signature in enumerate(_thought_signatures(candidate))
+                if signature
+            }
             choices.append(
                 Choice(
                     index=getattr(candidate, "index", None) if getattr(candidate, "index", None) is not None else index,
                     message=ChatCompletionMessage(
                         role=role, content=text or None, tool_calls=mapped_tool_calls,
                         parsed=getattr(response, "parsed", None) if index == 0 else None,
+                        extensions=(ProviderExtensions(provider="vertexai", fields={"thought_signatures": signatures})
+                                    if signatures else None),
                     ),
                     finish_reason=finish_reason,
                     logprobs=self._map_logprobs(candidate),

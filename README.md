@@ -407,10 +407,12 @@ below.
 
 - Images are supported in user messages only. An image in a system, assistant or tool message raises
   `ValueError` with a clear message.
-- A provider's own reasoning blocks (for example Anthropic `thinking` and `redacted_thinking`) and its
-  native tool-use blocks are not sent back. Tool calls are sent through `tool_calls`. If you turn on
-  extended thinking with tools, a provider can reject a continued tool loop, because the signed thinking
-  block is missing from the history.
+- With Anthropic, the signed `thinking` and `redacted_thinking` blocks of an answer are kept and sent back
+  unchanged in the next request, first in the assistant turn, as Anthropic asks for extended thinking with
+  tools. Tool calls are sent through `tool_calls`. Other providers' reasoning blocks are not sent back.
+- With Vertex AI, the thought signature of each function call is kept and sent back with that call, as Gemini
+  requires for tool use. Thinking blocks and these signatures are kept for `invoke` and the agent. A streamed
+  answer does not keep them, so they are not sent back after a streamed turn.
 - `tool_choice=False` is sent as `"none"`, which tells the model not to call tools.
 
 ### Closing the agentic model
@@ -449,8 +451,9 @@ verdict on whether the answer does what was asked. A rejected answer is revised,
 An `interrupted` run has a `reason` of `tool_error` (a tool failed and `interrupt_on_tool_error=True`) or
 `uncertain_tool_execution` (a tool may have started before the pause and is not safe to run again). A
 `stopped` run has a `reason` of `max_iterations_reached`, `max_runtime_exceeded`,
-`max_input_tokens_per_step_exceeded`, `tool_retry_exhausted` or `reflection_verdict_unreadable` (the reflection
-check gave no readable verdict in three tries, so the run stops with the answer it had).
+`max_input_tokens_per_step_exceeded`, `tool_retry_exhausted` (a failure remained after the retries), `tool_failed`
+(a failure, with no retries configured) or `reflection_verdict_unreadable` (the reflection check gave no readable
+verdict in three tries, so the run stops with the answer it had).
 
 `steps` is a list of `AgentStep` objects, one per model call. Each has `step`, `assistant_content`,
 `tool_calls`, `model_used` (the name of the model that answered) and `tool_results`.
@@ -484,11 +487,12 @@ message, so the model can recover. Each failure has a kind:
 |---|---|---|
 | `tool_timeout_seconds` | 30 | The most time one tool call may take. |
 | `parallel_tools` | `True` | Runs the tool calls of one step at the same time. |
+| `tool_isolation` | `"thread"` | `"process"` stops a `def` tool at its limit by killing its forked process (see below). |
 | `max_concurrency` | 4 | The most tool calls running at once. |
 | `tool_retry_attempts` | 0 | Extra rounds for the retryable failures. |
 | `tool_retry_backoff_seconds` | 0 | The pause between retry rounds. |
 | `interrupt_on_tool_error` | `False` | Pauses the run after a failed tool, so you can decide what to do. |
-| `escalate_on_retry_exhausted` | `False` | Stops the run with `tool_retry_exhausted` when a failure remains after the retries. |
+| `escalate_on_retry_exhausted` | `False` | Stops the run when a tool fails and the failure remains after the retries (reason `tool_retry_exhausted`, or `tool_failed` when no retries are configured). |
 
 Mark a tool safe to retry with `idempotent`. Only do this when running the tool twice has the same effect as
 running it once:
@@ -503,8 +507,15 @@ def get_weather(city: str) -> str:
 ```
 
 A timeout stops the wait, not the work. A tool written as `async def` is cancelled at the timeout. A plain
-`def` tool runs in a worker thread, and Python cannot stop a running thread, so it keeps running after the
-timeout, in sync and async runs alike. Write a tool as `async def` when it must really stop.
+`def` tool runs in a worker thread, and Python cannot stop a running thread, so by default it keeps running
+after the timeout, in sync and async runs alike.
+
+To stop a plain `def` tool at its limit, set `tool_isolation="process"`. The tool then runs in a forked child
+process, which is killed at the timeout, so its work stops. Its arguments and its result cross the process
+boundary: the arguments are inherited by the fork, but the result must be picklable. The tool must not depend on state that only exists in the parent
+process. It is available on POSIX systems (Linux and macOS), not on Windows. Python warns that a fork from a
+program with several threads can deadlock in the child, so use this setting in a program that starts its
+threads after the fork, or accept that risk.
 
 ### Checkpoints and resume
 
@@ -551,7 +562,7 @@ agent = Agent(model=primary_llm, fallback_model=backup_llm, tools=[lookup],
 
 For your own rule, subclass `BaseRoutingPolicy` and implement `select_llm`, or pass `router=` a function
 that takes `(messages, step)` and returns the model. A `router` takes precedence over a routing policy.
-Routing state lives for one run and is saved in checkpoints, so a resumed run continues the same rotation.
+Routing state, such as a round-robin position, belongs to the agent: each run starts where the last one stopped. It is also saved in checkpoints, so a resumed run continues its own rotation. A resume does not change the agent's routing state, so a run that happens in between is not undone. Use one agent per concurrent run if the order of the models matters.
 Each decision is reported to the event handler as `on_routing_decision`.
 
 ### Specialists, contracts and shared state
@@ -582,9 +593,10 @@ rows = invoke_specialists(
   `timeout`. Rows from a contract also have `weight` and `capabilities`.
 - `max_runtime_seconds` is shared: each specialist gets what is left of it. `parallel=False` runs them one
   after another, and `max_concurrency` limits the parallel ones. In a parallel run, a specialist still running
-  when the limit ends is reported as `timeout`, and its work is not written to the shared state. The async
-  version cancels it. In a sequential run, the limit is checked before each specialist starts and between the
-  steps of an agent run, so a model call that has already started is not interrupted.
+  when the limit ends is reported as `timeout`, and its work is not written to the shared state. A sequential
+  run works the same way, one specialist at a time. The async version cancels a specialist at the limit. The
+  sync version reports the timeout on time, but the specialist's thread keeps running in the background, as
+  any sync call does.
 - A parallel specialist reads the shared state when it starts, so what it sees depends on timing.
 - `SharedState` is a thread-safe store. Each specialist's output is written to it under
   `specialist_outputs.<name>`. Its contents are added to the task prompt, so a large state is trimmed to
@@ -635,8 +647,9 @@ missing method is skipped: `on_step_start`, `on_step_end`, `on_tool_start`, `on_
 and `on_routing_decision`. `CollectingEventHandler` keeps the events in its `events` list. `LoggingEventHandler` writes
 them to the `llmswitch.agentic` logger, and it logs tool names and the names of exception classes, never
 argument or result values. Tool events can come from worker threads when tools run in parallel, so a handler
-must be safe to call from several threads. A call that is rejected before it runs, with arguments that are not
-a JSON object or an unknown tool name, produces no tool events. It appears in the step's `tool_results`.
+must be safe to call from several threads. A call that is refused before it runs, with arguments that are not
+a JSON object or an unknown tool name, still gets an `on_tool_start` and an `on_tool_error` event, and it appears in the
+step's `tool_results`.
 
 ## Rate limits
 
@@ -689,8 +702,9 @@ client = LLMSwitch(
 oldest window is dropped and a warning is logged once. That user's window restarts, so the limit is weaker for
 that window, but no user is refused for lack of room. Use Redis for exact limits with many users.
 
-**Streams without usage.** A stream that does not report token usage counts zero completion tokens against
-`tpm`.
+**Streams without usage.** When a stream does not report token usage, its completion is counted from the text
+it streamed (content and thinking), with the same tokenizer that counts prompts. This is an estimate, so it can
+differ a little from the provider's own count. When the provider does report usage, that count is used.
 
 ## Retries, timeouts and the circuit breaker
 

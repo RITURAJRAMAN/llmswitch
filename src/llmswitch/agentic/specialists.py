@@ -111,6 +111,8 @@ def invoke_specialists(
         return []
 
     def run(name: str, agent: Agent) -> dict[str, Any]:
+        if _remaining(deadline) == 0:  # the shared limit ended before this specialist could start
+            return _timeout_row(name)
         try:
             payload = _task_payload(task, shared_state, shared_state_keys, shared_state_max_bytes)
             result = agent.invoke(payload, max_runtime_seconds=_remaining(deadline))
@@ -118,18 +120,15 @@ def invoke_specialists(
         except Exception as exc:  # noqa: BLE001 - one specialist failing must not stop the others
             return _error_row(name, exc)
 
-    if not parallel or len(items) == 1:
-        rows = []
-        for name, agent in items:
-            if deadline is not None and _remaining(deadline) == 0:
-                rows.append(_timeout_row(name))
-            else:
-                rows.append(run(name, agent))
+    if deadline is None and (not parallel or len(items) == 1):
+        rows = [run(name, agent) for name, agent in items]
         _publish(shared_state, rows)
         return attach_contract_weights(rows, contracts)
 
-    pool = ThreadPoolExecutor(max_workers=max(1, min(max_concurrency, len(items))),
-                              thread_name_prefix="llmswitch-specialist")
+    # With a time limit, every specialist runs on a worker thread, even one at a time, so the caller can stop
+    # waiting at the limit. A sequential run uses one worker: the next specialist starts when the last one ends.
+    workers = 1 if not parallel else max(1, min(max_concurrency, len(items)))
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="llmswitch-specialist")
     try:
         futures = {
             pool.submit(copy_context().run, run, name, agent): index

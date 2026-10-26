@@ -115,8 +115,9 @@ class ChatLLMSwitch(BaseChatModel):
 
     @property
     def _identifying_params(self) -> dict[str, Any]:
-        # A configured deployment name wins over the model name, as it does in the core client.
-        model = self._switch_options.get("deployment_name") or self._switch_options.get("model")
+        # The core client's order: a configured deployment name wins, then a per-call model, then the model.
+        model = (self._switch_options.get("deployment_name") or self.call_options.get("model")
+                 or self._switch_options.get("model"))
         return {"provider": self._switch_options.get("provider"), "model": model, "api": self.api}
 
     def close(self) -> None:
@@ -178,7 +179,7 @@ class ChatLLMSwitch(BaseChatModel):
                 input=to_response_input(messages), **self._responses_request(stop, kwargs))
             return ChatResult(generations=[ChatGeneration(message=response_to_ai_message(response))])
         completion = self._switch.chat.completions.create(
-            messages=to_chat_messages(messages), **self._request(stop, kwargs))
+            messages=to_chat_messages(messages, self._switch_options.get("provider")), **self._request(stop, kwargs))
         return ChatResult(generations=[ChatGeneration(message=to_ai_message(completion))])
 
     async def _agenerate(self, messages: list[BaseMessage], stop: list[str] | None = None,
@@ -188,7 +189,7 @@ class ChatLLMSwitch(BaseChatModel):
                 input=to_response_input(messages), **self._responses_request(stop, kwargs))
             return ChatResult(generations=[ChatGeneration(message=response_to_ai_message(response))])
         completion = await self._async().chat.completions.create(
-            messages=to_chat_messages(messages), **self._request(stop, kwargs))
+            messages=to_chat_messages(messages, self._switch_options.get("provider")), **self._request(stop, kwargs))
         return ChatResult(generations=[ChatGeneration(message=to_ai_message(completion))])
 
     def _stream(self, messages: list[BaseMessage], stop: list[str] | None = None,
@@ -205,7 +206,7 @@ class ChatLLMSwitch(BaseChatModel):
                 yield ChatGenerationChunk(message=message)
             return
         stream = self._switch.chat.completions.create(
-            messages=to_chat_messages(messages), stream=True, **self._request(stop, kwargs))
+            messages=to_chat_messages(messages, self._switch_options.get("provider")), stream=True, **self._request(stop, kwargs))
         for chunk in stream:
             message = to_ai_chunk(chunk)
             if run_manager is not None and message.content:
@@ -227,7 +228,7 @@ class ChatLLMSwitch(BaseChatModel):
                 yield ChatGenerationChunk(message=message)
             return
         stream = await self._async().chat.completions.create(
-            messages=to_chat_messages(messages), stream=True, **self._request(stop, kwargs))
+            messages=to_chat_messages(messages, self._switch_options.get("provider")), stream=True, **self._request(stop, kwargs))
         async for chunk in stream:
             message = to_ai_chunk(chunk)
             if run_manager is not None and message.content:

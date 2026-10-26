@@ -91,10 +91,10 @@ from .retry import _async_retry_call, _fails_over, _retry_call
 from .streaming import (
     AsyncStreamSession,
     StreamHandle,
-    _additional_stream_tokens,
     chat_chunk_has_visible_output,
     response_event_has_visible_output,
     response_event_terminal_status,
+    stream_completion_tokens,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,8 +118,12 @@ class _AsyncChatCompletions(ProviderCache):
 
     async def _wrap_streaming(self, primary_factory, user_key: str, pre_count_tokens: int, *,
                               backup_factory=None, max_retries: int = 0, base_delay: float = 0.0):
-        async def on_complete(last_usage, limiter_scope, prompt_tokens):
-            actual = _additional_stream_tokens(last_usage, prompt_tokens, pre_count_tokens)
+        async def on_complete(last_usage, limiter_scope, prompt_tokens, output_text):
+            # Counting the text can take a while for a long answer, so it runs off the event loop.
+            actual = await asyncio.to_thread(
+                stream_completion_tokens, last_usage, prompt_tokens, pre_count_tokens,
+                output_text, getattr(self.config, "model", None),
+            )
             await asyncio.to_thread(
                 self.rate_limiter.update_token_usage,
                 user_key,
@@ -437,8 +441,12 @@ class _AsyncResponses(ProviderCache):
 
     async def _wrap_streaming(self, primary_factory, user_key: str, pre_count_tokens: int, *,
                               backup_factory=None, max_retries: int = 0, base_delay: float = 0.0):
-        async def on_complete(last_usage, limiter_scope, prompt_tokens):
-            actual = _additional_stream_tokens(last_usage, prompt_tokens, pre_count_tokens)
+        async def on_complete(last_usage, limiter_scope, prompt_tokens, output_text):
+            # Counting the text can take a while for a long answer, so it runs off the event loop.
+            actual = await asyncio.to_thread(
+                stream_completion_tokens, last_usage, prompt_tokens, pre_count_tokens,
+                output_text, getattr(self.config, "model", None),
+            )
             await asyncio.to_thread(
                 self.rate_limiter.update_token_usage,
                 user_key,

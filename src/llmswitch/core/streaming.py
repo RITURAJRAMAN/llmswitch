@@ -7,6 +7,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from ..ratelimit.tokenizer import count_tokens
 from .circuit_breaker import is_health_failure
 from .events import current_emitter
 from .execution import ExecutionOutcome, ExecutionStatus
@@ -69,9 +70,39 @@ def response_event_terminal_status(event: Any) -> ExecutionStatus | None:
     return None
 
 
-def _additional_stream_tokens(usage: Any, prompt_tokens: int | None, estimated_prompt_tokens: int) -> int:
-    total_tokens = getattr(usage, "total_tokens", 0) if usage else 0
-    return max(0, total_tokens - (prompt_tokens if prompt_tokens is not None else estimated_prompt_tokens))
+def stream_item_text(item: Any) -> str:
+    """The text a stream item adds: chat content and thinking deltas, or a Responses text delta."""
+    if _field(item, "type") in ("response.output_text.delta", "response.reasoning_summary_text.delta",
+                                "response.function_call_arguments.delta"):
+        return _field(item, "delta") or ""
+    parts: list[str] = []
+    for choice in _field(item, "choices", ()) or ():
+        delta = _field(choice, "delta")
+        if delta is None:
+            continue
+        for name in ("content", "thinking"):
+            value = _field(delta, name)
+            if isinstance(value, str):
+                parts.append(value)
+        for call in _field(delta, "tool_calls", ()) or ():
+            arguments = _field(_field(call, "function"), "arguments")
+            if isinstance(arguments, str):
+                parts.append(arguments)
+    return "".join(parts)
+
+
+def stream_completion_tokens(usage: Any, prompt_tokens: int | None, estimated_prompt_tokens: int,
+                             output_text: str, model_name: str | None) -> int:
+    """The tokens a finished stream adds to the rate limit, beyond the prompt that was already counted.
+
+    The provider's usage is exact when it sends one. A stream without usage is counted from its text,
+    with the same tokenizer that counts prompts, so it is not free against the limit.
+    """
+    if usage is not None:
+        total_tokens = getattr(usage, "total_tokens", 0) or 0
+        if total_tokens:
+            return max(0, total_tokens - (prompt_tokens if prompt_tokens is not None else estimated_prompt_tokens))
+    return count_tokens(output_text, model_name) if output_text else 0
 
 
 @dataclass
@@ -117,6 +148,7 @@ class SyncStreamSession:
         self._buffer: deque[Any] = deque()
         self._output_visible = False
         self._last_usage = None
+        self._output_parts: list[str] = []
         self._terminal_status: ExecutionStatus | None = None
         self.outcome = ExecutionOutcome(status=ExecutionStatus.NOT_STARTED)
 
@@ -163,6 +195,9 @@ class SyncStreamSession:
         usage = getattr(item, "usage", None)
         if usage is not None:
             self._last_usage = usage
+        text = stream_item_text(item)
+        if text:
+            self._output_parts.append(text)
         terminal_status = self._terminal_status_fn(item)
         if terminal_status is not None:
             self._terminal_status = terminal_status
@@ -190,6 +225,7 @@ class SyncStreamSession:
                     self._last_usage,
                     handle.limiter_scope if handle is not None else None,
                     handle.prompt_tokens if handle is not None else None,
+                    "".join(self._output_parts),
                 )
             self.outcome = ExecutionOutcome(
                 status=status,
@@ -269,6 +305,7 @@ class SyncStreamSession:
                 self._output_visible = False
                 self._terminal_status = None
                 self._last_usage = None
+                self._output_parts = []
                 if not _is_retryable(exc) or attempt == self._max_retries:
                     raise
                 delay = _retry_delay(exc, attempt, self._base_delay, self._max_delay)
@@ -353,6 +390,7 @@ class AsyncStreamSession:
         self._buffer: deque[Any] = deque()
         self._output_visible = False
         self._last_usage = None
+        self._output_parts: list[str] = []
         self._terminal_status: ExecutionStatus | None = None
         self.outcome = ExecutionOutcome(status=ExecutionStatus.NOT_STARTED)
 
@@ -411,6 +449,9 @@ class AsyncStreamSession:
         usage = getattr(item, "usage", None)
         if usage is not None:
             self._last_usage = usage
+        text = stream_item_text(item)
+        if text:
+            self._output_parts.append(text)
         terminal_status = self._terminal_status_fn(item)
         if terminal_status is not None:
             self._terminal_status = terminal_status
@@ -438,6 +479,7 @@ class AsyncStreamSession:
                     self._last_usage,
                     handle.limiter_scope if handle is not None else None,
                     handle.prompt_tokens if handle is not None else None,
+                    "".join(self._output_parts),
                 )
                 if result is not None:
                     await result
@@ -538,6 +580,7 @@ class AsyncStreamSession:
                 self._output_visible = False
                 self._terminal_status = None
                 self._last_usage = None
+                self._output_parts = []
                 if not _is_retryable(exc) or attempt == self._max_retries:
                     raise
                 delay = _retry_delay(exc, attempt, self._base_delay, self._max_delay)

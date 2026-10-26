@@ -12,8 +12,8 @@ use and the reason. Three policies are included:
 - :class:`CostAwareRoutingPolicy` uses the primary, switching to the fallback after a tool error or from
   a chosen step onwards.
 
-Routing state lives for one run, and it is saved in checkpoints, so a resumed run continues the same
-rotation.
+Routing state, such as a round-robin position, belongs to the agent and carries over from one run to the
+next. It is also saved in checkpoints, so a resumed run continues its own rotation.
 """
 from __future__ import annotations
 

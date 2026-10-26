@@ -84,10 +84,10 @@ from .retry import _fails_over, _retry_call
 from .streaming import (
     StreamHandle,
     SyncStreamSession,
-    _additional_stream_tokens,
     chat_chunk_has_visible_output,
     response_event_has_visible_output,
     response_event_terminal_status,
+    stream_completion_tokens,
 )
 
 logger = logging.getLogger(__name__)
@@ -109,8 +109,9 @@ class _ChatCompletions(ProviderCache):
 
     def _wrap_streaming(self, primary_factory, user_key: str, pre_count_tokens: int, *,
                         backup_factory=None, max_retries: int = 0, base_delay: float = 0.0):
-        def on_complete(last_usage, limiter_scope, prompt_tokens):
-            actual = _additional_stream_tokens(last_usage, prompt_tokens, pre_count_tokens)
+        def on_complete(last_usage, limiter_scope, prompt_tokens, output_text):
+            actual = stream_completion_tokens(last_usage, prompt_tokens, pre_count_tokens,
+                                                  output_text, getattr(self.config, "model", None))
             self.rate_limiter.update_token_usage(
                 user_key,
                 actual,
@@ -568,8 +569,9 @@ class _Responses(ProviderCache):
 
     def _wrap_streaming(self, primary_factory, user_key: str, pre_count_tokens: int, *,
                         backup_factory=None, max_retries: int = 0, base_delay: float = 0.0):
-        def on_complete(last_usage, limiter_scope, prompt_tokens):
-            actual = _additional_stream_tokens(last_usage, prompt_tokens, pre_count_tokens)
+        def on_complete(last_usage, limiter_scope, prompt_tokens, output_text):
+            actual = stream_completion_tokens(last_usage, prompt_tokens, pre_count_tokens,
+                                                  output_text, getattr(self.config, "model", None))
             self.rate_limiter.update_token_usage(
                 user_key,
                 actual,

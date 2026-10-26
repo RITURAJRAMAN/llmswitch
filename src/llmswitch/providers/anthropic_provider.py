@@ -78,6 +78,7 @@ from ..models import (
     ChunkDelta,
     CompletionUsage,
     Function,
+    ProviderExtensions,
 )
 from ..structured import (
     is_pydantic_model_class,
@@ -201,7 +202,7 @@ def _openai_messages_to_anthropic(
             continue
 
         if role == "assistant":
-            parts: list[dict[str, Any]] = []
+            parts: list[dict[str, Any]] = _replayed_thinking_blocks(msg)
             if content:
                 text = _content_to_text(content)
                 if text:
@@ -248,6 +249,37 @@ def _openai_messages_to_anthropic(
         logger.warning("Anthropic provider: unknown message role '%s', skipping.", role)
 
     return system_blocks, anthropic_messages
+
+
+def _replayed_thinking_blocks(msg: dict[str, Any]) -> list[dict[str, Any]]:
+    """The signed thinking blocks of an earlier assistant turn, to send back unchanged.
+
+    Anthropic requires them to come first in the assistant content, before any text or tool use.
+    Only blocks tagged for the ``anthropic`` provider are sent.
+    """
+    extensions = msg.get("extensions")
+    if isinstance(extensions, ProviderExtensions):
+        provider, fields = extensions.provider, extensions.fields
+    elif isinstance(extensions, dict):
+        provider, fields = extensions.get("provider"), extensions.get("fields") or {}
+    else:
+        return []
+    if provider != "anthropic":
+        return []
+    return [dict(block) for block in fields.get("thinking_blocks") or []]
+
+
+def _thinking_blocks(content_blocks: list[Any]) -> list[dict[str, Any]]:
+    """The thinking blocks of a response, in the form the next request must send back."""
+    blocks: list[dict[str, Any]] = []
+    for block in content_blocks:
+        block_type = getattr(block, "type", None)
+        if block_type == "thinking":
+            blocks.append({"type": "thinking", "thinking": getattr(block, "thinking", "") or "",
+                           "signature": getattr(block, "signature", "") or ""})
+        elif block_type == "redacted_thinking":
+            blocks.append({"type": "redacted_thinking", "data": getattr(block, "data", "") or ""})
+    return blocks
 
 
 def _content_to_text(content: Any) -> str:
@@ -440,6 +472,8 @@ def _to_chat_completion_response(provider: "AnthropicChatProvider", response: An
         response,
         {"id", "type", "role", "content", "model", "stop_reason", "stop_sequence", "usage"},
     )
+    blocks = _thinking_blocks(response.content)
+    message_extensions = ProviderExtensions(provider="anthropic", fields={"thinking_blocks": blocks}) if blocks else None
     return ChatCompletion(
         id=response.id,
         object="chat.completion",
@@ -455,6 +489,7 @@ def _to_chat_completion_response(provider: "AnthropicChatProvider", response: An
                     thinking=thinking,
                     thinking_signature=thinking_signature,
                     citations=citations,
+                    extensions=message_extensions,
                 ),
                 finish_reason=finish_reason,
             )

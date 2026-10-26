@@ -21,8 +21,7 @@ def add(a: int, b: int) -> int:
 
 
 def main() -> None:
-    llm = ChatLLMSwitch(provider="openai", api_key=os.environ["OPENAI_API_KEY"], model="gpt-4o-mini",
-                        temperature=0)
+    llm = ChatLLMSwitch(provider="openai", api_key=os.environ["OPENAI_API_KEY"], model="gpt-4o-mini")
     try:
         history = run_tool_loop(
             llm,

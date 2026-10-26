@@ -18,7 +18,9 @@ def sync_demo(api_key: str) -> None:
     reply = client.chat.completions.create(messages=MESSAGES)
     print("sync chat:", reply.choices[0].message.content)
 
-    vectors = client.embeddings.create(["llmswitch", "python"], model="text-embedding-3-small")
+    # Set OPENAI_EMBEDDING_MODEL to the name of an embedding model your endpoint has deployed.
+    model = os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+    vectors = client.embeddings.create(["llmswitch", "python"], model=model)
     print("sync embeddings:", len(vectors.data), "vectors of length", len(vectors.data[0].embedding))
 
 

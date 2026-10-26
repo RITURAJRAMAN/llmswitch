@@ -14,7 +14,8 @@ The loop stops with a status in the result:
   ``interrupt_on_tool_error`` is set) or ``uncertain_tool_execution`` (a tool may have started before
   the run was paused, and it is not safe to run it again). :meth:`Agent.resume` continues from there.
 - ``stopped`` with a ``reason``: ``max_iterations_reached``, ``max_runtime_exceeded``,
-  ``max_input_tokens_per_step_exceeded`` or ``tool_retry_exhausted``.
+  ``max_input_tokens_per_step_exceeded``, ``tool_retry_exhausted`` (a failure remained after the retries),
+  ``tool_failed`` (a failure with no retries configured) or ``reflection_verdict_unreadable``.
 
 Every model call is a step record, so the caller can see what happened on each turn. The agent writes a
 checkpoint at each phase of a step (before reflection, before tools, after tools, after a rejected
@@ -45,11 +46,13 @@ from .chat import Tool, _as_messages, _tool_map
 from .checkpoints import SCHEMA_VERSION, CheckpointStore, InMemoryCheckpointStore
 from .events import AgentEventHandler, notify
 from .execution import (
+    Isolation,
     ToolExecutionResult,
     aexecute_tool_calls,
     aretry_failed_tool_calls,
     execute_tool_calls,
     is_idempotent,
+    process_isolation_available,
     retry_failed_tool_calls,
 )
 from .routing import BaseRoutingPolicy
@@ -94,6 +97,7 @@ class AgentConfig:
     tool_timeout_seconds: float = 30.0
     parallel_tools: bool = True
     max_concurrency: int = 4
+    tool_isolation: Isolation = "thread"
     tool_retry_attempts: int = 0
     tool_retry_backoff_seconds: float = 0.0
     retry_on_tool_not_found: bool = False
@@ -112,6 +116,10 @@ class AgentConfig:
             raise ValueError("reflection_max_retries must not be negative")
         if self.tool_timeout_seconds <= 0:
             raise ValueError("tool_timeout_seconds must be positive")
+        if self.tool_isolation not in ("thread", "process"):
+            raise ValueError("tool_isolation must be 'thread' or 'process'")
+        if self.tool_isolation == "process" and not process_isolation_available():
+            raise ValueError("tool_isolation='process' needs a platform with fork (POSIX); use 'thread' here")
         if self.max_concurrency < 1:
             raise ValueError("max_concurrency must be at least 1")
         if self.tool_retry_attempts < 0:
@@ -307,22 +315,30 @@ class Agent:
         self.event_handler = event_handler
         self.checkpoint_store: CheckpointStore = checkpoint_store or InMemoryCheckpointStore()
         self._tool_map = _tool_map(self.tools) if self.tools else {}
+        # Routing state, such as a round-robin position, carries over from one run to the next.
+        self._routing_state: dict[str, Any] = {}
 
     # --- public API -------------------------------------------------------------------------
 
     def invoke(self, input: str | list[BaseMessage], *, max_runtime_seconds: float | None = None) -> dict[str, Any]:
         """Run the loop synchronously and return the result dictionary."""
-        return self._drive(
+        routing = dict(self._routing_state)
+        result = self._drive(
             messages=_as_messages(input), steps=[], step=1, budget=self._budget(max_runtime_seconds),
-            reflection_retries=0, had_tool_error=False, pending=None, routing={},
+            reflection_retries=0, had_tool_error=False, pending=None, routing=routing,
         )
+        self._routing_state.update(routing)
+        return result
 
     async def ainvoke(self, input: str | list[BaseMessage], *, max_runtime_seconds: float | None = None) -> dict[str, Any]:
         """Run the loop asynchronously and return the result dictionary."""
-        return await self._adrive(
+        routing = dict(self._routing_state)
+        result = await self._adrive(
             messages=_as_messages(input), steps=[], step=1, budget=self._budget(max_runtime_seconds),
-            reflection_retries=0, had_tool_error=False, pending=None, routing={},
+            reflection_retries=0, had_tool_error=False, pending=None, routing=routing,
         )
+        self._routing_state.update(routing)
+        return result
 
     def resume(self, checkpoint_id: str, user_feedback: str | None = None) -> dict[str, Any]:
         """Continue an interrupted run from its checkpoint.
@@ -334,7 +350,8 @@ class Agent:
         plan = self._restore(checkpoint_id, user_feedback)
         if "status" in plan:  # already a final result, such as an uncertain tool execution
             return plan
-        return self._drive(**plan)
+        result = self._drive(**plan)
+        return result
 
     async def aresume(self, checkpoint_id: str, user_feedback: str | None = None) -> dict[str, Any]:
         """Async :meth:`resume`."""
@@ -641,7 +658,7 @@ class Agent:
         if indices:
             subset = [calls[i] for i in indices]
             fresh = execute_tool_calls(
-                step=step_number, tool_calls=subset, tool_map=self._tool_map, timeout_s=cfg.tool_timeout_seconds,
+                step=step_number, tool_calls=subset, tool_map=self._tool_map, timeout_s=cfg.tool_timeout_seconds, isolation=cfg.tool_isolation,
                 parallel=cfg.parallel_tools, max_concurrency=cfg.max_concurrency, handler=self.event_handler,
                 on_start=lambda local: journal.start(indices[local]),
                 on_result=lambda local, result: journal.result(indices[local], result),
@@ -649,7 +666,7 @@ class Agent:
             if cfg.tool_retry_attempts and any(not result.ok for result in fresh):
                 fresh = retry_failed_tool_calls(
                     step=step_number, tool_calls=subset, results=fresh, tool_map=self._tool_map,
-                    timeout_s=cfg.tool_timeout_seconds, attempts=cfg.tool_retry_attempts,
+                    timeout_s=cfg.tool_timeout_seconds, isolation=cfg.tool_isolation, attempts=cfg.tool_retry_attempts,
                     backoff_seconds=cfg.tool_retry_backoff_seconds,
                     retry_on_tool_not_found=cfg.retry_on_tool_not_found,
                     retry_non_idempotent=cfg.retry_non_idempotent_tools,
@@ -671,7 +688,7 @@ class Agent:
         if indices:
             subset = [calls[i] for i in indices]
             fresh = await aexecute_tool_calls(
-                step=step_number, tool_calls=subset, tool_map=self._tool_map, timeout_s=cfg.tool_timeout_seconds,
+                step=step_number, tool_calls=subset, tool_map=self._tool_map, timeout_s=cfg.tool_timeout_seconds, isolation=cfg.tool_isolation,
                 parallel=cfg.parallel_tools, max_concurrency=cfg.max_concurrency, handler=self.event_handler,
                 on_start=lambda local: journal.start(indices[local]),
                 on_result=lambda local, result: journal.result(indices[local], result),
@@ -679,7 +696,7 @@ class Agent:
             if cfg.tool_retry_attempts and any(not result.ok for result in fresh):
                 fresh = await aretry_failed_tool_calls(
                     step=step_number, tool_calls=subset, results=fresh, tool_map=self._tool_map,
-                    timeout_s=cfg.tool_timeout_seconds, attempts=cfg.tool_retry_attempts,
+                    timeout_s=cfg.tool_timeout_seconds, isolation=cfg.tool_isolation, attempts=cfg.tool_retry_attempts,
                     backoff_seconds=cfg.tool_retry_backoff_seconds,
                     retry_on_tool_not_found=cfg.retry_on_tool_not_found,
                     retry_non_idempotent=cfg.retry_non_idempotent_tools,
@@ -698,8 +715,11 @@ class Agent:
         if not failed:
             return None
         if self.config.escalate_on_retry_exhausted:
+            # "Exhausted" only when a failure was actually retried; a failure that was never retried is "failed".
+            retried = any(result.attempts > 1 for result in failed)
+            reason = "tool_retry_exhausted" if retried else "tool_failed"
             return {
-                "status": "stopped", "reason": "tool_retry_exhausted",
+                "status": "stopped", "reason": reason,
                 "failed_tools": [{"tool_name": r.tool_name, "error": r.error, "attempts": r.attempts} for r in failed],
                 "messages": messages, "steps": steps,
             }

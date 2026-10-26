@@ -349,7 +349,8 @@ def test_a_successful_call_emits_start_and_end_events():
 def test_a_failed_call_emits_an_error_event():
     events = CollectingEventHandler()
     execute_tool_calls(step=1, tool_calls=[c("ghost", {}, "e2")], tool_map={}, timeout_s=5, handler=events)
-    assert events.events == []  # a missing tool never starts, so no tool event is emitted
+    # A refused call still gets a start and an error event, so event consumers see it.
+    assert [e.event for e in events.events] == ["tool_start", "tool_error"]
 
     @tool
     def bad(x: int) -> int:
@@ -358,8 +359,8 @@ def test_a_failed_call_emits_an_error_event():
 
     execute_tool_calls(step=1, tool_calls=[c("bad", {"x": 1}, "e3")], tool_map={"bad": bad}, timeout_s=5,
                        handler=events)
-    assert [e.event for e in events.events] == ["tool_start", "tool_error"]
-    assert events.events[1].payload["error"] == "ValueError: oops"
+    assert [e.event for e in events.events[2:]] == ["tool_start", "tool_error"]
+    assert events.events[3].payload["error"] == "ValueError: oops"
 
 
 def test_a_handler_that_raises_does_not_break_the_run(caplog):

@@ -31,7 +31,7 @@ from langchain_core.messages import (
 )
 
 from ..errors import ResponsesError
-from ..models import ChatCompletion, ChatCompletionChunk, Response, ResponseStreamEvent
+from ..models import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage, Response, ResponseStreamEvent
 
 _TEXT_BLOCK = "text"
 
@@ -95,11 +95,23 @@ def _content_for_role(content: Any, role: str) -> Any:
     return _text_only(parts)
 
 
+# Providers whose answers carry data that must be sent back on the next turn.
+_REPLAYED_PROVIDERS = frozenset({"anthropic", "vertexai"})
+
+
+def _provider_data(message: ChatCompletionMessage) -> dict[str, Any] | None:
+    """The replayable provider data of an answer, as plain JSON-safe values, or None."""
+    extensions = message.extensions
+    if extensions is None or extensions.provider not in _REPLAYED_PROVIDERS or not extensions.fields:
+        return None
+    return {"provider": extensions.provider, "fields": json.loads(json.dumps(extensions.fields))}
+
+
 def _tool_call_dict(call_id: str | None, name: str | None, arguments: str) -> dict[str, Any]:
     return {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
 
 
-def _assistant_dict(message: AIMessage) -> dict[str, Any]:
+def _assistant_dict(message: AIMessage, provider: str | None) -> dict[str, Any]:
     text = _content_for_role(message.content, "assistant") if message.content else ""
     calls = [
         _tool_call_dict(call["id"], call["name"], json.dumps(call["args"]))
@@ -112,11 +124,19 @@ def _assistant_dict(message: AIMessage) -> dict[str, Any]:
     result: dict[str, Any] = {"role": "assistant", "content": text or None}
     if calls:
         result["tool_calls"] = calls
+    kept = message.additional_kwargs.get("provider_data")
+    if kept and kept.get("provider") == provider:
+        # The provider sends these back unchanged: Anthropic thinking blocks, or Gemini function-call signatures.
+        result["extensions"] = {"provider": provider, "fields": kept["fields"]}
     return result
 
 
-def to_chat_messages(messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
-    """Convert agentic message objects to the chat message dicts that llmswitch sends."""
+def to_chat_messages(messages: Sequence[BaseMessage], provider: str | None = None) -> list[dict[str, Any]]:
+    """Convert agentic message objects to the chat message dicts that llmswitch sends.
+
+    ``provider`` decides which provider-specific data is kept: the signed thinking blocks of an Anthropic
+    answer are sent back only to Anthropic.
+    """
     converted: list[dict[str, Any]] = []
     for message in messages:
         if isinstance(message, SystemMessage):
@@ -124,7 +144,7 @@ def to_chat_messages(messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
         elif isinstance(message, HumanMessage):
             converted.append({"role": "user", "content": _content_for_role(message.content, "user")})
         elif isinstance(message, AIMessage):
-            converted.append(_assistant_dict(message))
+            converted.append(_assistant_dict(message, provider))
         elif isinstance(message, ToolMessage):
             converted.append({"role": "tool", "tool_call_id": message.tool_call_id,
                               "content": _content_for_role(message.content, "tool")})
@@ -171,6 +191,7 @@ def to_ai_message(completion: ChatCompletion) -> AIMessage:
     """
     choice = completion.choices[0]
     message = choice.message
+    kept = _provider_data(message)
     tool_calls: list[ToolCall] = []
     invalid: list[InvalidToolCall] = []
     for call in message.tool_calls or []:
@@ -184,6 +205,7 @@ def to_ai_message(completion: ChatCompletion) -> AIMessage:
         content=message.content or "",
         tool_calls=tool_calls,
         invalid_tool_calls=invalid,
+        additional_kwargs={"provider_data": kept} if kept else {},
         usage_metadata=_usage_metadata(completion.usage),
         response_metadata={
             "model_name": completion.model,

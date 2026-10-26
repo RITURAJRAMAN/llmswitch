@@ -15,7 +15,7 @@ from llmswitch.agentic import ChatLLMSwitch
 
 def build_model() -> ChatLLMSwitch:
     return ChatLLMSwitch(provider="openai", api_key=os.environ["OPENAI_API_KEY"], model="gpt-4o-mini",
-                         temperature=0.2, max_tokens=200)
+                         max_tokens=200)
 
 
 def main() -> None:
