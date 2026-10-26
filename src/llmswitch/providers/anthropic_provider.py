@@ -546,6 +546,43 @@ def _raise_mapped_anthropic_error(
 # Provider
 # ---------------------------------------------------------------------------
 
+class _StreamedThinking:
+    """Turns the events of one Anthropic stream into deltas, keeping each thinking block whole.
+
+    A thinking block's text streams first and its signature last, so the text is held until the
+    signature arrives, and the complete block is then sent on the signature delta. A redacted block
+    is complete at its start event.
+    """
+
+    def __init__(self) -> None:
+        self.text = ""
+
+    def delta_for(self, event: Any) -> ChoiceDelta | None:
+        event_type = getattr(event, "type", None)
+        if event_type == "content_block_start":
+            block = getattr(event, "content_block", None)
+            if getattr(block, "type", None) == "redacted_thinking":
+                blocks = [{"type": "redacted_thinking", "data": getattr(block, "data", "") or ""}]
+                return ChoiceDelta(role="assistant", extensions=ProviderExtensions(
+                    provider="anthropic", fields={"thinking_blocks": blocks}))
+            return None
+        if event_type != "content_block_delta":
+            return None
+        delta = event.delta
+        delta_type = getattr(delta, "type", None)
+        if delta_type == "text_delta":
+            return ChoiceDelta(role="assistant", content=delta.text)
+        if delta_type == "thinking_delta":
+            self.text += delta.thinking
+            return ChoiceDelta(role="assistant", thinking=delta.thinking)
+        if delta_type == "signature_delta":
+            blocks = [{"type": "thinking", "thinking": self.text, "signature": delta.signature}]
+            self.text = ""
+            return ChoiceDelta(role="assistant", thinking_signature=delta.signature,
+                               extensions=ProviderExtensions(provider="anthropic", fields={"thinking_blocks": blocks}))
+        return None
+
+
 class AnthropicChatProvider(BaseChatProvider):
     """
     Anthropic (Claude) ChatCompletion Provider.
@@ -764,23 +801,16 @@ class AnthropicChatProvider(BaseChatProvider):
                 model = req.get("model", self.model)
                 created = int(time.time())
 
+                thinking = _StreamedThinking()
+
                 with self.client.messages.stream(**req) as stream:
                     # Stream text and thinking incrementally as deltas arrive, rather
                     # than collecting thinking only from the final message. Iterating
                     # raw events exposes thinking_delta / signature_delta, which
                     # stream.text_stream (text-only) hides.
                     for event in stream:
-                        if getattr(event, "type", None) != "content_block_delta":
-                            continue
-                        delta = event.delta
-                        delta_type = getattr(delta, "type", None)
-                        if delta_type == "text_delta":
-                            chunk_delta = ChoiceDelta(role="assistant", content=delta.text)
-                        elif delta_type == "thinking_delta":
-                            chunk_delta = ChoiceDelta(role="assistant", thinking=delta.thinking)
-                        elif delta_type == "signature_delta":
-                            chunk_delta = ChoiceDelta(role="assistant", thinking_signature=delta.signature)
-                        else:
+                        chunk_delta = thinking.delta_for(event)
+                        if chunk_delta is None:
                             continue
                         yield ChatCompletionChunk(
                             id=chunk_id,
@@ -940,22 +970,15 @@ class AsyncAnthropicChatProvider(AnthropicChatProvider):
             model = req.get("model", self.model)
             created = int(time.time())
 
+            thinking = _StreamedThinking()
+
             async with self.client.messages.stream(**req) as stream:
                 # Stream text and thinking incrementally as deltas arrive (see the
                 # sync provider for rationale): raw events expose thinking_delta /
                 # signature_delta that stream.text_stream hides.
                 async for event in stream:
-                    if getattr(event, "type", None) != "content_block_delta":
-                        continue
-                    delta = event.delta
-                    delta_type = getattr(delta, "type", None)
-                    if delta_type == "text_delta":
-                        chunk_delta = ChoiceDelta(role="assistant", content=delta.text)
-                    elif delta_type == "thinking_delta":
-                        chunk_delta = ChoiceDelta(role="assistant", thinking=delta.thinking)
-                    elif delta_type == "signature_delta":
-                        chunk_delta = ChoiceDelta(role="assistant", thinking_signature=delta.signature)
-                    else:
+                    chunk_delta = thinking.delta_for(event)
+                    if chunk_delta is None:
                         continue
                     yield ChatCompletionChunk(
                         id=chunk_id,

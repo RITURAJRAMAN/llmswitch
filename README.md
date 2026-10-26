@@ -411,8 +411,8 @@ below.
   unchanged in the next request, first in the assistant turn, as Anthropic asks for extended thinking with
   tools. Tool calls are sent through `tool_calls`. Other providers' reasoning blocks are not sent back.
 - With Vertex AI, the thought signature of each function call is kept and sent back with that call, as Gemini
-  requires for tool use. Thinking blocks and these signatures are kept for `invoke` and the agent. A streamed
-  answer does not keep them, so they are not sent back after a streamed turn.
+  requires for tool use. Streamed answers keep them too, so a streamed turn can be sent back with its
+  thinking blocks and signatures intact.
 - `tool_choice=False` is sent as `"none"`, which tells the model not to call tools.
 
 ### Closing the agentic model

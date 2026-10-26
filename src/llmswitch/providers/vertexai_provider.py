@@ -134,6 +134,8 @@ class _StreamState:
         self.last_response: Any = None
         self.requested_count: int = getattr(config, "candidate_count", None) or 1
         self.seen_candidates: set[int] = set()
+        # Function calls are numbered across the whole stream, so ids and signatures do not collide.
+        self.call_count: int = 0
 
 
 class VertexAIChatProvider(BaseChatProvider):
@@ -436,14 +438,14 @@ class VertexAIChatProvider(BaseChatProvider):
             for index, function_call in enumerate(function_calls)
         ]
 
-    def _map_delta_tool_calls(self, function_calls: list[Any]) -> list[ChoiceDeltaToolCall] | None:
+    def _map_delta_tool_calls(self, function_calls: list[Any], first_index: int = 0) -> list[ChoiceDeltaToolCall] | None:
         if not function_calls:
             return None
 
         return [
             ChoiceDeltaToolCall(
-                index=index,
-                id=self._tool_call_id(index),
+                index=first_index + index,
+                id=self._tool_call_id(first_index + index),
                 type="function",
                 function=ChoiceDeltaToolCallFunction(
                     name=getattr(function_call, "name", None),
@@ -805,7 +807,14 @@ class VertexAIChatProvider(BaseChatProvider):
             text, function_calls = self._extract_text_and_function_calls(candidate) if candidate else ("", [])
             if len(candidates) <= 1 and not function_calls:
                 function_calls = list(getattr(response, "function_calls", None) or [])
-            mapped_tool_calls = self._map_delta_tool_calls(function_calls)
+            first_index = state.call_count
+            state.call_count += len(function_calls)
+            mapped_tool_calls = self._map_delta_tool_calls(function_calls, first_index)
+            signatures = {
+                self._tool_call_id(first_index + position): signature
+                for position, signature in enumerate(_thought_signatures(candidate) if candidate else [])
+                if signature
+            }
             finish_reason = self._normalize_finish_reason(
                 getattr(candidate, "finish_reason", None) if candidate else None,
                 has_tool_calls=bool(mapped_tool_calls),
@@ -817,7 +826,11 @@ class VertexAIChatProvider(BaseChatProvider):
             chunk_choices.append(
                 ChunkDelta(
                     index=index,
-                    delta=ChoiceDelta(role=role, content=text or None, tool_calls=mapped_tool_calls),
+                    delta=ChoiceDelta(
+                        role=role, content=text or None, tool_calls=mapped_tool_calls,
+                        extensions=(ProviderExtensions(provider="vertexai", fields={"thought_signatures": signatures})
+                                    if signatures else None),
+                    ),
                     finish_reason=finish_reason,
                     content_filter_results=getattr(candidate, "safety_ratings", None) if candidate else None,
                     citation_metadata=to_jsonable(

@@ -19,8 +19,8 @@ All notable changes to this project are documented here. The format follows
 - `make_subagent_tool` and `make_specialist_tools`, which wrap an agent as a tool that another agent can call.
 - Aggregation of specialist rows: `MajorityVoteAggregator`, `WeightedScoreAggregator` (weights from the contracts), and `JsonMergeAggregator` with the `last_writer_wins`, `first_writer_wins` and `error` conflict policies. `aggregate_specialists` and `aaggregate_specialists` run and aggregate in one call. JSON in a Markdown code fence is read as JSON.
 - `tool_isolation="process"` for the agent: a plain `def` tool runs in a forked child process that is killed at `tool_timeout_seconds`, so its work stops. POSIX only.
-- Anthropic extended thinking with tools: the signed `thinking` and `redacted_thinking` blocks of an answer are kept and sent back unchanged, first in the assistant turn. A stream does not keep them.
-- Vertex AI tool use with Gemini: each function call's thought signature is kept and sent back with the call. Models that enforce signatures, such as Gemini 3, reject the next turn of a tool loop without them.
+- Anthropic extended thinking with tools: the signed `thinking` and `redacted_thinking` blocks of an answer, streamed or not, are kept and sent back unchanged, first in the assistant turn.
+- Vertex AI tool use with Gemini: each function call's thought signature is kept, streamed or not, and sent back with the call. Streamed function calls are numbered across the whole stream, so they no longer collide. Models that enforce signatures, such as Gemini 3, reject the next turn of a tool loop without them.
 - A stream without provider usage is counted from its streamed text (content and thinking), with the same tokenizer as prompts, so it counts against `tpm`.
 - Sequential specialists run on a worker thread when a time limit is set, so a specialist still running at the limit is reported as `timeout` on time.
 - Examples `examples/agentic_agent.py` (a tool failure, a file checkpoint and a resume) and `examples/agentic_specialists.py` (weighted consensus over specialists).

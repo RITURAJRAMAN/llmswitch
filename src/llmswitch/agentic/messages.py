@@ -31,7 +31,13 @@ from langchain_core.messages import (
 )
 
 from ..errors import ResponsesError
-from ..models import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage, Response, ResponseStreamEvent
+from ..models import (
+    ChatCompletion,
+    ChatCompletionChunk,
+    ProviderExtensions,
+    Response,
+    ResponseStreamEvent,
+)
 
 _TEXT_BLOCK = "text"
 
@@ -52,9 +58,9 @@ def _image_url(block: dict[str, Any]) -> str:
     raise ValueError(f"Unsupported image content block: {sorted(block)}")
 
 
-# Blocks that describe a provider's own reasoning or tool use. They are not replayed:
-# the tool calls are already sent through ``tool_calls``, and a reasoning block is only
-# valid with the signature the original provider issued, which llmswitch does not keep.
+# Content blocks that describe a provider's own reasoning or tool use. They are not replayed from
+# message content: tool calls are sent through ``tool_calls``. The data a provider needs back (Anthropic
+# thinking blocks, Vertex function-call signatures) is kept in ``additional_kwargs`` by ``_kept_data``.
 _NOT_REPLAYED = frozenset({
     "thinking", "redacted_thinking", "reasoning", "tool_use", "tool_call", "function_call", "server_tool_use",
 })
@@ -95,16 +101,19 @@ def _content_for_role(content: Any, role: str) -> Any:
     return _text_only(parts)
 
 
-# Providers whose answers carry data that must be sent back on the next turn.
-_REPLAYED_PROVIDERS = frozenset({"anthropic", "vertexai"})
+def _kept_data(extensions: ProviderExtensions | None) -> dict[str, Any]:
+    """The data a provider answer must send back on the next turn, as message additional kwargs.
 
-
-def _provider_data(message: ChatCompletionMessage) -> dict[str, Any] | None:
-    """The replayable provider data of an answer, as plain JSON-safe values, or None."""
-    extensions = message.extensions
-    if extensions is None or extensions.provider not in _REPLAYED_PROVIDERS or not extensions.fields:
-        return None
-    return {"provider": extensions.provider, "fields": json.loads(json.dumps(extensions.fields))}
+    Each kind has its own key and no provider name, so chunks of one answer can be joined: lists of
+    thinking blocks concatenate, and signature maps merge.
+    """
+    if extensions is None or not extensions.fields:
+        return {}
+    if extensions.provider == "anthropic" and extensions.fields.get("thinking_blocks"):
+        return {"anthropic_thinking_blocks": json.loads(json.dumps(extensions.fields["thinking_blocks"]))}
+    if extensions.provider == "vertexai" and extensions.fields.get("thought_signatures"):
+        return {"vertexai_thought_signatures": json.loads(json.dumps(extensions.fields["thought_signatures"]))}
+    return {}
 
 
 def _tool_call_dict(call_id: str | None, name: str | None, arguments: str) -> dict[str, Any]:
@@ -124,10 +133,14 @@ def _assistant_dict(message: AIMessage, provider: str | None) -> dict[str, Any]:
     result: dict[str, Any] = {"role": "assistant", "content": text or None}
     if calls:
         result["tool_calls"] = calls
-    kept = message.additional_kwargs.get("provider_data")
-    if kept and kept.get("provider") == provider:
-        # The provider sends these back unchanged: Anthropic thinking blocks, or Gemini function-call signatures.
-        result["extensions"] = {"provider": provider, "fields": kept["fields"]}
+    kept = message.additional_kwargs
+    if provider == "anthropic" and kept.get("anthropic_thinking_blocks"):
+        # Sent back unchanged, first in the assistant turn, as Anthropic requires with extended thinking.
+        result["extensions"] = {"provider": "anthropic", "fields": {"thinking_blocks": kept["anthropic_thinking_blocks"]}}
+    elif provider == "vertexai" and kept.get("vertexai_thought_signatures"):
+        # Sent back with each function call, as Gemini requires.
+        result["extensions"] = {"provider": "vertexai",
+                                "fields": {"thought_signatures": kept["vertexai_thought_signatures"]}}
     return result
 
 
@@ -191,7 +204,6 @@ def to_ai_message(completion: ChatCompletion) -> AIMessage:
     """
     choice = completion.choices[0]
     message = choice.message
-    kept = _provider_data(message)
     tool_calls: list[ToolCall] = []
     invalid: list[InvalidToolCall] = []
     for call in message.tool_calls or []:
@@ -205,7 +217,7 @@ def to_ai_message(completion: ChatCompletion) -> AIMessage:
         content=message.content or "",
         tool_calls=tool_calls,
         invalid_tool_calls=invalid,
-        additional_kwargs={"provider_data": kept} if kept else {},
+        additional_kwargs=_kept_data(message.extensions),
         usage_metadata=_usage_metadata(completion.usage),
         response_metadata={
             "model_name": completion.model,
@@ -224,8 +236,10 @@ def to_ai_chunk(chunk: ChatCompletionChunk) -> AIMessageChunk:
     content = ""
     fragments: list[ToolCallChunk] = []
     finish_reason = None
+    kept: dict[str, Any] = {}
     for choice in chunk.choices:
         delta = choice.delta
+        kept.update(_kept_data(delta.extensions))
         if delta.content:
             content += delta.content
         for call in delta.tool_calls or []:
@@ -237,6 +251,7 @@ def to_ai_chunk(chunk: ChatCompletionChunk) -> AIMessageChunk:
     return AIMessageChunk(
         content=content,
         tool_call_chunks=fragments,
+        additional_kwargs=kept,
         usage_metadata=_usage_metadata(chunk.usage),
         response_metadata={"model_name": chunk.model, "finish_reason": finish_reason, "id": chunk.id},
     )
