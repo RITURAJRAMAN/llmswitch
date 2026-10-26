@@ -8,7 +8,7 @@ OpenAI, Azure OpenAI, Azure AI Foundry, Anthropic and Vertex AI.
 """
 import logging
 
-__version__ = "0.1.3"
+__version__ = "0.1.3a0"
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
