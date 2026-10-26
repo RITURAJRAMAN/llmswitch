@@ -46,11 +46,11 @@ vertexai = []
 redis = [
     "redis>=8.1.0,<9",
 ]
-langchain = [
+agentic = [
     "langchain-core>=1.6.9,<2",
 ]
 all = [
-    "llmswitch-sdk[redis,langchain]",
+    "llmswitch-sdk[redis,agentic]",
 ]
 dev = [
     "build>=1.6.1",

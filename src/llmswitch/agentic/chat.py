@@ -1,14 +1,14 @@
 """
-llmswitch.integrations.langchain
+llmswitch.agentic.chat
 
-``ChatLLMSwitch``, a LangChain chat model backed by ``LLMSwitch`` and ``AsyncLLMSwitch``.
+``ChatLLMSwitch``, a chat model backed by ``LLMSwitch`` and ``AsyncLLMSwitch``.
 Every provider that supports chat completions works, and rate limits, retries,
 circuit breaking, failover and ``on_event`` apply to calls made through it.
 
-It needs ``langchain-core``, installed by the ``langchain`` extra. Importing this
-module without it raises ``ImportError`` with the install command.
+It needs the ``agentic`` extra. Importing this module without it raises ``ImportError``
+with the install command.
 
-    from llmswitch.integrations.langchain import ChatLLMSwitch
+    from llmswitch.agentic import ChatLLMSwitch
 
     llm = ChatLLMSwitch(provider="anthropic", api_key="...", model="claude-opus-4-5", temperature=0.2)
     llm.invoke("Hello")
@@ -32,22 +32,22 @@ try:
     from langchain_core.utils.function_calling import convert_to_openai_tool
     from pydantic import Field, PrivateAttr
 
-    from .langchain_messages import to_ai_chunk, to_ai_message, to_chat_messages
-except ImportError as exc:  # pragma: no cover - exercised by tests that hide langchain_core
+    from .messages import to_ai_chunk, to_ai_message, to_chat_messages
+except ImportError as exc:  # pragma: no cover - exercised by tests that hide the optional dependency
     raise ImportError(
-        "The LangChain integration needs langchain-core. Install it with: "
-        'pip install "llmswitch-sdk[langchain]"'
+        "The agentic features need the agentic extra. Install it with: "
+        'pip install "llmswitch-sdk[agentic]"'
     ) from exc
 
 from ..core import AsyncLLMSwitch, LLMSwitch
 from ..errors import ToolLoopLimitError
 
-# LangChain passes some internal keyword arguments (for example ``ls_structured_output_format``).
+# The framework passes some internal keyword arguments (for example ``ls_structured_output_format``).
 # They describe tracing, not the request, so they are not forwarded.
 _INTERNAL_PREFIX = "ls_"
 
 def _tool_choice(value: Any) -> Any:
-    """Translate LangChain's tool_choice spellings into chat completions form."""
+    """Translate the tool_choice spellings used by the agentic model into chat completions form."""
     if value is None:
         return None
     if value is False:
@@ -61,9 +61,14 @@ def _tool_choice(value: Any) -> Any:
     return value
 
 
+# Guards the one-time creation of each model's async client. A module-level lock keeps the
+# model itself free of lock objects, so it can still be copied and pickled.
+_ASYNC_CLIENT_LOCK = threading.Lock()
+
+
 class ChatLLMSwitch(BaseChatModel):
     """
-    LangChain chat model over llmswitch.
+    Chat model over llmswitch.
 
     Options that the model itself understands are fields: ``temperature``, ``max_tokens``,
     ``stop``, and ``call_options`` (extra keyword arguments sent with every request).
@@ -79,7 +84,6 @@ class ChatLLMSwitch(BaseChatModel):
     _switch_options: dict[str, Any] = PrivateAttr(default_factory=dict)
     _switch: Any = PrivateAttr(default=None)
     _async_switch: Any = PrivateAttr(default=None)
-    _async_lock: Any = PrivateAttr(default_factory=threading.Lock)
 
     def __init__(self, **kwargs: Any) -> None:
         own_fields = set(type(self).model_fields)
@@ -111,12 +115,13 @@ class ChatLLMSwitch(BaseChatModel):
 
         Locked, so concurrent first calls from several threads share one client.
         """
-        with self._async_lock:
+        with _ASYNC_CLIENT_LOCK:
             if self._async_switch is None:
                 self._async_switch = AsyncLLMSwitch(**self._switch_options)
             return self._async_switch
 
     def _request(self, stop: list[str] | None, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Build the keyword arguments for one request. ``None`` means "not set", so it is never sent."""
         request: dict[str, Any] = dict(self.call_options)
         if self.temperature is not None:
             request["temperature"] = self.temperature
@@ -126,10 +131,10 @@ class ChatLLMSwitch(BaseChatModel):
         if stop_sequences:
             request["stop"] = list(stop_sequences)
         for key, value in kwargs.items():
-            if key.startswith(_INTERNAL_PREFIX):
+            if key.startswith(_INTERNAL_PREFIX) or value is None:
                 continue
             request[key] = _tool_choice(value) if key == "tool_choice" else value
-        return request
+        return {key: value for key, value in request.items() if value is not None}
 
     def _generate(self, messages: list[BaseMessage], stop: list[str] | None = None,
                   run_manager: CallbackManagerForLLMRun | None = None, **kwargs: Any) -> ChatResult:
@@ -173,7 +178,7 @@ class ChatLLMSwitch(BaseChatModel):
     ) -> Runnable[Any, AIMessage]:
         """Return a copy of the model that sends ``tools`` with every request.
 
-        ``tools`` may be LangChain tools, Pydantic classes, plain functions or OpenAI-style
+        ``tools`` may be tool objects, Pydantic classes, plain functions or OpenAI-style
         dicts. ``tool_choice`` accepts ``"auto"``, ``"none"``, ``"required"`` (or ``"any"``),
         or the name of one tool to force.
         """
@@ -196,7 +201,7 @@ def _tool_map(tools: Sequence[Tool]) -> dict[str, Tool]:
     for tool in tools:
         name: str | None = tool.name if isinstance(tool, BaseTool) else getattr(tool, "__name__", None)
         if not name:
-            raise ValueError("Plain callable tools need a __name__; use a def function or a LangChain tool, "
+            raise ValueError("Plain callable tools need a __name__; use a def function or a tool object, "
                              "not functools.partial.")
         if name in mapping:
             raise ValueError(f"Duplicate tool name: {name}")

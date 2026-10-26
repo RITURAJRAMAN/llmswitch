@@ -3,7 +3,7 @@ import logging
 
 import pytest
 
-from llmswitch import APIConnectionError, LLMSwitchError, TimeOutError, ToolLoopLimitError
+from llmswitch import APIConnectionError, LLMSwitch, LLMSwitchError, TimeOutError, ToolLoopLimitError
 from llmswitch.core.redaction import redact_sensitive
 from llmswitch.core.retry import _is_retryable, _retry_call
 from llmswitch.providers.anthropic_provider import _content_to_anthropic_parts
@@ -43,10 +43,10 @@ def test_tool_loop_limit_error_is_a_library_error_exported_from_the_package():
     assert errors.ToolLoopLimitError is ToolLoopLimitError
 
 
-def test_the_langchain_module_re_exports_the_same_error():
+def test_the_chat_module_re_exports_the_same_error():
     pytest.importorskip("langchain_core")
-    from llmswitch.integrations.langchain import ToolLoopLimitError as from_integration
-    assert from_integration is ToolLoopLimitError
+    from llmswitch.agentic.chat import ToolLoopLimitError as from_chat_module
+    assert from_chat_module is ToolLoopLimitError
 
 
 def test_unsupported_anthropic_parts_are_dropped_with_a_warning(caplog):
@@ -55,3 +55,51 @@ def test_unsupported_anthropic_parts_are_dropped_with_a_warning(caplog):
                                              {"type": "file", "file": {"file_id": "f1"}}])
     assert parts == [{"type": "text", "text": "hi"}]
     assert any("dropping unsupported content part of type file" in r.getMessage() for r in caplog.records)
+
+
+def test_a_timeout_on_the_primary_fails_over_to_the_backup(monkeypatch):
+    import uuid
+
+    from llmswitch.core.registry import CHAT_PROVIDER_REGISTRY
+    from llmswitch.models import ChatCompletion, ChatCompletionMessage, Choice
+
+    class TimedOut:
+        def __init__(self, **kwargs):
+            pass
+
+        def create(self, messages, stream=False, **kwargs):
+            raise TimeOutError(5)
+
+    class Backup:
+        def __init__(self, **kwargs):
+            pass
+
+        def create(self, messages, stream=False, **kwargs):
+            return ChatCompletion(id="b", created=1, model="claude", choices=[
+                Choice(index=0, finish_reason="stop", message=ChatCompletionMessage(role="assistant", content="from backup"))])
+
+    monkeypatch.setitem(CHAT_PROVIDER_REGISTRY, "openai", TimedOut)
+    monkeypatch.setitem(CHAT_PROVIDER_REGISTRY, "anthropic", Backup)
+    client = LLMSwitch(provider="openai", api_key="k", model="gpt-4o", max_retries=0,
+                       user_id=f"timeout-failover-{uuid.uuid4().hex}",
+                       backup={"provider": "anthropic", "api_key": "k2", "model": "claude-opus-4-5"})
+    assert client.chat.completions.create(messages=[{"role": "user", "content": "x"}]).choices[0].message.content == "from backup"
+
+
+def test_a_timeout_on_the_primary_stream_fails_over_to_the_backup_stream():
+    from llmswitch.core.streaming import StreamHandle, SyncStreamSession
+
+    def primary():
+        raise TimeOutError(5)
+
+    def backup():
+        return StreamHandle(iter([{"choices": [{"delta": {"content": "backup"}}]}]))
+
+    session = SyncStreamSession(primary_factory=primary, backup_factory=backup, is_output_visible=lambda item: True)
+    assert [item["choices"][0]["delta"]["content"] for item in session] == ["backup"]
+
+
+def test_the_agentic_package_does_not_re_export_the_core_error():
+    import llmswitch.agentic as agentic
+    assert "ToolLoopLimitError" not in agentic.__all__
+    assert not hasattr(agentic, "ToolLoopLimitError")

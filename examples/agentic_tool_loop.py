@@ -1,24 +1,20 @@
 """
-A bounded tool loop with a LangChain chat model over llmswitch.
+A bounded tool loop with llmswitch's chat model.
 
-Requires the langchain extra:  pip install "llmswitch-sdk[langchain]"
+Requires the agentic extra:  pip install "llmswitch-sdk[agentic]"
 
-    OPENAI_API_KEY=sk-... python examples/langchain_tool_loop.py
+    OPENAI_API_KEY=sk-... python examples/agentic_tool_loop.py
 """
 import os
 
-from langchain_core.tools import tool
-
-from llmswitch.integrations.langchain import ChatLLMSwitch, run_tool_loop
+from llmswitch.agentic import ChatLLMSwitch, run_tool_loop
 
 
-@tool
 def get_weather(city: str) -> str:
     """Get the current weather for a city."""
     return f"It is sunny and 22 degrees in {city}."
 
 
-@tool
 def add(a: int, b: int) -> int:
     """Add two integers."""
     return a + b
@@ -35,7 +31,7 @@ def main() -> None:
             max_steps=4,
         )
         for message in history:
-            print(f"{type(message).__name__:>12}: {message.content}")
+            print(f"{message.type:>12}: {message.content}")
     finally:
         llm.close()
 

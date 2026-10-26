@@ -41,7 +41,7 @@ jobs:
         run: pytest --cov
 
   test-core-only:
-    # The core package must work without LangChain installed.
+    # The core package must work without the optional agentic extra installed.
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -52,9 +52,9 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Install package with the redis extra and dev tools, without LangChain
+      - name: Install package with the redis extra and dev tools, without the agentic extra
         run: python -m pip install -e ".[redis,dev]"
-      - name: Confirm LangChain is not installed
+      - name: Confirm the optional dependency is not installed
         run: python -c "import importlib.util, sys; sys.exit(importlib.util.find_spec('langchain_core') is not None)"
-      - name: Test without LangChain
+      - name: Test without the agentic extra
         run: python -m pytest -q -p no:cacheprovider

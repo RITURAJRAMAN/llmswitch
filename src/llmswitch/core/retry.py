@@ -40,6 +40,15 @@ def _is_retryable(exc: Exception) -> bool:
     return status is not None and status >= 500
 
 
+def _fails_over(exc: Exception) -> bool:
+    """Whether a primary failure should move the request to the backup provider.
+
+    Retryable errors and timeouts both do. A timed-out primary is treated as unavailable,
+    while retries stay limited to the errors that ``_is_retryable`` accepts.
+    """
+    return isinstance(exc, TimeOutError) or _is_retryable(exc)
+
+
 def _retry_delay(exc: Exception, attempt: int, base: float, cap: float) -> float:
     """Full-jitter exponential backoff, honouring retry_after when available."""
     if isinstance(exc, RateLimitExceededError):
