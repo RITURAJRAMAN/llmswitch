@@ -16,6 +16,10 @@ Every failure has a kind, so retry decisions do not depend on the wording of an 
 Timeouts stop the wait, not the work. Python cannot stop a thread that is already running, so a sync
 tool that times out keeps running in the background until it returns. An async tool written as a
 coroutine is cancelled at its next await.
+
+``on_start`` and ``on_result`` hooks let a caller record progress: ``on_start(index)`` fires right
+before a tool is actually invoked, and ``on_result(index, result)`` fires for every result. The agent
+uses them to checkpoint tool progress.
 """
 from __future__ import annotations
 
@@ -47,6 +51,8 @@ logger = logging.getLogger(__name__)
 
 ErrorKind = Literal["none", "parse", "not_found", "timeout", "tool_error"]
 Tool = BaseTool | Callable[..., Any]
+StartHook = Callable[[int], None]
+ResultHook = Callable[[int, "ToolExecutionResult"], None]
 
 _IDEMPOTENT_KEY = "llmswitch_idempotent"
 
@@ -157,8 +163,9 @@ def _call_with_timeout(tool: Tool, args: dict[str, Any], timeout_s: float) -> An
         pool.shutdown(wait=False, cancel_futures=True)
 
 
-def _execute_sync(call: Mapping[str, Any], tool_map: Mapping[str, Tool], timeout_s: float,
-                  handler: AgentEventHandler | None, step: int) -> ToolExecutionResult:
+def _run_sync_call(call: Mapping[str, Any], tool_map: Mapping[str, Tool], timeout_s: float,
+                   handler: AgentEventHandler | None, step: int,
+                   before: Callable[[], None] | None) -> ToolExecutionResult:
     call_id, name = _call_id(call), call.get("name") or ""
     ok, args, error = parse_arguments(call.get("args"))
     if not ok:
@@ -167,6 +174,8 @@ def _execute_sync(call: Mapping[str, Any], tool_map: Mapping[str, Tool], timeout
     if tool is None:
         return _failed(call_id, name, args, "not_found", f"Tool not found: {name}")
     notify(handler, "on_tool_start", step, name, args)
+    if before is not None:
+        before()
     started = time.monotonic()
     try:
         value = _call_with_timeout(tool, args, timeout_s)
@@ -185,6 +194,16 @@ def _execute_sync(call: Mapping[str, Any], tool_map: Mapping[str, Tool], timeout
     return ToolExecutionResult(call_id, name, args, True, _content(value), duration_s=duration)
 
 
+def _execute_sync(call: Mapping[str, Any], tool_map: Mapping[str, Tool], timeout_s: float,
+                  handler: AgentEventHandler | None, step: int,
+                  before: Callable[[], None] | None = None,
+                  after: Callable[[ToolExecutionResult], None] | None = None) -> ToolExecutionResult:
+    result = _run_sync_call(call, tool_map, timeout_s, handler, step, before)
+    if after is not None:
+        after(result)
+    return result
+
+
 def execute_tool_calls(
     *,
     step: int,
@@ -194,6 +213,8 @@ def execute_tool_calls(
     parallel: bool = True,
     max_concurrency: int = 4,
     handler: AgentEventHandler | None = None,
+    on_start: StartHook | None = None,
+    on_result: ResultHook | None = None,
 ) -> list[ToolExecutionResult]:
     """Run tool calls, in parallel up to ``max_concurrency`` when ``parallel`` is set.
 
@@ -201,12 +222,25 @@ def execute_tool_calls(
     """
     if not tool_calls:
         return []
+
+    def hooks(index: int) -> tuple[Callable[[], None] | None, Callable[[ToolExecutionResult], None] | None]:
+        before = (lambda: on_start(index)) if on_start is not None else None
+        after = (lambda result: on_result(index, result)) if on_result is not None else None
+        return before, after
+
     if not parallel or len(tool_calls) == 1:
-        return [_execute_sync(call, tool_map, timeout_s, handler, step) for call in tool_calls]
+        results = []
+        for index, call in enumerate(tool_calls):
+            before, after = hooks(index)
+            results.append(_execute_sync(call, tool_map, timeout_s, handler, step, before, after))
+        return results
     workers = max(1, min(max_concurrency, len(tool_calls)))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="llmswitch-agent") as pool:
-        futures = [pool.submit(copy_context().run, _execute_sync, call, tool_map, timeout_s, handler, step)
-                   for call in tool_calls]
+        futures = []
+        for index, call in enumerate(tool_calls):
+            before, after = hooks(index)
+            futures.append(pool.submit(copy_context().run, _execute_sync, call, tool_map, timeout_s, handler, step,
+                                       before, after))
         return [future.result() for future in futures]
 
 
@@ -220,8 +254,18 @@ async def _call_async(tool: Tool, args: dict[str, Any]) -> Any:
 
 
 async def _execute_async(call: Mapping[str, Any], tool_map: Mapping[str, Tool], timeout_s: float,
-                         handler: AgentEventHandler | None, step: int,
-                         semaphore: asyncio.Semaphore) -> ToolExecutionResult:
+                         handler: AgentEventHandler | None, step: int, semaphore: asyncio.Semaphore,
+                         before: Callable[[], None] | None = None,
+                         after: Callable[[ToolExecutionResult], None] | None = None) -> ToolExecutionResult:
+    result = await _run_async_call(call, tool_map, timeout_s, handler, step, semaphore, before)
+    if after is not None:
+        after(result)
+    return result
+
+
+async def _run_async_call(call: Mapping[str, Any], tool_map: Mapping[str, Tool], timeout_s: float,
+                          handler: AgentEventHandler | None, step: int, semaphore: asyncio.Semaphore,
+                          before: Callable[[], None] | None) -> ToolExecutionResult:
     call_id, name = _call_id(call), call.get("name") or ""
     ok, args, error = parse_arguments(call.get("args"))
     if not ok:
@@ -231,6 +275,8 @@ async def _execute_async(call: Mapping[str, Any], tool_map: Mapping[str, Tool], 
         return _failed(call_id, name, args, "not_found", f"Tool not found: {name}")
     async with semaphore:
         notify(handler, "on_tool_start", step, name, args)
+        if before is not None:
+            before()
         started = time.monotonic()
         try:
             value = await asyncio.wait_for(_call_async(tool, args), timeout_s)
@@ -258,14 +304,30 @@ async def aexecute_tool_calls(
     parallel: bool = True,
     max_concurrency: int = 4,
     handler: AgentEventHandler | None = None,
+    on_start: StartHook | None = None,
+    on_result: ResultHook | None = None,
 ) -> list[ToolExecutionResult]:
     """Async :func:`execute_tool_calls`, bounded by a semaphore. Results keep the input order."""
     if not tool_calls:
         return []
     semaphore = asyncio.Semaphore(max(1, max_concurrency) if parallel else 1)
-    return list(await asyncio.gather(*(
-        _execute_async(call, tool_map, timeout_s, handler, step, semaphore) for call in tool_calls
-    )))
+
+    def hooks(index: int) -> tuple[Callable[[], None] | None, Callable[[ToolExecutionResult], None] | None]:
+        before = (lambda: on_start(index)) if on_start is not None else None
+        after = (lambda result: on_result(index, result)) if on_result is not None else None
+        return before, after
+
+    if not parallel:
+        results = []
+        for index, call in enumerate(tool_calls):
+            before, after = hooks(index)
+            results.append(await _execute_async(call, tool_map, timeout_s, handler, step, semaphore, before, after))
+        return results
+    tasks = []
+    for index, call in enumerate(tool_calls):
+        before, after = hooks(index)
+        tasks.append(_execute_async(call, tool_map, timeout_s, handler, step, semaphore, before, after))
+    return list(await asyncio.gather(*tasks))
 
 
 def is_retryable(result: ToolExecutionResult, *, idempotent: bool, retry_on_tool_not_found: bool,
@@ -291,6 +353,13 @@ def _retry_indices(tool_calls: Sequence[Mapping[str, Any]], results: Sequence[To
     ]
 
 
+def _mapped(hook: Callable[..., None] | None, indices: list[int]) -> Callable[..., None] | None:
+    """Translate the positions of a retry round back to positions in the original call list."""
+    if hook is None:
+        return None
+    return lambda local, *args: hook(indices[local], *args)
+
+
 def retry_failed_tool_calls(
     *,
     step: int,
@@ -305,6 +374,8 @@ def retry_failed_tool_calls(
     parallel: bool = True,
     max_concurrency: int = 4,
     handler: AgentEventHandler | None = None,
+    on_start: StartHook | None = None,
+    on_result: ResultHook | None = None,
 ) -> list[ToolExecutionResult]:
     """Retry the retryable failures, up to ``attempts`` extra rounds, sleeping ``backoff_seconds`` between them."""
     current = list(results)
@@ -317,6 +388,7 @@ def retry_failed_tool_calls(
         fresh = execute_tool_calls(
             step=step, tool_calls=[tool_calls[i] for i in indices], tool_map=tool_map, timeout_s=timeout_s,
             parallel=parallel, max_concurrency=max_concurrency, handler=handler,
+            on_start=_mapped(on_start, indices), on_result=_mapped(on_result, indices),
         )
         for index, result in zip(indices, fresh, strict=True):
             result.attempts = current[index].attempts + 1
@@ -338,6 +410,8 @@ async def aretry_failed_tool_calls(
     parallel: bool = True,
     max_concurrency: int = 4,
     handler: AgentEventHandler | None = None,
+    on_start: StartHook | None = None,
+    on_result: ResultHook | None = None,
 ) -> list[ToolExecutionResult]:
     """Async :func:`retry_failed_tool_calls`."""
     current = list(results)
@@ -350,6 +424,7 @@ async def aretry_failed_tool_calls(
         fresh = await aexecute_tool_calls(
             step=step, tool_calls=[tool_calls[i] for i in indices], tool_map=tool_map, timeout_s=timeout_s,
             parallel=parallel, max_concurrency=max_concurrency, handler=handler,
+            on_start=_mapped(on_start, indices), on_result=_mapped(on_result, indices),
         )
         for index, result in zip(indices, fresh, strict=True):
             result.attempts = current[index].attempts + 1

@@ -10,22 +10,30 @@ The loop stops with a status in the result:
 - ``completed``: the answer passed reflection (or reflection is off).
 - ``completed_with_reflection_limit``: the answer was still rejected after ``reflection_max_retries``
   revisions, so the last answer is returned.
-- ``stopped`` with a ``reason``: ``max_iterations_reached``, ``max_runtime_exceeded`` or
-  ``max_input_tokens_per_step_exceeded``.
+- ``interrupted`` with a ``reason`` and a ``checkpoint_id``: ``tool_error`` (a tool failed and
+  ``interrupt_on_tool_error`` is set) or ``uncertain_tool_execution`` (a tool may have started before
+  the run was paused, and it is not safe to run it again). :meth:`Agent.resume` continues from there.
+- ``stopped`` with a ``reason``: ``max_iterations_reached``, ``max_runtime_exceeded``,
+  ``max_input_tokens_per_step_exceeded`` or ``tool_retry_exhausted``.
 
-Every model call is a step record, so the caller can see what happened on each turn.
+Every model call is a step record, so the caller can see what happened on each turn. The agent writes a
+checkpoint at each phase of a step (before reflection, before tools, after tools, after a rejected
+answer). A checkpoint records each tool's progress as it runs, so a resumed run never repeats a
+finished tool, and never repeats an unfinished non-idempotent tool.
 """
 from __future__ import annotations
 
 import json
+import threading
 import time
+import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import asdict, dataclass, field
+from typing import Any, Literal
 
 try:
     from langchain_core.language_models.chat_models import BaseChatModel
-    from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+    from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, messages_from_dict, messages_to_dict
 except ImportError as exc:  # pragma: no cover - exercised by tests that hide the optional dependency
     raise ImportError(
         "The agentic features need the agentic extra. Install it with: "
@@ -34,12 +42,14 @@ except ImportError as exc:  # pragma: no cover - exercised by tests that hide th
 
 from ..ratelimit.tokenizer import count_tokens
 from .chat import Tool, _as_messages, _tool_map
+from .checkpoints import SCHEMA_VERSION, CheckpointStore, InMemoryCheckpointStore
 from .events import AgentEventHandler, notify
 from .execution import (
     ToolExecutionResult,
     aexecute_tool_calls,
     aretry_failed_tool_calls,
     execute_tool_calls,
+    is_idempotent,
     retry_failed_tool_calls,
 )
 
@@ -57,6 +67,8 @@ REFLECTION_ATTEMPTS = 3
 # can cut the verdict off. The verdict is short, so the check gets at least this many output tokens.
 REFLECTION_MIN_OUTPUT_TOKENS = 2048
 
+_PHASES = ("awaiting_reflection", "awaiting_tools", "tools_done", "reflection_feedback")
+
 
 @dataclass(frozen=True)
 class AgentConfig:
@@ -66,6 +78,9 @@ class AgentConfig:
     wall-clock limit for one run. ``reflection_max_retries`` is how many revisions a rejected answer
     may get before the last answer is returned. ``max_input_tokens_per_step`` stops a run before a
     call whose input would exceed the limit, using the library's own token count (an estimate).
+    ``tool_timeout_seconds`` limits each tool call; ``tool_retry_attempts`` retries the failures that
+    are safe to retry. ``interrupt_on_tool_error`` pauses the run after a failed tool, and
+    ``escalate_on_retry_exhausted`` stops it when a failure remains after the retries.
     """
 
     max_iterations: int = 12
@@ -133,6 +148,47 @@ class _Budget:
         return self.max_input_tokens_per_step is not None and tokens > self.max_input_tokens_per_step
 
 
+@dataclass
+class _Pending:
+    """A step that has started but not finished: its kind, its record, and tool progress to continue from."""
+
+    kind: Literal["reflect", "tools"]
+    record: AgentStep
+    prior: list[ToolExecutionResult | None] | None = None
+    journal: _Journal | None = None
+
+
+class _Journal:
+    """Writes each tool's progress into its checkpoint, so a resumed run knows what already happened.
+
+    Entries are ``not_started``, ``started`` (the tool was about to run) or ``completed`` (with its result).
+    Calls can come from several threads, so writes are serialised.
+    """
+
+    def __init__(self, store: CheckpointStore, checkpoint_id: str, state: dict[str, Any], count: int) -> None:
+        self._store = store
+        self._checkpoint_id = checkpoint_id
+        self._state = state
+        self._lock = threading.Lock()
+        if not isinstance(state.get("progress"), list) or len(state["progress"]) != count:
+            state["progress"] = [{"status": "not_started"} for _ in range(count)]
+
+    @property
+    def checkpoint_id(self) -> str:
+        return self._checkpoint_id
+
+    def start(self, index: int) -> None:
+        self._write(index, {"status": "started"})
+
+    def result(self, index: int, result: ToolExecutionResult) -> None:
+        self._write(index, {"status": "completed", "result": asdict(result)})
+
+    def _write(self, index: int, entry: dict[str, Any]) -> None:
+        with self._lock:
+            self._state["progress"][index] = entry
+            self._store.save(self._checkpoint_id, self._state)
+
+
 def _text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -148,6 +204,8 @@ def _transcript(messages: Sequence[BaseMessage]) -> str:
     lead some models to call tools the check does not declare, so the verdict is requested
     without any tool history attached.
     """
+    from langchain_core.messages import ToolMessage
+
     lines: list[str] = []
     for message in messages:
         if isinstance(message, ToolMessage):
@@ -192,17 +250,38 @@ def estimate_input_tokens(messages: Sequence[BaseMessage], model_name: str | Non
     return total
 
 
+def _step_to_dict(step: AgentStep) -> dict[str, Any]:
+    return asdict(step)
+
+
+def _step_from_dict(data: dict[str, Any]) -> AgentStep:
+    return AgentStep(
+        step=int(data["step"]),
+        assistant_content=str(data.get("assistant_content", "")),
+        tool_calls=list(data.get("tool_calls") or []),
+        model_used=data.get("model_used"),
+        tool_results=[ToolExecutionResult(**item) for item in data.get("tool_results") or []],
+    )
+
+
+def _result_from_entry(entry: dict[str, Any]) -> ToolExecutionResult:
+    return ToolExecutionResult(**entry["result"])
+
+
 class Agent:
     """A think-act-observe agent over a chat model.
 
     ``model`` is a :class:`~llmswitch.agentic.ChatLLMSwitch` (or any chat model that supports
-    ``bind_tools``). ``tools`` are tool objects or plain functions.
+    ``bind_tools``). ``tools`` are tool objects or plain functions. ``checkpoint_store`` decides where
+    checkpoints go; the default keeps them in memory, and :class:`~llmswitch.agentic.FileCheckpointStore`
+    keeps them on disk so a run can resume after a restart.
 
     Usage::
 
         agent = Agent(model=llm, tools=[get_weather], config=AgentConfig(max_iterations=6))
         result = agent.invoke("Weather in Paris, then a short summary.")
-        print(result["status"], result["output"])
+        if result["status"] == "interrupted":
+            result = agent.resume(result["checkpoint_id"])
     """
 
     def __init__(
@@ -211,102 +290,228 @@ class Agent:
         tools: Sequence[Tool] | None = None,
         config: AgentConfig | None = None,
         event_handler: AgentEventHandler | None = None,
+        checkpoint_store: CheckpointStore | None = None,
     ) -> None:
         self.model = model
         self.tools = list(tools or [])
         self.config = config or AgentConfig()
         self.event_handler = event_handler
+        self.checkpoint_store: CheckpointStore = checkpoint_store or InMemoryCheckpointStore()
         self._tool_map = _tool_map(self.tools) if self.tools else {}
 
     # --- public API -------------------------------------------------------------------------
 
     def invoke(self, input: str | list[BaseMessage], *, max_runtime_seconds: float | None = None) -> dict[str, Any]:
         """Run the loop synchronously and return the result dictionary."""
-        budget = self._budget(max_runtime_seconds)
-        bound = self._bound_model()
-        messages = _as_messages(input)
-        steps: list[AgentStep] = []
-        reflection_retries = 0
-        for step_number in range(1, budget.max_iterations + 1):
-            if budget.runtime_exceeded():
-                return self._stopped("max_runtime_exceeded", messages, steps)
-            tokens = estimate_input_tokens(messages, self._model_name())
-            if budget.input_exceeded(tokens):
-                return self._stopped("max_input_tokens_per_step_exceeded", messages, steps,
-                                     input_tokens=tokens, limit=budget.max_input_tokens_per_step)
-            notify(self.event_handler, "on_step_start", step_number, {"messages": len(messages)})
-            answer = bound.invoke(messages)
-            record = self._record(step_number, answer)
-            messages.append(answer)
-            if budget.runtime_exceeded():
-                return self._stopped("max_runtime_exceeded", messages, [*steps, record])
-            if not answer.tool_calls:
-                if not self.config.reflection_enabled:
-                    return self._completed("completed", answer, messages, [*steps, record])
-                ok, feedback = self._reflect(messages)
-                if budget.runtime_exceeded():
-                    return self._stopped("max_runtime_exceeded", messages, [*steps, record])
-                if ok:
-                    return self._completed("completed", answer, messages, [*steps, record])
-                if reflection_retries >= self.config.reflection_max_retries:
-                    return self._completed("completed_with_reflection_limit", answer, messages, [*steps, record])
-                reflection_retries += 1
-                messages.append(HumanMessage(content=f"Please revise your answer. Feedback: {feedback}"))
-                steps.append(record)
-                notify(self.event_handler, "on_step_end", step_number, {"finished": False})
-                continue
-            record.tool_results = self._run_tools(step_number, answer)
-            messages.extend(result.as_tool_message() for result in record.tool_results)
-            steps.append(record)
-            outcome = self._after_tools(record.tool_results, messages, steps)
-            if outcome is not None:
-                return outcome
-            notify(self.event_handler, "on_step_end", step_number, {"finished": False})
-        return self._stopped("max_iterations_reached", messages, steps)
+        return self._drive(
+            messages=_as_messages(input), steps=[], step=1, budget=self._budget(max_runtime_seconds),
+            reflection_retries=0, had_tool_error=False, pending=None,
+        )
 
     async def ainvoke(self, input: str | list[BaseMessage], *, max_runtime_seconds: float | None = None) -> dict[str, Any]:
         """Run the loop asynchronously and return the result dictionary."""
-        budget = self._budget(max_runtime_seconds)
+        return await self._adrive(
+            messages=_as_messages(input), steps=[], step=1, budget=self._budget(max_runtime_seconds),
+            reflection_retries=0, had_tool_error=False, pending=None,
+        )
+
+    def resume(self, checkpoint_id: str, user_feedback: str | None = None) -> dict[str, Any]:
+        """Continue an interrupted run from its checkpoint.
+
+        ``user_feedback`` is added to the conversation. If the checkpoint is at a model answer or at tools
+        that have not started, the feedback replaces that answer, and the step is redone. A checkpoint
+        whose tools have started cannot take feedback, because that work may already have happened.
+        """
+        plan = self._restore(checkpoint_id, user_feedback)
+        if "status" in plan:  # already a final result, such as an uncertain tool execution
+            return plan
+        return self._drive(**plan)
+
+    async def aresume(self, checkpoint_id: str, user_feedback: str | None = None) -> dict[str, Any]:
+        """Async :meth:`resume`."""
+        plan = self._restore(checkpoint_id, user_feedback)
+        if "status" in plan:
+            return plan
+        return await self._adrive(**plan)
+
+    # --- the loop ---------------------------------------------------------------------------
+
+    def _drive(self, *, messages: list[BaseMessage], steps: list[AgentStep], step: int, budget: _Budget,
+               reflection_retries: int, had_tool_error: bool, pending: _Pending | None) -> dict[str, Any]:
         bound = self._bound_model()
-        messages = _as_messages(input)
-        steps: list[AgentStep] = []
-        reflection_retries = 0
-        for step_number in range(1, budget.max_iterations + 1):
-            if budget.runtime_exceeded():
-                return self._stopped("max_runtime_exceeded", messages, steps)
-            tokens = estimate_input_tokens(messages, self._model_name())
-            if budget.input_exceeded(tokens):
-                return self._stopped("max_input_tokens_per_step_exceeded", messages, steps,
-                                     input_tokens=tokens, limit=budget.max_input_tokens_per_step)
-            notify(self.event_handler, "on_step_start", step_number, {"messages": len(messages)})
-            answer = await bound.ainvoke(messages)
-            record = self._record(step_number, answer)
-            messages.append(answer)
-            if budget.runtime_exceeded():
-                return self._stopped("max_runtime_exceeded", messages, [*steps, record])
-            if not answer.tool_calls:
-                if not self.config.reflection_enabled:
-                    return self._completed("completed", answer, messages, [*steps, record])
-                ok, feedback = await self._areflect(messages)
+        while step <= budget.max_iterations:
+            if pending is None:
+                if budget.runtime_exceeded():
+                    return self._stopped("max_runtime_exceeded", messages, steps)
+                tokens = estimate_input_tokens(messages, self._model_name())
+                if budget.input_exceeded(tokens):
+                    return self._stopped("max_input_tokens_per_step_exceeded", messages, steps,
+                                         input_tokens=tokens, limit=budget.max_input_tokens_per_step)
+                notify(self.event_handler, "on_step_start", step, {"messages": len(messages)})
+                answer = bound.invoke(messages)
+                record = self._record(step, answer)
+                messages.append(answer)
                 if budget.runtime_exceeded():
                     return self._stopped("max_runtime_exceeded", messages, [*steps, record])
+                pending = _Pending("tools" if answer.tool_calls else "reflect", record)
+            if pending.kind == "reflect":
+                if not self.config.reflection_enabled:
+                    return self._completed("completed", messages, [*steps, pending.record], step)
+                self._save(self._state("awaiting_reflection", messages, steps, step, budget,
+                                       reflection_retries, had_tool_error, pending=pending.record))
+                ok, feedback = self._reflect(messages)
+                if budget.runtime_exceeded():
+                    return self._stopped("max_runtime_exceeded", messages, [*steps, pending.record])
                 if ok:
-                    return self._completed("completed", answer, messages, [*steps, record])
+                    return self._completed("completed", messages, [*steps, pending.record], step)
                 if reflection_retries >= self.config.reflection_max_retries:
-                    return self._completed("completed_with_reflection_limit", answer, messages, [*steps, record])
+                    return self._completed("completed_with_reflection_limit", messages,
+                                           [*steps, pending.record], step)
                 reflection_retries += 1
                 messages.append(HumanMessage(content=f"Please revise your answer. Feedback: {feedback}"))
-                steps.append(record)
-                notify(self.event_handler, "on_step_end", step_number, {"finished": False})
+                steps.append(pending.record)
+                self._save(self._state("reflection_feedback", messages, steps, step, budget,
+                                       reflection_retries, had_tool_error))
+                notify(self.event_handler, "on_step_end", step, {"finished": False})
+                step, pending = step + 1, None
                 continue
-            record.tool_results = await self._arun_tools(step_number, answer)
+            # tools: either a new step, or a step resumed from a checkpoint
+            record = pending.record
+            if pending.journal is None:
+                state = self._state("awaiting_tools", messages, steps, step, budget, reflection_retries,
+                                    had_tool_error, pending=record)
+                checkpoint_id = str(uuid.uuid4())
+                pending.journal = _Journal(self.checkpoint_store, checkpoint_id, state, len(record.tool_calls))
+                self.checkpoint_store.save(checkpoint_id, state)
+            record.tool_results = self._run_tools(step, record, pending.journal, pending.prior)
             messages.extend(result.as_tool_message() for result in record.tool_results)
             steps.append(record)
-            outcome = self._after_tools(record.tool_results, messages, steps)
+            had_tool_error = any(not result.ok for result in record.tool_results)
+            done = self._save(self._state("tools_done", messages, steps, step, budget, reflection_retries,
+                                          had_tool_error))
+            outcome = self._after_tools(record.tool_results, messages, steps, done)
             if outcome is not None:
                 return outcome
-            notify(self.event_handler, "on_step_end", step_number, {"finished": False})
+            notify(self.event_handler, "on_step_end", step, {"finished": False})
+            step, pending = step + 1, None
         return self._stopped("max_iterations_reached", messages, steps)
+
+    async def _adrive(self, *, messages: list[BaseMessage], steps: list[AgentStep], step: int, budget: _Budget,
+                      reflection_retries: int, had_tool_error: bool, pending: _Pending | None) -> dict[str, Any]:
+        bound = self._bound_model()
+        while step <= budget.max_iterations:
+            if pending is None:
+                if budget.runtime_exceeded():
+                    return self._stopped("max_runtime_exceeded", messages, steps)
+                tokens = estimate_input_tokens(messages, self._model_name())
+                if budget.input_exceeded(tokens):
+                    return self._stopped("max_input_tokens_per_step_exceeded", messages, steps,
+                                         input_tokens=tokens, limit=budget.max_input_tokens_per_step)
+                notify(self.event_handler, "on_step_start", step, {"messages": len(messages)})
+                answer = await bound.ainvoke(messages)
+                record = self._record(step, answer)
+                messages.append(answer)
+                if budget.runtime_exceeded():
+                    return self._stopped("max_runtime_exceeded", messages, [*steps, record])
+                pending = _Pending("tools" if answer.tool_calls else "reflect", record)
+            if pending.kind == "reflect":
+                if not self.config.reflection_enabled:
+                    return self._completed("completed", messages, [*steps, pending.record], step)
+                self._save(self._state("awaiting_reflection", messages, steps, step, budget,
+                                       reflection_retries, had_tool_error, pending=pending.record))
+                ok, feedback = await self._areflect(messages)
+                if budget.runtime_exceeded():
+                    return self._stopped("max_runtime_exceeded", messages, [*steps, pending.record])
+                if ok:
+                    return self._completed("completed", messages, [*steps, pending.record], step)
+                if reflection_retries >= self.config.reflection_max_retries:
+                    return self._completed("completed_with_reflection_limit", messages,
+                                           [*steps, pending.record], step)
+                reflection_retries += 1
+                messages.append(HumanMessage(content=f"Please revise your answer. Feedback: {feedback}"))
+                steps.append(pending.record)
+                self._save(self._state("reflection_feedback", messages, steps, step, budget,
+                                       reflection_retries, had_tool_error))
+                notify(self.event_handler, "on_step_end", step, {"finished": False})
+                step, pending = step + 1, None
+                continue
+            record = pending.record
+            if pending.journal is None:
+                state = self._state("awaiting_tools", messages, steps, step, budget, reflection_retries,
+                                    had_tool_error, pending=record)
+                checkpoint_id = str(uuid.uuid4())
+                pending.journal = _Journal(self.checkpoint_store, checkpoint_id, state, len(record.tool_calls))
+                self.checkpoint_store.save(checkpoint_id, state)
+            record.tool_results = await self._arun_tools(step, record, pending.journal, pending.prior)
+            messages.extend(result.as_tool_message() for result in record.tool_results)
+            steps.append(record)
+            had_tool_error = any(not result.ok for result in record.tool_results)
+            done = self._save(self._state("tools_done", messages, steps, step, budget, reflection_retries,
+                                          had_tool_error))
+            outcome = self._after_tools(record.tool_results, messages, steps, done)
+            if outcome is not None:
+                return outcome
+            notify(self.event_handler, "on_step_end", step, {"finished": False})
+            step, pending = step + 1, None
+        return self._stopped("max_iterations_reached", messages, steps)
+
+    # --- resuming -----------------------------------------------------------------------------
+
+    def _restore(self, checkpoint_id: str, user_feedback: str | None) -> dict[str, Any]:
+        """Rebuild the run from a checkpoint. Returns the arguments for ``_drive``, or a final result."""
+        state = self.checkpoint_store.load(checkpoint_id)
+        if state is None:
+            raise ValueError(f"Checkpoint not found: {checkpoint_id}")
+        if state.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError("Unsupported checkpoint schema version.")
+        phase = state.get("phase")
+        if phase not in _PHASES:
+            raise ValueError(f"Unknown checkpoint phase: {phase}")
+        messages = list(messages_from_dict(state["messages"]))
+        steps = [_step_from_dict(item) for item in state.get("steps") or []]
+        budget = self._budget(float(state["remaining_runtime_seconds"]))
+        reflection_retries = int(state.get("reflection_retries", 0))
+        had_tool_error = bool(state.get("had_tool_error", False))
+        step = int(state["step"])
+        pending: _Pending | None = None
+
+        if phase == "awaiting_reflection":
+            record = _step_from_dict(state["pending"])
+            if user_feedback:
+                self._replace_last_answer(messages, user_feedback)
+            else:
+                pending = _Pending("reflect", record)
+        elif phase == "awaiting_tools":
+            record = _step_from_dict(state["pending"])
+            progress = state["progress"]
+            if user_feedback:
+                if any(entry.get("status") != "not_started" for entry in progress):
+                    raise ValueError("Cannot change pending tool work after execution may have started.")
+                self._replace_last_answer(messages, user_feedback)
+            else:
+                prior: list[ToolExecutionResult | None] = [None] * len(record.tool_calls)
+                for index, entry in enumerate(progress):
+                    status = entry.get("status")
+                    if status == "completed":
+                        prior[index] = _result_from_entry(entry)
+                    elif status == "started" and not is_idempotent(self._tool_map.get(
+                            record.tool_calls[index].get("name") or "")):
+                        return self._interrupted("uncertain_tool_execution", messages, steps, checkpoint_id)
+                journal = _Journal(self.checkpoint_store, checkpoint_id, state, len(record.tool_calls))
+                pending = _Pending("tools", record, prior=prior, journal=journal)
+        else:
+            step += 1
+            if user_feedback:
+                messages.append(HumanMessage(content=user_feedback))
+        return {"messages": messages, "steps": steps, "step": step, "budget": budget,
+                "reflection_retries": reflection_retries, "had_tool_error": had_tool_error, "pending": pending}
+
+    @staticmethod
+    def _replace_last_answer(messages: list[BaseMessage], feedback: str) -> None:
+        if not messages or not isinstance(messages[-1], AIMessage):
+            raise ValueError("The checkpoint has no pending assistant answer to replace.")
+        messages.pop()
+        messages.append(HumanMessage(content=feedback))
 
     # --- helpers ----------------------------------------------------------------------------
 
@@ -335,6 +540,28 @@ class Agent:
             model_used=self._model_name(),
         )
 
+    def _state(self, phase: str, messages: list[BaseMessage], steps: list[AgentStep], step: int,
+               budget: _Budget, reflection_retries: int, had_tool_error: bool,
+               pending: AgentStep | None = None) -> dict[str, Any]:
+        """A checkpoint in JSON-compatible form."""
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "phase": phase,
+            "step": step,
+            "messages": messages_to_dict(messages),
+            "steps": [_step_to_dict(item) for item in steps],
+            "pending": _step_to_dict(pending) if pending is not None else None,
+            "progress": None,
+            "remaining_runtime_seconds": budget.remaining_seconds(),
+            "reflection_retries": reflection_retries,
+            "had_tool_error": had_tool_error,
+        }
+
+    def _save(self, state: dict[str, Any]) -> str:
+        checkpoint_id = str(uuid.uuid4())
+        self.checkpoint_store.save(checkpoint_id, state)
+        return checkpoint_id
+
     def _reflection_model(self) -> Any:
         limit = getattr(self.model, "max_tokens", None)
         if limit is not None and limit < REFLECTION_MIN_OUTPUT_TOKENS:
@@ -357,46 +584,68 @@ class Agent:
                 return verdict
         raise ValueError(f"The reflection check did not return a verdict in {REFLECTION_ATTEMPTS} attempts.")
 
-    def _run_tools(self, step_number: int, answer: AIMessage) -> list[ToolExecutionResult]:
-        """Run the requested tools, then retry the retryable failures."""
+    def _run_tools(self, step_number: int, record: AgentStep, journal: _Journal,
+                   prior: list[ToolExecutionResult | None] | None) -> list[ToolExecutionResult]:
+        """Run the tools that have not finished yet, then retry the retryable failures among them."""
         cfg = self.config
-        calls = list(answer.tool_calls)
-        results = execute_tool_calls(
-            step=step_number, tool_calls=calls, tool_map=self._tool_map, timeout_s=cfg.tool_timeout_seconds,
-            parallel=cfg.parallel_tools, max_concurrency=cfg.max_concurrency, handler=self.event_handler,
-        )
-        if cfg.tool_retry_attempts and any(not result.ok for result in results):
-            results = retry_failed_tool_calls(
-                step=step_number, tool_calls=calls, results=results, tool_map=self._tool_map,
-                timeout_s=cfg.tool_timeout_seconds, attempts=cfg.tool_retry_attempts,
-                backoff_seconds=cfg.tool_retry_backoff_seconds,
-                retry_on_tool_not_found=cfg.retry_on_tool_not_found,
-                retry_non_idempotent=cfg.retry_non_idempotent_tools,
+        calls = list(record.tool_calls)
+        indices = [i for i in range(len(calls)) if prior is None or prior[i] is None]
+        results: list[ToolExecutionResult | None] = list(prior) if prior is not None else [None] * len(calls)
+        if indices:
+            subset = [calls[i] for i in indices]
+            fresh = execute_tool_calls(
+                step=step_number, tool_calls=subset, tool_map=self._tool_map, timeout_s=cfg.tool_timeout_seconds,
                 parallel=cfg.parallel_tools, max_concurrency=cfg.max_concurrency, handler=self.event_handler,
+                on_start=lambda local: journal.start(indices[local]),
+                on_result=lambda local, result: journal.result(indices[local], result),
             )
-        return results
+            if cfg.tool_retry_attempts and any(not result.ok for result in fresh):
+                fresh = retry_failed_tool_calls(
+                    step=step_number, tool_calls=subset, results=fresh, tool_map=self._tool_map,
+                    timeout_s=cfg.tool_timeout_seconds, attempts=cfg.tool_retry_attempts,
+                    backoff_seconds=cfg.tool_retry_backoff_seconds,
+                    retry_on_tool_not_found=cfg.retry_on_tool_not_found,
+                    retry_non_idempotent=cfg.retry_non_idempotent_tools,
+                    parallel=cfg.parallel_tools, max_concurrency=cfg.max_concurrency, handler=self.event_handler,
+                    on_start=lambda local: journal.start(indices[local]),
+                    on_result=lambda local, result: journal.result(indices[local], result),
+                )
+            for index, result in zip(indices, fresh, strict=True):
+                results[index] = result
+        return [result for result in results if result is not None]
 
-    async def _arun_tools(self, step_number: int, answer: AIMessage) -> list[ToolExecutionResult]:
+    async def _arun_tools(self, step_number: int, record: AgentStep, journal: _Journal,
+                          prior: list[ToolExecutionResult | None] | None) -> list[ToolExecutionResult]:
         """Async :meth:`_run_tools`."""
         cfg = self.config
-        calls = list(answer.tool_calls)
-        results = await aexecute_tool_calls(
-            step=step_number, tool_calls=calls, tool_map=self._tool_map, timeout_s=cfg.tool_timeout_seconds,
-            parallel=cfg.parallel_tools, max_concurrency=cfg.max_concurrency, handler=self.event_handler,
-        )
-        if cfg.tool_retry_attempts and any(not result.ok for result in results):
-            results = await aretry_failed_tool_calls(
-                step=step_number, tool_calls=calls, results=results, tool_map=self._tool_map,
-                timeout_s=cfg.tool_timeout_seconds, attempts=cfg.tool_retry_attempts,
-                backoff_seconds=cfg.tool_retry_backoff_seconds,
-                retry_on_tool_not_found=cfg.retry_on_tool_not_found,
-                retry_non_idempotent=cfg.retry_non_idempotent_tools,
+        calls = list(record.tool_calls)
+        indices = [i for i in range(len(calls)) if prior is None or prior[i] is None]
+        results: list[ToolExecutionResult | None] = list(prior) if prior is not None else [None] * len(calls)
+        if indices:
+            subset = [calls[i] for i in indices]
+            fresh = await aexecute_tool_calls(
+                step=step_number, tool_calls=subset, tool_map=self._tool_map, timeout_s=cfg.tool_timeout_seconds,
                 parallel=cfg.parallel_tools, max_concurrency=cfg.max_concurrency, handler=self.event_handler,
+                on_start=lambda local: journal.start(indices[local]),
+                on_result=lambda local, result: journal.result(indices[local], result),
             )
-        return results
+            if cfg.tool_retry_attempts and any(not result.ok for result in fresh):
+                fresh = await aretry_failed_tool_calls(
+                    step=step_number, tool_calls=subset, results=fresh, tool_map=self._tool_map,
+                    timeout_s=cfg.tool_timeout_seconds, attempts=cfg.tool_retry_attempts,
+                    backoff_seconds=cfg.tool_retry_backoff_seconds,
+                    retry_on_tool_not_found=cfg.retry_on_tool_not_found,
+                    retry_non_idempotent=cfg.retry_non_idempotent_tools,
+                    parallel=cfg.parallel_tools, max_concurrency=cfg.max_concurrency, handler=self.event_handler,
+                    on_start=lambda local: journal.start(indices[local]),
+                    on_result=lambda local, result: journal.result(indices[local], result),
+                )
+            for index, result in zip(indices, fresh, strict=True):
+                results[index] = result
+        return [result for result in results if result is not None]
 
     def _after_tools(self, results: list[ToolExecutionResult], messages: list[BaseMessage],
-                     steps: list[AgentStep]) -> dict[str, Any] | None:
+                     steps: list[AgentStep], checkpoint_id: str) -> dict[str, Any] | None:
         """Decide whether a step with failed tools ends the run. Returns the result, or ``None`` to go on."""
         failed = [result for result in results if not result.ok]
         if not failed:
@@ -408,12 +657,17 @@ class Agent:
                 "messages": messages, "steps": steps,
             }
         if self.config.interrupt_on_tool_error:
-            return {"status": "interrupted", "reason": "tool_error", "messages": messages, "steps": steps}
+            return self._interrupted("tool_error", messages, steps, checkpoint_id)
         return None
 
-    def _completed(self, status: str, answer: AIMessage, messages: list[BaseMessage],
-                   steps: list[AgentStep]) -> dict[str, Any]:
-        notify(self.event_handler, "on_step_end", steps[-1].step, {"finished": True})
+    def _interrupted(self, reason: str, messages: list[BaseMessage], steps: list[AgentStep],
+                     checkpoint_id: str) -> dict[str, Any]:
+        return {"status": "interrupted", "reason": reason, "checkpoint_id": checkpoint_id,
+                "messages": messages, "steps": steps}
+
+    def _completed(self, status: str, messages: list[BaseMessage], steps: list[AgentStep], step: int) -> dict[str, Any]:
+        notify(self.event_handler, "on_step_end", step, {"finished": True})
+        answer = messages[-1]
         return {"status": status, "output": answer.content, "messages": messages, "steps": steps}
 
     @staticmethod

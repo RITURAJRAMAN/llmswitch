@@ -27,6 +27,9 @@ _EXPORTS = {
     "AgentEvent": ".events",
     "CollectingEventHandler": ".events",
     "LoggingEventHandler": ".events",
+    "CheckpointStore": ".checkpoints",
+    "FileCheckpointStore": ".checkpoints",
+    "InMemoryCheckpointStore": ".checkpoints",
 }
 
 __all__ = sorted(_EXPORTS)
