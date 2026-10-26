@@ -5,8 +5,14 @@ import time
 
 import pytest
 
-from llmswitch.agentic import AgentConfig
-from llmswitch.agentic.execution import aexecute_tool_calls, execute_tool_calls, process_isolation_available
+pytest.importorskip("langchain_core")
+
+from llmswitch.agentic import AgentConfig  # noqa: E402
+from llmswitch.agentic.execution import (  # noqa: E402
+    aexecute_tool_calls,
+    execute_tool_calls,
+    process_isolation_available,
+)
 
 pytestmark = pytest.mark.skipif(not process_isolation_available(), reason="needs a platform with fork")
 
