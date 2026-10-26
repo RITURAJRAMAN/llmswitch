@@ -18,6 +18,9 @@ _EXPORTS = {
     "ChatLLMSwitch": ".chat",
     "run_tool_loop": ".chat",
     "arun_tool_loop": ".chat",
+    "Agent": ".agent",
+    "AgentConfig": ".agent",
+    "AgentStep": ".agent",
 }
 
 __all__ = sorted(_EXPORTS)
