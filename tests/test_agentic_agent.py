@@ -260,10 +260,9 @@ def test_the_reflection_check_gets_enough_output_tokens_when_the_model_limit_is_
     from llmswitch.agentic.agent import REFLECTION_MIN_OUTPUT_TOKENS
 
     small = ChatLLMSwitch(provider="openai", api_key="k", model="gpt-4o", max_tokens=100, user_id=f"tok-{uuid.uuid4().hex}")
-    runner = Agent(small)
-    bound = runner._reflection_model()
+    bound = Agent._reflection_model(small)
     assert bound.kwargs == {"max_tokens": REFLECTION_MIN_OUTPUT_TOKENS}
     large = ChatLLMSwitch(provider="openai", api_key="k", model="gpt-4o", max_tokens=8000, user_id=f"tok2-{uuid.uuid4().hex}")
-    assert Agent(large)._reflection_model() is large
+    assert Agent._reflection_model(large) is large
     unlimited = ChatLLMSwitch(provider="openai", api_key="k", model="gpt-4o", user_id=f"tok3-{uuid.uuid4().hex}")
-    assert Agent(unlimited)._reflection_model() is unlimited
+    assert Agent._reflection_model(unlimited) is unlimited

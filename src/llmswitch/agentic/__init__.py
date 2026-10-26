@@ -30,6 +30,19 @@ _EXPORTS = {
     "CheckpointStore": ".checkpoints",
     "FileCheckpointStore": ".checkpoints",
     "InMemoryCheckpointStore": ".checkpoints",
+    "BaseRoutingPolicy": ".routing",
+    "RoundRobinRoutingPolicy": ".routing",
+    "EscalationRoutingPolicy": ".routing",
+    "CostAwareRoutingPolicy": ".routing",
+    "RoutingDecision": ".routing",
+    "SharedState": ".contracts",
+    "SpecialistContract": ".contracts",
+    "filter_specialists_by_capabilities": ".contracts",
+    "attach_contract_weights": ".contracts",
+    "invoke_specialists": ".specialists",
+    "ainvoke_specialists": ".specialists",
+    "make_subagent_tool": ".specialists",
+    "make_specialist_tools": ".specialists",
 }
 
 __all__ = sorted(_EXPORTS)

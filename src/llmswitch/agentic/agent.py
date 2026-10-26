@@ -27,7 +27,7 @@ import json
 import threading
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
@@ -52,6 +52,7 @@ from .execution import (
     is_idempotent,
     retry_failed_tool_calls,
 )
+from .routing import BaseRoutingPolicy
 
 REFLECTION_PROMPT = (
     "Evaluate if the assistant answer is complete and correct for the user request. "
@@ -156,6 +157,7 @@ class _Pending:
     record: AgentStep
     prior: list[ToolExecutionResult | None] | None = None
     journal: _Journal | None = None
+    llm: Any = None  # the model chosen for this step; None when the step is resumed and must be routed again
 
 
 class _Journal:
@@ -291,8 +293,14 @@ class Agent:
         config: AgentConfig | None = None,
         event_handler: AgentEventHandler | None = None,
         checkpoint_store: CheckpointStore | None = None,
+        fallback_model: BaseChatModel | None = None,
+        routing_policy: BaseRoutingPolicy | None = None,
+        router: Callable[[list[BaseMessage], int], BaseChatModel] | None = None,
     ) -> None:
         self.model = model
+        self.fallback_model = fallback_model
+        self.routing_policy = routing_policy
+        self.router = router
         self.tools = list(tools or [])
         self.config = config or AgentConfig()
         self.event_handler = event_handler
@@ -305,14 +313,14 @@ class Agent:
         """Run the loop synchronously and return the result dictionary."""
         return self._drive(
             messages=_as_messages(input), steps=[], step=1, budget=self._budget(max_runtime_seconds),
-            reflection_retries=0, had_tool_error=False, pending=None,
+            reflection_retries=0, had_tool_error=False, pending=None, routing={},
         )
 
     async def ainvoke(self, input: str | list[BaseMessage], *, max_runtime_seconds: float | None = None) -> dict[str, Any]:
         """Run the loop asynchronously and return the result dictionary."""
         return await self._adrive(
             messages=_as_messages(input), steps=[], step=1, budget=self._budget(max_runtime_seconds),
-            reflection_retries=0, had_tool_error=False, pending=None,
+            reflection_retries=0, had_tool_error=False, pending=None, routing={},
         )
 
     def resume(self, checkpoint_id: str, user_feedback: str | None = None) -> dict[str, Any]:
@@ -337,29 +345,31 @@ class Agent:
     # --- the loop ---------------------------------------------------------------------------
 
     def _drive(self, *, messages: list[BaseMessage], steps: list[AgentStep], step: int, budget: _Budget,
-               reflection_retries: int, had_tool_error: bool, pending: _Pending | None) -> dict[str, Any]:
-        bound = self._bound_model()
+               reflection_retries: int, had_tool_error: bool, pending: _Pending | None,
+               routing: dict[str, Any]) -> dict[str, Any]:
         while step <= budget.max_iterations:
             if pending is None:
                 if budget.runtime_exceeded():
                     return self._stopped("max_runtime_exceeded", messages, steps)
-                tokens = estimate_input_tokens(messages, self._model_name())
+                llm = self._choose(messages, step, had_tool_error, routing)
+                tokens = estimate_input_tokens(messages, self._model_name(llm))
                 if budget.input_exceeded(tokens):
                     return self._stopped("max_input_tokens_per_step_exceeded", messages, steps,
                                          input_tokens=tokens, limit=budget.max_input_tokens_per_step)
                 notify(self.event_handler, "on_step_start", step, {"messages": len(messages)})
-                answer = bound.invoke(messages)
-                record = self._record(step, answer)
+                answer = self._bound_model(llm).invoke(messages)
+                record = self._record(step, answer, llm)
                 messages.append(answer)
                 if budget.runtime_exceeded():
                     return self._stopped("max_runtime_exceeded", messages, [*steps, record])
-                pending = _Pending("tools" if answer.tool_calls else "reflect", record)
+                pending = _Pending("tools" if answer.tool_calls else "reflect", record, llm=llm)
             if pending.kind == "reflect":
+                llm = pending.llm or self._choose(messages, step, had_tool_error, routing)
                 if not self.config.reflection_enabled:
                     return self._completed("completed", messages, [*steps, pending.record], step)
-                self._save(self._state("awaiting_reflection", messages, steps, step, budget,
+                self._save(self._state_for(routing, "awaiting_reflection", messages, steps, step, budget,
                                        reflection_retries, had_tool_error, pending=pending.record))
-                ok, feedback = self._reflect(messages)
+                ok, feedback = self._reflect(llm, messages)
                 if budget.runtime_exceeded():
                     return self._stopped("max_runtime_exceeded", messages, [*steps, pending.record])
                 if ok:
@@ -370,7 +380,7 @@ class Agent:
                 reflection_retries += 1
                 messages.append(HumanMessage(content=f"Please revise your answer. Feedback: {feedback}"))
                 steps.append(pending.record)
-                self._save(self._state("reflection_feedback", messages, steps, step, budget,
+                self._save(self._state_for(routing, "reflection_feedback", messages, steps, step, budget,
                                        reflection_retries, had_tool_error))
                 notify(self.event_handler, "on_step_end", step, {"finished": False})
                 step, pending = step + 1, None
@@ -378,7 +388,7 @@ class Agent:
             # tools: either a new step, or a step resumed from a checkpoint
             record = pending.record
             if pending.journal is None:
-                state = self._state("awaiting_tools", messages, steps, step, budget, reflection_retries,
+                state = self._state_for(routing, "awaiting_tools", messages, steps, step, budget, reflection_retries,
                                     had_tool_error, pending=record)
                 checkpoint_id = str(uuid.uuid4())
                 pending.journal = _Journal(self.checkpoint_store, checkpoint_id, state, len(record.tool_calls))
@@ -387,7 +397,7 @@ class Agent:
             messages.extend(result.as_tool_message() for result in record.tool_results)
             steps.append(record)
             had_tool_error = any(not result.ok for result in record.tool_results)
-            done = self._save(self._state("tools_done", messages, steps, step, budget, reflection_retries,
+            done = self._save(self._state_for(routing, "tools_done", messages, steps, step, budget, reflection_retries,
                                           had_tool_error))
             outcome = self._after_tools(record.tool_results, messages, steps, done)
             if outcome is not None:
@@ -397,29 +407,31 @@ class Agent:
         return self._stopped("max_iterations_reached", messages, steps)
 
     async def _adrive(self, *, messages: list[BaseMessage], steps: list[AgentStep], step: int, budget: _Budget,
-                      reflection_retries: int, had_tool_error: bool, pending: _Pending | None) -> dict[str, Any]:
-        bound = self._bound_model()
+                      reflection_retries: int, had_tool_error: bool, pending: _Pending | None,
+               routing: dict[str, Any]) -> dict[str, Any]:
         while step <= budget.max_iterations:
             if pending is None:
                 if budget.runtime_exceeded():
                     return self._stopped("max_runtime_exceeded", messages, steps)
-                tokens = estimate_input_tokens(messages, self._model_name())
+                llm = self._choose(messages, step, had_tool_error, routing)
+                tokens = estimate_input_tokens(messages, self._model_name(llm))
                 if budget.input_exceeded(tokens):
                     return self._stopped("max_input_tokens_per_step_exceeded", messages, steps,
                                          input_tokens=tokens, limit=budget.max_input_tokens_per_step)
                 notify(self.event_handler, "on_step_start", step, {"messages": len(messages)})
-                answer = await bound.ainvoke(messages)
-                record = self._record(step, answer)
+                answer = await self._bound_model(llm).ainvoke(messages)
+                record = self._record(step, answer, llm)
                 messages.append(answer)
                 if budget.runtime_exceeded():
                     return self._stopped("max_runtime_exceeded", messages, [*steps, record])
-                pending = _Pending("tools" if answer.tool_calls else "reflect", record)
+                pending = _Pending("tools" if answer.tool_calls else "reflect", record, llm=llm)
             if pending.kind == "reflect":
+                llm = pending.llm or self._choose(messages, step, had_tool_error, routing)
                 if not self.config.reflection_enabled:
                     return self._completed("completed", messages, [*steps, pending.record], step)
-                self._save(self._state("awaiting_reflection", messages, steps, step, budget,
+                self._save(self._state_for(routing, "awaiting_reflection", messages, steps, step, budget,
                                        reflection_retries, had_tool_error, pending=pending.record))
-                ok, feedback = await self._areflect(messages)
+                ok, feedback = await self._areflect(llm, messages)
                 if budget.runtime_exceeded():
                     return self._stopped("max_runtime_exceeded", messages, [*steps, pending.record])
                 if ok:
@@ -430,14 +442,14 @@ class Agent:
                 reflection_retries += 1
                 messages.append(HumanMessage(content=f"Please revise your answer. Feedback: {feedback}"))
                 steps.append(pending.record)
-                self._save(self._state("reflection_feedback", messages, steps, step, budget,
+                self._save(self._state_for(routing, "reflection_feedback", messages, steps, step, budget,
                                        reflection_retries, had_tool_error))
                 notify(self.event_handler, "on_step_end", step, {"finished": False})
                 step, pending = step + 1, None
                 continue
             record = pending.record
             if pending.journal is None:
-                state = self._state("awaiting_tools", messages, steps, step, budget, reflection_retries,
+                state = self._state_for(routing, "awaiting_tools", messages, steps, step, budget, reflection_retries,
                                     had_tool_error, pending=record)
                 checkpoint_id = str(uuid.uuid4())
                 pending.journal = _Journal(self.checkpoint_store, checkpoint_id, state, len(record.tool_calls))
@@ -446,7 +458,7 @@ class Agent:
             messages.extend(result.as_tool_message() for result in record.tool_results)
             steps.append(record)
             had_tool_error = any(not result.ok for result in record.tool_results)
-            done = self._save(self._state("tools_done", messages, steps, step, budget, reflection_retries,
+            done = self._save(self._state_for(routing, "tools_done", messages, steps, step, budget, reflection_retries,
                                           had_tool_error))
             outcome = self._after_tools(record.tool_results, messages, steps, done)
             if outcome is not None:
@@ -504,7 +516,8 @@ class Agent:
             if user_feedback:
                 messages.append(HumanMessage(content=user_feedback))
         return {"messages": messages, "steps": steps, "step": step, "budget": budget,
-                "reflection_retries": reflection_retries, "had_tool_error": had_tool_error, "pending": pending}
+                "reflection_retries": reflection_retries, "had_tool_error": had_tool_error, "pending": pending,
+                "routing": dict(state.get("routing") or {})}
 
     @staticmethod
     def _replace_last_answer(messages: list[BaseMessage], feedback: str) -> None:
@@ -523,22 +536,46 @@ class Agent:
             runtime = min(runtime, max_runtime_seconds)
         return _Budget(self.config.max_iterations, runtime, self.config.max_input_tokens_per_step)
 
-    def _bound_model(self) -> Any:
-        if not self.tools:
-            return self.model
-        return self.model.bind_tools(self.tools, tool_choice=self.config.tool_choice)
+    def _choose(self, messages: list[BaseMessage], step: int, had_tool_error: bool,
+                routing: dict[str, Any]) -> BaseChatModel:
+        """The model for a step: a custom router, a routing policy, or the escalation default."""
+        if self.router is not None:
+            return self.router(messages, step)
+        if self.routing_policy is not None:
+            decision = self.routing_policy.select_llm(
+                messages=messages, step=step, had_tool_error=had_tool_error,
+                primary_llm=self.model, fallback_llm=self.fallback_model, state=routing,
+            )
+            notify(self.event_handler, "on_routing_decision", step, {
+                "policy": decision.policy_name, "reason": decision.reason,
+                "metadata": decision.metadata, "model": self._model_name(decision.llm),
+            })
+            return decision.llm
+        if had_tool_error and self.fallback_model is not None:
+            return self.fallback_model
+        return self.model
 
-    def _model_name(self) -> str | None:
-        params = getattr(self.model, "_identifying_params", None) or {}
+    def _bound_model(self, llm: BaseChatModel) -> Any:
+        if not self.tools:
+            return llm
+        return llm.bind_tools(self.tools, tool_choice=self.config.tool_choice)
+
+    @staticmethod
+    def _model_name(llm: BaseChatModel) -> str | None:
+        params = getattr(llm, "_identifying_params", None) or {}
         return params.get("model")
 
-    def _record(self, step_number: int, answer: AIMessage) -> AgentStep:
+    def _record(self, step_number: int, answer: AIMessage, llm: BaseChatModel) -> AgentStep:
         return AgentStep(
             step=step_number,
             assistant_content=_text(answer.content),
             tool_calls=list(answer.tool_calls or []),
-            model_used=self._model_name(),
+            model_used=self._model_name(llm),
         )
+
+    def _state_for(self, routing: dict[str, Any], *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """A checkpoint that also records the routing state, so a resumed run keeps the same rotation."""
+        return {**self._state(*args, **kwargs), "routing": dict(routing)}
 
     def _state(self, phase: str, messages: list[BaseMessage], steps: list[AgentStep], step: int,
                budget: _Budget, reflection_retries: int, had_tool_error: bool,
@@ -562,22 +599,23 @@ class Agent:
         self.checkpoint_store.save(checkpoint_id, state)
         return checkpoint_id
 
-    def _reflection_model(self) -> Any:
-        limit = getattr(self.model, "max_tokens", None)
+    @staticmethod
+    def _reflection_model(llm: BaseChatModel) -> Any:
+        limit = getattr(llm, "max_tokens", None)
         if limit is not None and limit < REFLECTION_MIN_OUTPUT_TOKENS:
-            return self.model.bind(max_tokens=REFLECTION_MIN_OUTPUT_TOKENS)
-        return self.model
+            return llm.bind(max_tokens=REFLECTION_MIN_OUTPUT_TOKENS)
+        return llm
 
-    def _reflect(self, messages: list[BaseMessage]) -> tuple[bool, str]:
-        checker = self._reflection_model()
+    def _reflect(self, llm: BaseChatModel, messages: list[BaseMessage]) -> tuple[bool, str]:
+        checker = self._reflection_model(llm)
         for _ in range(REFLECTION_ATTEMPTS):
             verdict = _verdict(checker.invoke(_reflection_request(messages)))
             if verdict is not None:
                 return verdict
         raise ValueError(f"The reflection check did not return a verdict in {REFLECTION_ATTEMPTS} attempts.")
 
-    async def _areflect(self, messages: list[BaseMessage]) -> tuple[bool, str]:
-        checker = self._reflection_model()
+    async def _areflect(self, llm: BaseChatModel, messages: list[BaseMessage]) -> tuple[bool, str]:
+        checker = self._reflection_model(llm)
         for _ in range(REFLECTION_ATTEMPTS):
             verdict = _verdict(await checker.ainvoke(_reflection_request(messages)))
             if verdict is not None:

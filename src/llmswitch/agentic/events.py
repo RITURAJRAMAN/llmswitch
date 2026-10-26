@@ -72,10 +72,11 @@ class CollectingEventHandler:
 
 def notify(handler: AgentEventHandler | None, name: str, *args: Any) -> None:
     """Call one handler method. A handler that raises is logged, and the run continues."""
-    if handler is None:
+    method = getattr(handler, name, None)
+    if method is None:
         return
     try:
-        getattr(handler, name)(*args)
+        method(*args)
     except Exception:  # noqa: BLE001 - observing a run must never break it
         logger.exception("Agent event handler %s raised", name)
 
