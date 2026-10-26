@@ -115,8 +115,9 @@ class ChatLLMSwitch(BaseChatModel):
 
     @property
     def _identifying_params(self) -> dict[str, Any]:
-        return {"provider": self._switch_options.get("provider"), "model": self._switch_options.get("model"),
-                "api": self.api}
+        # A configured deployment name wins over the model name, as it does in the core client.
+        model = self._switch_options.get("deployment_name") or self._switch_options.get("model")
+        return {"provider": self._switch_options.get("provider"), "model": model, "api": self.api}
 
     def close(self) -> None:
         """Close the sync client and its provider connections."""

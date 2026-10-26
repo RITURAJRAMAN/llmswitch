@@ -46,6 +46,19 @@ def _task_payload(task: str, shared_state: SharedState | None, keys: set[str] | 
     return f"{task}\n\nSharedStateContext(JSON): {json.dumps(context, sort_keys=True, default=str)}"
 
 
+def _publish(shared_state: SharedState | None, rows: list[dict[str, Any]]) -> None:
+    """Write the outputs of the specialists that finished to the shared state.
+
+    This runs in the caller, after the rows are collected. A specialist that timed out may still be running in
+    its thread, and it must not write to the state after the caller has reported it as a timeout.
+    """
+    if shared_state is None:
+        return
+    for row in rows:
+        if row["raw"] is not None:
+            shared_state.set(f"specialist_outputs.{row['specialist']}", row["output"])
+
+
 def _row(name: str, result: dict[str, Any]) -> dict[str, Any]:
     return {
         "specialist": name,
@@ -101,8 +114,6 @@ def invoke_specialists(
         try:
             payload = _task_payload(task, shared_state, shared_state_keys, shared_state_max_bytes)
             result = agent.invoke(payload, max_runtime_seconds=_remaining(deadline))
-            if shared_state is not None:
-                shared_state.set(f"specialist_outputs.{name}", result.get("output"))
             return _row(name, result)
         except Exception as exc:  # noqa: BLE001 - one specialist failing must not stop the others
             return _error_row(name, exc)
@@ -114,6 +125,7 @@ def invoke_specialists(
                 rows.append(_timeout_row(name))
             else:
                 rows.append(run(name, agent))
+        _publish(shared_state, rows)
         return attach_contract_weights(rows, contracts)
 
     pool = ThreadPoolExecutor(max_workers=max(1, min(max_concurrency, len(items))),
@@ -136,6 +148,7 @@ def invoke_specialists(
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
     rows = [ordered.get(index) or _timeout_row(name) for index, (name, _) in enumerate(items)]
+    _publish(shared_state, rows)
     return attach_contract_weights(rows, contracts)
 
 
@@ -166,8 +179,6 @@ async def ainvoke_specialists(
             payload = _task_payload(task, shared_state, shared_state_keys, shared_state_max_bytes)
             call = agent.ainvoke(payload, max_runtime_seconds=remaining)
             result = await (asyncio.wait_for(call, remaining) if remaining is not None else call)
-            if shared_state is not None:
-                shared_state.set(f"specialist_outputs.{name}", result.get("output"))
             return _row(name, result)
         except TimeoutError:
             return _timeout_row(name)
@@ -184,6 +195,7 @@ async def ainvoke_specialists(
                 return await run(name, agent)
 
         rows = list(await asyncio.gather(*(gated(name, agent) for name, agent in items)))
+    _publish(shared_state, rows)
     return attach_contract_weights(rows, contracts)
 
 

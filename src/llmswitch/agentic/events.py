@@ -23,7 +23,11 @@ logger = logging.getLogger(__name__)
 
 @runtime_checkable
 class AgentEventHandler(Protocol):
-    """Callback interface for agent events. Every method is called on the thread that runs the agent."""
+    """Callback interface for agent events.
+
+    Step and routing events are called on the thread that runs the agent. Tool events can be called from a
+    worker thread, when tools run in parallel, so a handler must be safe to call from several threads.
+    """
 
     def on_step_start(self, step: int, context: dict[str, Any]) -> None: ...
 

@@ -217,8 +217,10 @@ def test_feedback_cannot_change_tools_that_already_started():
     agent = Agent(model, tools=[started_tool], config=AgentConfig(), checkpoint_store=store)
     with pytest.raises(SystemExit):
         agent.invoke("x")
-    with pytest.raises(ValueError, match="may have started"):
-        agent.resume(find(store, "awaiting_tools"), user_feedback="Change the tool call.")
+    checkpoint = find(store, "awaiting_tools")
+    result = agent.resume(checkpoint, user_feedback="Change the tool call.")
+    assert result["status"] == "interrupted" and result["reason"] == "uncertain_tool_execution"
+    assert result["checkpoint_id"] == checkpoint
 
 
 def test_feedback_on_a_finished_step_is_added_to_the_conversation():

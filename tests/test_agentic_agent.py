@@ -148,10 +148,11 @@ def test_a_reflection_without_a_verdict_is_asked_again():
     assert len(model.seen) == 3
 
 
-def test_a_reflection_that_never_gives_a_verdict_is_an_error():
+def test_a_reflection_that_never_gives_a_verdict_stops_the_run_with_a_result():
     model, runner = agent([AIMessage(content="ok")] + [AIMessage(content="no verdict")] * 3)
-    with pytest.raises(ValueError, match="in 3 attempts"):
-        runner.invoke("x")
+    result = runner.invoke("x")
+    assert result["status"] == "stopped" and result["reason"] == "reflection_verdict_unreadable"
+    assert result["steps"][0].assistant_content == "ok"
 
 
 # --- limits -----------------------------------------------------------------------------------------

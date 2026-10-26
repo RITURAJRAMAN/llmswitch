@@ -75,7 +75,8 @@ _PHASES = ("awaiting_reflection", "awaiting_tools", "tools_done", "reflection_fe
 class AgentConfig:
     """Limits and behaviour for an :class:`Agent`.
 
-    ``max_iterations`` is the most model calls one run may make. ``max_runtime_seconds`` is the
+    ``max_iterations`` is the most model calls one run may make to answer or to request tools; the
+    reflection checks are not counted. ``max_runtime_seconds`` is the
     wall-clock limit for one run. ``reflection_max_retries`` is how many revisions a rejected answer
     may get before the last answer is returned. ``max_input_tokens_per_step`` stops a run before a
     call whose input would exceed the limit, using the library's own token count (an estimate).
@@ -369,7 +370,10 @@ class Agent:
                     return self._completed("completed", messages, [*steps, pending.record], step)
                 self._save(self._state_for(routing, "awaiting_reflection", messages, steps, step, budget,
                                        reflection_retries, had_tool_error, pending=pending.record))
-                ok, feedback = self._reflect(llm, messages)
+                verdict = self._reflect(llm, messages)
+                if verdict is None:
+                    return self._stopped("reflection_verdict_unreadable", messages, [*steps, pending.record])
+                ok, feedback = verdict
                 if budget.runtime_exceeded():
                     return self._stopped("max_runtime_exceeded", messages, [*steps, pending.record])
                 if ok:
@@ -431,7 +435,10 @@ class Agent:
                     return self._completed("completed", messages, [*steps, pending.record], step)
                 self._save(self._state_for(routing, "awaiting_reflection", messages, steps, step, budget,
                                        reflection_retries, had_tool_error, pending=pending.record))
-                ok, feedback = await self._areflect(llm, messages)
+                verdict = await self._areflect(llm, messages)
+                if verdict is None:
+                    return self._stopped("reflection_verdict_unreadable", messages, [*steps, pending.record])
+                ok, feedback = verdict
                 if budget.runtime_exceeded():
                     return self._stopped("max_runtime_exceeded", messages, [*steps, pending.record])
                 if ok:
@@ -498,7 +505,7 @@ class Agent:
             progress = state["progress"]
             if user_feedback:
                 if any(entry.get("status") != "not_started" for entry in progress):
-                    raise ValueError("Cannot change pending tool work after execution may have started.")
+                    return self._interrupted("uncertain_tool_execution", messages, steps, checkpoint_id)
                 self._replace_last_answer(messages, user_feedback)
             else:
                 prior: list[ToolExecutionResult | None] = [None] * len(record.tool_calls)
@@ -606,21 +613,23 @@ class Agent:
             return llm.bind(max_tokens=REFLECTION_MIN_OUTPUT_TOKENS)
         return llm
 
-    def _reflect(self, llm: BaseChatModel, messages: list[BaseMessage]) -> tuple[bool, str]:
+    def _reflect(self, llm: BaseChatModel, messages: list[BaseMessage]) -> tuple[bool, str] | None:
+        """The verdict, or ``None`` when the check gave no readable verdict in ``REFLECTION_ATTEMPTS`` tries."""
         checker = self._reflection_model(llm)
         for _ in range(REFLECTION_ATTEMPTS):
             verdict = _verdict(checker.invoke(_reflection_request(messages)))
             if verdict is not None:
                 return verdict
-        raise ValueError(f"The reflection check did not return a verdict in {REFLECTION_ATTEMPTS} attempts.")
+        return None
 
-    async def _areflect(self, llm: BaseChatModel, messages: list[BaseMessage]) -> tuple[bool, str]:
+    async def _areflect(self, llm: BaseChatModel, messages: list[BaseMessage]) -> tuple[bool, str] | None:
+        """Async :meth:`_reflect`."""
         checker = self._reflection_model(llm)
         for _ in range(REFLECTION_ATTEMPTS):
             verdict = _verdict(await checker.ainvoke(_reflection_request(messages)))
             if verdict is not None:
                 return verdict
-        raise ValueError(f"The reflection check did not return a verdict in {REFLECTION_ATTEMPTS} attempts.")
+        return None
 
     def _run_tools(self, step_number: int, record: AgentStep, journal: _Journal,
                    prior: list[ToolExecutionResult | None] | None) -> list[ToolExecutionResult]:

@@ -43,6 +43,13 @@ _EXPORTS = {
     "ainvoke_specialists": ".specialists",
     "make_subagent_tool": ".specialists",
     "make_specialist_tools": ".specialists",
+    "AggregatedResult": ".aggregation",
+    "BaseAggregator": ".aggregation",
+    "MajorityVoteAggregator": ".aggregation",
+    "WeightedScoreAggregator": ".aggregation",
+    "JsonMergeAggregator": ".aggregation",
+    "aggregate_specialists": ".aggregation",
+    "aaggregate_specialists": ".aggregation",
 }
 
 __all__ = sorted(_EXPORTS)

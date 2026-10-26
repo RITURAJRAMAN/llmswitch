@@ -5,9 +5,11 @@ Azure AI Foundry, Anthropic and Vertex AI. Switch providers by changing the cons
 call sites stay the same. Rate limits, retries, a circuit breaker, backup failover and context handling
 are built in, and they behave the same for every provider.
 
-Supported in 0.1.3: sync and async chat completions (streaming and structured output), embeddings, the
+Supported in 0.1.4: sync and async chat completions (streaming and structured output), embeddings, the
 Responses API, rate limiting, retries, a circuit breaker, backup failover, context truncation, batching,
-observability hooks, and an agentic chat model with a bounded tool loop.
+observability hooks, and the agentic features (the optional `agentic` extra): a chat model with a bounded
+tool loop, and an agent with reflection, tool execution, checkpoints and resume, model routing, specialists
+and aggregation.
 
 Supports Python 3.11, 3.12 and 3.13.
 
@@ -42,6 +44,9 @@ Supports Python 3.11, 3.12 and 3.13.
 | Turn text into vectors | `embeddings.create` | For search, clustering and similarity. Use `batching=True` for large lists. |
 | Use OpenAI's newer Responses API | `responses.create` | Stateful and tool-rich features. Native for OpenAI and Azure OpenAI; emulated for Anthropic and Vertex AI. |
 | Run tools in a loop with a model | `ChatLLMSwitch` and `run_tool_loop` | A bounded loop that runs the tools the model asks for, and feeds the results back. |
+| Let an agent work through a task with limits | `Agent` | Budgets, tool timeouts and retries, reflection on the answer, and checkpoints to pause and resume. |
+| Route steps between a main and a backup model | `Agent(fallback_model=..., routing_policy=...)` | Escalate after a tool error, alternate models, or switch on a late step. |
+| Ask several agents and combine their answers | `invoke_specialists` and `aggregate_specialists` | Contracts with capabilities and weights, and majority, weighted or JSON-merge consensus. |
 | Limit cost and traffic per user | `rpm`, `tpm`, `user_id` | Stops one user or job from using the whole quota. |
 | Share limits across many processes | `redis_url` | In-process limits cannot see other processes. |
 | Survive short provider outages | `max_retries`, `retry_base_delay` | Retries transient errors with exponential backoff. |
@@ -64,7 +69,7 @@ Optional extras:
 | Extra | Install | Use it when |
 |---|---|---|
 | `redis` | `pip install "llmswitch-sdk[redis]"` | You run several processes that must share rate limits. |
-| `agentic` | `pip install "llmswitch-sdk[agentic]"` | You want the agentic chat model and tool loop. |
+| `agentic` | `pip install "llmswitch-sdk[agentic]"` | You want the agentic chat model, the tool loop, or the agent with specialists. |
 | `all` | `pip install "llmswitch-sdk[all]"` | You want Redis and the agentic extra together. |
 
 The extras `anthropic`, `azure-foundry` and `vertexai` are still accepted so existing install commands
@@ -355,6 +360,9 @@ keyword argument is a switch option, so `backup`, `on_event`, the rate-limit set
 same way as they do for `LLMSwitch`. It supports `invoke`, `ainvoke`, `stream`, `astream`, `bind_tools`
 and `close`/`aclose`. It is also a standard runnable, so it composes with prompts and parsers using `|`.
 
+Set `api="responses"` to send requests through the Responses API instead of chat completions. It is
+available for `openai` and `azure_openai`. The agent works with either API.
+
 **Binding tools.** `bind_tools` sends tool objects, Pydantic classes, plain functions or OpenAI-style dicts
 with every request:
 
@@ -392,8 +400,8 @@ print(history[-1].content)
 - Plain functions need a name. Functions created with `functools.partial` have none, so wrap them in a
   `def` or use a tool object.
 
-The loop is deliberately basic. It has no routing between agents, no specialists, no checkpoints and no
-budgets. Those are planned for a later release.
+`run_tool_loop` has no budgets beyond `max_steps`, no checkpoints and no routing. For those, use `Agent`
+below.
 
 ### Message conversion limits
 
@@ -409,6 +417,226 @@ budgets. Those are planned for a later release.
 
 Call `llm.close()`, or `await llm.aclose()` for async use, to close the provider connections. Put the call in
 a `finally` block, as the examples do.
+
+### Agent
+
+Use `Agent` when a run needs more than a fixed number of tool calls: budgets, tool timeouts and retries,
+pausing and resuming, routing between models, or several specialists. An agent is a loop of model calls
+and tool calls.
+
+```python
+from llmswitch.agentic import Agent, AgentConfig
+
+agent = Agent(model=llm, tools=[get_weather], config=AgentConfig(max_iterations=6))
+result = agent.invoke("Weather in Paris, then a short summary.")
+print(result["status"], result["output"])
+```
+
+Each step calls the model. If the model asks for tools, they run and their results go back to the model.
+If it answers, the answer is checked by **reflection**: a second model call, with no tools, returns a JSON
+verdict on whether the answer does what was asked. A rejected answer is revised, up to
+`reflection_max_retries` times (default 2). Set `reflection_enabled=False` to skip the check.
+
+`invoke` and `ainvoke` return a dictionary. Its `status` tells you what happened:
+
+| `status` | Meaning | Other keys |
+|---|---|---|
+| `completed` | The answer passed reflection, or reflection is off. | `output`, `messages`, `steps` |
+| `completed_with_reflection_limit` | The answer was still rejected after the revisions; the last one is returned. | `output`, `messages`, `steps` |
+| `interrupted` | The run paused. Resume it with `resume(checkpoint_id)`. | `reason`, `checkpoint_id`, `messages`, `steps` |
+| `stopped` | A limit ended the run. | `reason`, `messages`, `steps` |
+
+An `interrupted` run has a `reason` of `tool_error` (a tool failed and `interrupt_on_tool_error=True`) or
+`uncertain_tool_execution` (a tool may have started before the pause and is not safe to run again). A
+`stopped` run has a `reason` of `max_iterations_reached`, `max_runtime_exceeded`,
+`max_input_tokens_per_step_exceeded`, `tool_retry_exhausted` or `reflection_verdict_unreadable` (the reflection
+check gave no readable verdict in three tries, so the run stops with the answer it had).
+
+`steps` is a list of `AgentStep` objects, one per model call. Each has `step`, `assistant_content`,
+`tool_calls`, `model_used` (the name of the model that answered) and `tool_results`.
+
+The main limits, all in `AgentConfig`:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `max_iterations` | 12 | The most model calls in one run to answer or request tools. Reflection checks are not counted. |
+| `max_runtime_seconds` | 180 | The wall-clock limit for one run. |
+| `max_input_tokens_per_step` | none | Stops before a call whose input is over this many tokens (an estimate). |
+| `reflection_enabled` | `True` | Turns the reflection check on or off. |
+| `reflection_max_retries` | 2 | How many revisions a rejected answer may get. |
+
+You can also pass `max_runtime_seconds=` to `invoke` and `ainvoke` to give one run a shorter limit. It cannot
+make the limit longer than the config.
+
+### Tool execution
+
+Every tool call is run with the limits below, and a failure is returned to the model as an error tool
+message, so the model can recover. Each failure has a kind:
+
+- `parse`: the arguments are not a JSON object. Never retried.
+- `not_found`: no tool has that name. Retried only with `retry_on_tool_not_found=True`.
+- `timeout`: the tool did not finish within `tool_timeout_seconds` (default 30). Never retried, because the
+  tool may still be running or may already have acted.
+- `tool_error`: the tool raised. Retried only if the tool is marked idempotent, or with
+  `retry_non_idempotent_tools=True`.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `tool_timeout_seconds` | 30 | The most time one tool call may take. |
+| `parallel_tools` | `True` | Runs the tool calls of one step at the same time. |
+| `max_concurrency` | 4 | The most tool calls running at once. |
+| `tool_retry_attempts` | 0 | Extra rounds for the retryable failures. |
+| `tool_retry_backoff_seconds` | 0 | The pause between retry rounds. |
+| `interrupt_on_tool_error` | `False` | Pauses the run after a failed tool, so you can decide what to do. |
+| `escalate_on_retry_exhausted` | `False` | Stops the run with `tool_retry_exhausted` when a failure remains after the retries. |
+
+Mark a tool safe to retry with `idempotent`. Only do this when running the tool twice has the same effect as
+running it once:
+
+```python
+from llmswitch.agentic import idempotent
+
+@idempotent
+def get_weather(city: str) -> str:
+    """Get the current weather for a city."""
+    return f"Sunny in {city}"
+```
+
+A timeout stops the wait, not the work. A tool written as `async def` is cancelled at the timeout. A plain
+`def` tool runs in a worker thread, and Python cannot stop a running thread, so it keeps running after the
+timeout, in sync and async runs alike. Write a tool as `async def` when it must really stop.
+
+### Checkpoints and resume
+
+The agent saves its state at each phase of a run, under a checkpoint id. An `interrupted` run is continued
+with that id.
+
+```python
+from llmswitch.agentic import Agent, AgentConfig, FileCheckpointStore
+
+store = FileCheckpointStore("./checkpoints")
+agent = Agent(model=llm, tools=[lookup], config=AgentConfig(interrupt_on_tool_error=True),
+              checkpoint_store=store)
+
+result = agent.invoke("Look up the population of Lyon.")
+if result["status"] == "interrupted":
+    result = agent.resume(result["checkpoint_id"], user_feedback="Try the other service.")
+```
+
+- `InMemoryCheckpointStore` (the default) keeps checkpoints in the process. `FileCheckpointStore(directory)`
+  keeps one JSON file per checkpoint, written atomically and checked with a checksum, so a damaged file is
+  rejected instead of resumed. A new process can resume from the same directory.
+- Any object with `save`, `load` and `delete` methods works as a store.
+- `user_feedback` is added to the conversation. It replaces the model's last answer, or the tools that
+  have not started yet, and the step is run again.
+- A run that is `uncertain_tool_execution` cannot take feedback, because the tool may already have acted.
+  `resume` returns it as an `interrupted` result with the same reason, and the run does not continue.
+
+### Routing between models
+
+Give the agent a `fallback_model`, and a routing policy decides which model answers each step:
+
+```python
+from llmswitch.agentic import Agent, EscalationRoutingPolicy
+
+agent = Agent(model=primary_llm, fallback_model=backup_llm, tools=[lookup],
+              routing_policy=EscalationRoutingPolicy())
+```
+
+| Policy | Behaviour |
+|---|---|
+| `EscalationRoutingPolicy` | Uses the fallback after a tool error, and the primary otherwise. |
+| `RoundRobinRoutingPolicy` | Alternates between the primary and the fallback. |
+| `CostAwareRoutingPolicy(fallback_after_step=n)` | Uses the primary, switching to the fallback after a tool error or from step `n` on. |
+
+For your own rule, subclass `BaseRoutingPolicy` and implement `select_llm`, or pass `router=` a function
+that takes `(messages, step)` and returns the model. A `router` takes precedence over a routing policy.
+Routing state lives for one run and is saved in checkpoints, so a resumed run continues the same rotation.
+Each decision is reported to the event handler as `on_routing_decision`.
+
+### Specialists, contracts and shared state
+
+To ask several agents the same task, use `invoke_specialists` (or `ainvoke_specialists`). It returns one row
+per specialist, in the order you gave them:
+
+```python
+from llmswitch.agentic import SpecialistContract, invoke_specialists
+
+rows = invoke_specialists(
+    task="Review this plan.",
+    specialists={"legal": legal_agent, "finance": finance_agent},
+    contracts={
+        "legal": SpecialistContract(capabilities={"review", "legal"}, weight=2.0),
+        "finance": SpecialistContract(capabilities={"review"}, weight=1.0),
+    },
+    required_capabilities={"review"},
+    max_runtime_seconds=120,
+)
+```
+
+- A `SpecialistContract` lists what a specialist can do (`capabilities`) and how much its answer counts
+  (`weight`, a finite non-negative number). With `required_capabilities`, only specialists whose contracts
+  cover all of them are asked. A specialist with no contract is not asked in that case.
+- Each row has `specialist`, `status`, `output`, `reason`, `steps`, `checkpoint_id` and `raw` (the full
+  result). A specialist that raised has status `error`. One that ran out of the shared time limit has status
+  `timeout`. Rows from a contract also have `weight` and `capabilities`.
+- `max_runtime_seconds` is shared: each specialist gets what is left of it. `parallel=False` runs them one
+  after another, and `max_concurrency` limits the parallel ones. In a parallel run, a specialist still running
+  when the limit ends is reported as `timeout`, and its work is not written to the shared state. The async
+  version cancels it. In a sequential run, the limit is checked before each specialist starts and between the
+  steps of an agent run, so a model call that has already started is not interrupted.
+- A parallel specialist reads the shared state when it starts, so what it sees depends on timing.
+- `SharedState` is a thread-safe store. Each specialist's output is written to it under
+  `specialist_outputs.<name>`. Its contents are added to the task prompt, so a large state is trimmed to
+  `shared_state_max_bytes` (default 16,000). Pick the keys to share with `shared_state_keys`.
+
+An agent can also be a tool for another agent. `make_subagent_tool(name=..., description=..., agent=...)`
+returns a function that runs the agent and returns a JSON summary (`status`, `output`, `reason`, `steps`).
+Give it to the parent's `tools` list, and the parent decides when to delegate.
+
+### Aggregation
+
+`aggregate_specialists` (and `aaggregate_specialists`) runs the specialists and combines their rows. Pick
+the strategy with `aggregator=`:
+
+| Aggregator | Consensus |
+|---|---|
+| `MajorityVoteAggregator()` | The output most specialists gave. |
+| `WeightedScoreAggregator()` | The output with the largest total `weight`. A row without a weight counts as 1. |
+| `JsonMergeAggregator(conflict_policy=...)` | Merges outputs that are JSON objects, key by key. The default. |
+
+```python
+from llmswitch.agentic import WeightedScoreAggregator, aggregate_specialists
+
+result = aggregate_specialists(
+    task="What is the capital of Australia? Answer with the city name only.",
+    specialists={"geography": geo_agent, "trivia": trivia_agent},
+    contracts={"geography": SpecialistContract({"facts"}, weight=2.0),
+               "trivia": SpecialistContract({"facts"}, weight=1.0)},
+    aggregator=WeightedScoreAggregator(),
+)
+result.consensus, result.confidence   # the answer, and the share of the weight behind it
+```
+
+- Rows with status `error`, `timeout`, `interrupted` or `stopped` are left out, unless you pass
+  `include_failed=True`.
+- An output that is a JSON string is read as JSON first, and so is a JSON object inside a Markdown code
+  fence. `{"a": 1}` and `'{"a": 1}'` count as the same answer.
+- An output of `None` is not a vote, but it still counts in the denominator of `confidence`.
+- Ties go to the answer that appeared first in the rows.
+- `JsonMergeAggregator` falls back to a majority vote when no output is an object. Its conflict policies are
+  `last_writer_wins` (the default), `first_writer_wins` and `error`. Each conflict is listed in
+  `metadata["conflicts"]`.
+
+### Events
+
+Pass an `event_handler` to see what the agent does. It is any object with some of these methods, and a
+missing method is skipped: `on_step_start`, `on_step_end`, `on_tool_start`, `on_tool_end`, `on_tool_error`
+and `on_routing_decision`. `CollectingEventHandler` keeps the events in its `events` list. `LoggingEventHandler` writes
+them to the `llmswitch.agentic` logger, and it logs tool names and the names of exception classes, never
+argument or result values. Tool events can come from worker threads when tools run in parallel, so a handler
+must be safe to call from several threads. A call that is rejected before it runs, with arguments that are not
+a JSON object or an unknown tool name, produces no tool events. It appears in the step's `tool_results`.
 
 ## Rate limits
 

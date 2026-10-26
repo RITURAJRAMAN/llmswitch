@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.4] - 2026-10-26
+
+### Added
+
+- `ChatLLMSwitch(api="responses")` sends requests through the Responses API, for `openai` and `azure_openai`. The agent and the tool loop work with either API.
+- `Agent` and `AgentConfig` in `llmswitch.agentic`: a loop of model calls and tool calls, with reflection on the final answer (`reflection_enabled`, `reflection_max_retries`), budgets (`max_iterations`, `max_runtime_seconds`, `max_input_tokens_per_step`), and a result with a `status` of `completed`, `completed_with_reflection_limit`, `interrupted` or `stopped`.
+- Tool execution for the agent: a timeout per tool call (`tool_timeout_seconds`), parallel tool calls (`parallel_tools`, `max_concurrency`), retries for safe failures (`tool_retry_attempts`, `tool_retry_backoff_seconds`), and the `idempotent` marker that allows a retry after a tool error. Failures carry a kind (`parse`, `not_found`, `timeout`, `tool_error`). `interrupt_on_tool_error` and `escalate_on_retry_exhausted` stop a run on a failure.
+- Checkpoints and resume: `InMemoryCheckpointStore` and `FileCheckpointStore`. The file store writes atomically with a checksum, so a damaged checkpoint is rejected rather than resumed. `Agent.resume` and `Agent.aresume` continue an interrupted run, optionally with user feedback. A run whose tool may already have acted is reported as `uncertain_tool_execution` and is not continued.
+- Routing between models: `Agent(fallback_model=..., routing_policy=...)` with `EscalationRoutingPolicy`, `RoundRobinRoutingPolicy`, `CostAwareRoutingPolicy`, a custom `BaseRoutingPolicy`, or a `router` function. Routing state is saved in checkpoints, so a resumed run continues the same rotation.
+- Events for agents through an `event_handler` with `on_step_start`, `on_step_end`, `on_tool_start`, `on_tool_end`, `on_tool_error` and `on_routing_decision`. `CollectingEventHandler` and `LoggingEventHandler` are included. The logger does not log argument or result values.
+- Specialists: `invoke_specialists` and `ainvoke_specialists` run several agents on one task under a shared time limit, and return one row per specialist with its status (`completed`, `error`, `timeout`, `interrupted`, `stopped`).
+- Contracts and shared state: `SpecialistContract` (capabilities and a weight), `required_capabilities` to choose the specialists, and `SharedState`, a thread-safe store that feeds a bounded projection into each specialist's prompt.
+- `make_subagent_tool` and `make_specialist_tools`, which wrap an agent as a tool that another agent can call.
+- Aggregation of specialist rows: `MajorityVoteAggregator`, `WeightedScoreAggregator` (weights from the contracts), and `JsonMergeAggregator` with the `last_writer_wins`, `first_writer_wins` and `error` conflict policies. `aggregate_specialists` and `aaggregate_specialists` run and aggregate in one call. JSON in a Markdown code fence is read as JSON.
+- Examples `examples/agentic_agent.py` (a tool failure, a file checkpoint and a resume) and `examples/agentic_specialists.py` (weighted consensus over specialists).
+
 ## [0.1.3] - 2026-10-26
 
 ### Added
