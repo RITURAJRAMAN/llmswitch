@@ -1,4 +1,4 @@
-"""LangChain message conversion: pure functions, no network. Skipped when langchain-core is not installed."""
+"""Agentic message conversion: pure functions, no network. Skipped when the agentic extra is not installed."""
 import json
 
 import pytest
@@ -7,7 +7,7 @@ pytest.importorskip("langchain_core")
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage  # noqa: E402
 
-from llmswitch.integrations.langchain_messages import to_ai_chunk, to_ai_message, to_chat_messages  # noqa: E402
+from llmswitch.agentic.messages import to_ai_chunk, to_ai_message, to_chat_messages  # noqa: E402
 from llmswitch.models import (  # noqa: E402
     ChatCompletion,
     ChatCompletionChunk,
@@ -34,7 +34,7 @@ def call(call_id, name, arguments):
     return ChatCompletionMessageToolCall(id=call_id, type="function", function=Function(name=name, arguments=arguments))
 
 
-# --- LangChain messages -> chat dicts -------------------------------------------------------------
+# --- agentic messages -> chat dicts -------------------------------------------------------------
 
 def test_plain_text_messages_keep_their_roles():
     converted = to_chat_messages([SystemMessage(content="Be brief."), HumanMessage(content="Hi")])
@@ -52,7 +52,7 @@ def test_a_user_message_with_an_image_keeps_its_parts():
     ]
 
 
-def test_the_langchain_standard_image_shapes_are_accepted():
+def test_the_standard_image_shapes_are_accepted():
     url = HumanMessage(content=[{"type": "image", "url": "https://x/a.png"}])
     data = HumanMessage(content=[{"type": "image", "base64": "QUJD", "mime_type": "image/jpeg"}])
     assert to_chat_messages([url])[0]["content"][0]["image_url"]["url"] == "https://x/a.png"

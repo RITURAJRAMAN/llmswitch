@@ -252,9 +252,9 @@ class RedisRateLimiter:
             if _MEMORY_NEXT_EXPIRY is None or expiry < _MEMORY_NEXT_EXPIRY:
                 _MEMORY_NEXT_EXPIRY = expiry
 
-    def _incr_memory_window(self, key: str, request_type: str, tokens: int,
-                            window_seconds: int, scope: str | None = None) -> tuple[int, int]:
-        current = self._memory_key(key, window_seconds, request_type, scope=scope)
+    def _incr_memory_window(self, current: tuple[str, str, str, str, int, int],
+                            tokens: int) -> tuple[int, int]:
+        """Reserve one request and ``tokens`` in the window identified by ``current``."""
         with _MEMORY_WINDOWS_LOCK:
             self._ensure_memory_capacity(current)
             counts = _MEMORY_WINDOWS.setdefault(current, [0, 0])
@@ -262,23 +262,35 @@ class RedisRateLimiter:
             counts[1] += tokens
             return counts[0], counts[1]
 
-    def _release_memory_window(self, key: str, request_type: str, tokens: int,
-                               window_seconds: int, scope: str | None = None) -> None:
-        """Give back the reservation made for a denied request."""
-        current = self._memory_key(key, window_seconds, request_type, scope=scope)
+    def _release_memory_window(self, current: tuple[str, str, str, str, int, int], tokens: int) -> None:
+        """Give back the reservation made in the window ``current`` for a denied request.
+
+        The window key is the one the reservation was made under, not one recomputed from
+        the clock, so a window that rolled over in between is not decremented by mistake.
+        """
         with _MEMORY_WINDOWS_LOCK:
             counts = _MEMORY_WINDOWS.get(current)
             if counts is not None:
                 counts[0] = max(0, counts[0] - 1)
                 counts[1] = max(0, counts[1] - tokens)
 
-    def _release_window(self, rpm_key: str, tpm_key: str, tokens: int) -> None:
-        """Give back the Redis reservation made for a denied request."""
+    def _release_window(self, rpm_key: str, tpm_key: str, tokens: int, window_seconds: int) -> None:
+        """Give back the Redis reservation made for a denied request.
+
+        Best effort: if the window expired in between, the decrement must not create a
+        key without a TTL, so the same EXPIRE NX used by the increment is applied. A
+        failure here is logged and the denial stands.
+        """
         assert self.redis is not None  # mode is 'redis'
-        with self.redis.pipeline() as pipe:
-            pipe.decrby(rpm_key, 1)
-            pipe.decrby(tpm_key, tokens)
-            pipe.execute()
+        try:
+            with self.redis.pipeline() as pipe:
+                pipe.decrby(rpm_key, 1)
+                pipe.decrby(tpm_key, tokens)
+                pipe.expire(rpm_key, window_seconds, nx=True)
+                pipe.expire(tpm_key, window_seconds, nx=True)
+                pipe.execute()
+        except RedisError as exc:
+            logger.warning("Could not release a denied request's rate-limit reservation: %s", exc)
 
     def _incr_window(self, rpm_key: str, tpm_key: str, tokens: int, window_seconds: int) -> tuple[int, int]:
         """
@@ -317,9 +329,8 @@ class RedisRateLimiter:
 
         try:
             if self.mode == "memory":
-                rpm_count, tpm_count = self._incr_memory_window(
-                    key, request_type, tokens, window_seconds, scope=scope
-                )
+                window = self._memory_key(key, window_seconds, request_type, scope=scope)
+                rpm_count, tpm_count = self._incr_memory_window(window, tokens)
             elif self.redis is not None:
                 rpm_key, tpm_key = self._get_window_keys(key, window_seconds, request_type, scope=scope)
                 rpm_count, tpm_count = self._incr_window(rpm_key, tpm_key, tokens, window_seconds)
@@ -338,9 +349,9 @@ class RedisRateLimiter:
                 reason, allowed, level, msg = "allowed", True, "DEBUG", "Rate limit allowed"
             if not allowed:
                 if self.mode == "memory":
-                    self._release_memory_window(key, request_type, tokens, window_seconds, scope=scope)
+                    self._release_memory_window(window, tokens)
                 else:
-                    self._release_window(rpm_key, tpm_key, tokens)
+                    self._release_window(rpm_key, tpm_key, tokens, window_seconds)
 
             RateLimitMetrics.record_miss() if allowed else RateLimitMetrics.record_hit()
             if not suppress_log:

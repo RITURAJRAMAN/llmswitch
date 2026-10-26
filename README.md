@@ -7,7 +7,7 @@ arguments; the call sites stay the same.
 
 Supported in 0.1.3: synchronous and asynchronous chat completions (including streaming and
 structured output), embeddings, the Responses API for OpenAI, Azure OpenAI, Anthropic and Vertex AI, rate limiting,
-retries, a circuit breaker, backup failover, context truncation, and a LangChain chat model with a
+retries, a circuit breaker, backup failover, context truncation, and an agentic chat model with a
 bounded tool loop.
 
 ## Installation
@@ -24,11 +24,11 @@ only the providers you use are imported.
 
 Shared rate limits across processes need Redis: `pip install "llmswitch-sdk[redis]"`.
 
-LangChain support needs `langchain-core`: `pip install "llmswitch-sdk[langchain]"`. See
-[LangChain integration](#langchain-integration).
+Agentic features need the `agentic` extra: `pip install "llmswitch-sdk[agentic]"`. See
+[Agentic features](#agentic-features).
 
 The optional extras `anthropic`, `azure-foundry` and `vertexai` are still accepted, so existing
-install commands keep working, but they add nothing new. `all` installs Redis and LangChain support.
+install commands keep working, but they add nothing new. `all` installs Redis and the agentic extra.
 
 ## Quick start
 
@@ -242,17 +242,17 @@ What works: text and image input, `instructions`, function tools and `tool_choic
 
 What does not work, because chat completions cannot provide it: server-side state (`previous_response_id`, `conversation`, `store=True`, `background`), stored objects (`retrieve`, `delete`, `cancel`, `compact`, `input_items`, `input_tokens.count`, `conversations`) and hosted tools (web search, file search, code interpreter, MCP and the rest). These raise `UnsupportedCapabilityError` before any request is sent, so keep the conversation history in your application and pass it as `input` items. `client.responses.capabilities().emulated` is `True` for these providers. Fields that have no chat equivalent (`metadata`, `user`, `truncation`, `include`, `reasoning` and similar) are accepted and ignored. Response ids are generated locally and cannot be used to retrieve anything.
 
-## LangChain integration
+## Agentic features
 
-Install the extra, then use `ChatLLMSwitch` wherever a LangChain chat model is accepted:
+Install the extra, then use `ChatLLMSwitch` as a chat model:
 
 ```python
-from llmswitch.integrations.langchain import ChatLLMSwitch
+from llmswitch.agentic import ChatLLMSwitch
 
 llm = ChatLLMSwitch(provider="anthropic", api_key="sk-ant-...", model="claude-opus-4-5", temperature=0.2)
 print(llm.invoke("Say hello in French.").content)
 
-chain = prompt | llm   # any LangChain prompt, parser or runnable composes with it
+chain = prompt | llm   # prompts, parsers and other pipeline steps compose with it
 ```
 
 Options the model understands are fields: `temperature`, `max_tokens`, `stop` and `call_options`
@@ -260,7 +260,7 @@ Options the model understands are fields: `temperature`, `max_tokens`, `stop` an
 passed to `LLMSwitch`, so `provider`, `api_key`, `model`, `backup`, `on_event` and the rest work the
 same way as they do for `LLMSwitch`.
 
-`bind_tools` sends LangChain tools, Pydantic classes, plain functions or OpenAI-style dicts:
+`bind_tools` sends tool objects, Pydantic classes, plain functions or OpenAI-style dicts:
 
 ```python
 llm_with_tools = llm.bind_tools([get_weather], tool_choice="auto")
@@ -276,7 +276,7 @@ Arguments that are not valid JSON appear in `reply.invalid_tool_calls` instead o
 `run_tool_loop` runs the tools the model asks for and returns the whole conversation:
 
 ```python
-from llmswitch.integrations.langchain import run_tool_loop
+from llmswitch.agentic import run_tool_loop
 
 history = run_tool_loop(llm, "Weather in Paris, and 17 plus 25?", [get_weather, add], max_steps=4)
 print(history[-1].content)
@@ -300,14 +300,14 @@ no budgets. Those are planned for a later release.
   native tool-use blocks are not sent back. Tool calls are sent through `tool_calls`. If you turn on
   extended thinking with tools, a provider can reject a continued tool loop, because the signed thinking
   block is missing from the history.
-- `tool_choice=False` means no tools, the same as `"none"`.
+- `tool_choice=False` is sent as `"none"`, which tells the model not to call tools.
 
 ### Closing clients
 
 Call `llm.close()`, or `await llm.aclose()` for async use, to close the provider connections. Put the call
 in a `finally` block, as the examples do.
 
-### Responses through LangChain
+### Responses with the agentic model
 
 `ChatLLMSwitch` uses chat completions only. For the Responses API, use `LLMSwitch` directly.
 
@@ -347,6 +347,7 @@ To fail instead of waiting, set `on_rate_limit="raise"`. To wait only for short 
 
 Transient errors are retried: rate limits, connection errors and 5xx responses. Timeouts are not
 retried, because the provider may already have processed the request and a retry could bill it twice.
+A timeout does count as a failure for the circuit breaker, and it does trigger backup failover.
 `max_retries` (default 3) and `retry_base_delay` control the exponential backoff. `retry_deadline` (seconds) caps how
 long one provider call keeps retrying: when the next wait would pass it, the last error is raised.
 
@@ -362,8 +363,10 @@ client = LLMSwitch(
 )
 ```
 
-The circuit breaker stops calls to a deployment after repeated failures and retries it after
-`reset_timeout` seconds. `backup` is used when the primary provider fails with a retryable error.
+The circuit breaker stops calls to a deployment after repeated failures (timeouts, connection errors and
+5xx responses) and retries it after `reset_timeout` seconds. If you stop reading a stream before it ends, call `close()` on it (or let it go out of scope), so the
+breaker's trial slot is released. `backup` is used when the primary provider
+fails with a retryable error or times out.
 The backup provider must support the same operation.
 
 Embedding failover is all or nothing. If the primary fails part-way through a batched request, the
@@ -442,7 +445,7 @@ pytest
 ruff check src tests
 ```
 
-The tests use mocks and do not contact any provider. The LangChain tests skip when `langchain-core`
+The tests use mocks and do not contact any provider. The agentic tests skip when the agentic extra
 is not installed, so `pip install -e ".[redis,dev]"` runs the core suite on its own.
 
 ## License

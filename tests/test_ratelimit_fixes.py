@@ -69,6 +69,9 @@ class RecordingPipeline:
     def decrby(self, name, amount):
         self.log.append(("decrby", name, amount))
 
+    def expire(self, name, seconds, nx=False):
+        self.log.append(("expire", name, seconds))
+
     def execute(self):
         self.log.append(("execute",))
 
@@ -81,13 +84,40 @@ class RecordingRedis:
         return RecordingPipeline(self.log)
 
 
-def test_redis_rollback_gives_back_exactly_the_reserved_amounts(memory_limiter):
+def test_redis_rollback_gives_back_exactly_the_reserved_amounts_and_keeps_a_ttl(memory_limiter):
     memory_limiter.redis = RecordingRedis()
-    memory_limiter._release_window("rpm-key", "tpm-key", 1500)
-    assert memory_limiter.redis.log == [("decrby", "rpm-key", 1), ("decrby", "tpm-key", 1500), ("execute",)]
+    memory_limiter._release_window("rpm-key", "tpm-key", 1500, 60)
+    assert memory_limiter.redis.log == [
+        ("decrby", "rpm-key", 1), ("decrby", "tpm-key", 1500),
+        ("expire", "rpm-key", 60), ("expire", "tpm-key", 60), ("execute",),
+    ]
+
+
+def test_a_failed_redis_rollback_does_not_turn_a_denial_into_an_error(memory_limiter, caplog):
+    class Broken(RecordingRedis):
+        def pipeline(self):
+            raise limiter_module.RedisError("connection lost")
+
+    memory_limiter.redis = Broken()
+    with caplog.at_level("WARNING", logger="llmswitch.ratelimit.limiter"):
+        memory_limiter._release_window("rpm-key", "tpm-key", 1, 60)
+    assert any("Could not release" in r.getMessage() for r in caplog.records)
 
 
 def test_a_memory_rollback_never_goes_below_zero(memory_limiter):
     user = key()
-    memory_limiter._release_memory_window(user, "completion", 50, 60)
-    assert not any(k[2] == user for k in limiter_module._MEMORY_WINDOWS)
+    window = memory_limiter._memory_key(user, 60, "completion")
+    memory_limiter._release_memory_window(window, 50)
+    assert window not in limiter_module._MEMORY_WINDOWS
+
+
+def test_a_rollback_uses_the_reservation_window_not_the_current_clock(monkeypatch, memory_limiter):
+    user = key()
+    clock = [100.1]
+    monkeypatch.setattr(limiter_module.time, "time", lambda: clock[0])
+    original = memory_limiter._memory_key(user, 1, "completion")
+    assert memory_limiter._incr_memory_window(original, 10) == (1, 10)
+    clock[0] = 101.5  # the window has rolled over before the denied request is released
+    memory_limiter._release_memory_window(original, 10)
+    assert limiter_module._MEMORY_WINDOWS[original] == [0, 0]
+    assert not any(k != original and k[2] == user and v[0] for k, v in limiter_module._MEMORY_WINDOWS.items())

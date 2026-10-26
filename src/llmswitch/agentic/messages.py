@@ -1,10 +1,10 @@
 """
-llmswitch.integrations.langchain_messages
+llmswitch.agentic.messages
 
-Pure conversions between LangChain messages and llmswitch's chat shapes. Nothing
-here makes a network call, so each function can be tested on its own.
+Pure conversions between the agentic message objects and llmswitch's chat shapes.
+Nothing here makes a network call, so each function can be tested on its own.
 
-- LangChain messages -> chat message dicts (``to_chat_messages``)
+- Agentic message objects -> chat message dicts (``to_chat_messages``)
 - ``ChatCompletion`` -> ``AIMessage`` (``to_ai_message``)
 - ``ChatCompletionChunk`` -> ``AIMessageChunk`` (``to_ai_chunk``)
 """
@@ -33,7 +33,7 @@ _TEXT_BLOCK = "text"
 
 
 def _image_url(block: dict[str, Any]) -> str:
-    """Return a URL for an image block, from either the OpenAI or the LangChain standard shape."""
+    """Return a URL for an image block, from either the OpenAI shape or the standard shape."""
     if block.get("type") == "image_url":
         image = block.get("image_url")
         url = image.get("url") if isinstance(image, dict) else image
@@ -112,7 +112,7 @@ def _assistant_dict(message: AIMessage) -> dict[str, Any]:
 
 
 def to_chat_messages(messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
-    """Convert LangChain messages to the chat message dicts that llmswitch sends."""
+    """Convert agentic message objects to the chat message dicts that llmswitch sends."""
     converted: list[dict[str, Any]] = []
     for message in messages:
         if isinstance(message, SystemMessage):
@@ -125,7 +125,7 @@ def to_chat_messages(messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
             converted.append({"role": "tool", "tool_call_id": message.tool_call_id,
                               "content": _content_for_role(message.content, "tool")})
         else:
-            raise ValueError(f"Unsupported LangChain message type: {type(message).__name__}")
+            raise ValueError(f"Unsupported message type: {type(message).__name__}")
     return converted
 
 
@@ -193,7 +193,7 @@ def to_ai_chunk(chunk: ChatCompletionChunk) -> AIMessageChunk:
     """Convert one streamed chunk to an ``AIMessageChunk``.
 
     Tool-call fragments become ``tool_call_chunks`` with their raw argument text, so
-    LangChain can join them across chunks, as it does for other providers.
+    the agentic model can join them across chunks, as it does for other providers.
     """
     content = ""
     fragments: list[ToolCallChunk] = []

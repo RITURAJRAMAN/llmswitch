@@ -1,18 +1,16 @@
 """
-LangChain chat model over llmswitch.
+Chat model with llmswitch's agentic features.
 
-Requires the langchain extra:  pip install "llmswitch-sdk[langchain]"
+Requires the agentic extra:  pip install "llmswitch-sdk[agentic]"
 
 Set the variables for the provider you want to try, then run:
 
-    OPENAI_API_KEY=sk-... python examples/langchain_chat.py
+    OPENAI_API_KEY=sk-... python examples/agentic_chat.py
 """
 import asyncio
 import os
 
-from langchain_core.prompts import ChatPromptTemplate
-
-from llmswitch.integrations.langchain import ChatLLMSwitch
+from llmswitch.agentic import ChatLLMSwitch
 
 
 def build_model() -> ChatLLMSwitch:
@@ -23,13 +21,12 @@ def build_model() -> ChatLLMSwitch:
 def main() -> None:
     llm = build_model()
     try:
-        reply = llm.invoke("Reply with one short sentence about LangChain.")
+        reply = llm.invoke([
+            {"role": "system", "content": "Answer in five words or fewer."},
+            {"role": "user", "content": "What is Python?"},
+        ])
         print("invoke:", reply.content)
         print("usage:", reply.usage_metadata)
-
-        prompt = ChatPromptTemplate.from_messages([("system", "Answer in five words or fewer."), ("user", "{q}")])
-        chain = prompt | llm
-        print("chain:", chain.invoke({"q": "What is Python?"}).content)
 
         print("stream: ", end="")
         for chunk in llm.stream("Count from one to three."):

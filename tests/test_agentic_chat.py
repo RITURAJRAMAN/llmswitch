@@ -1,4 +1,4 @@
-"""ChatLLMSwitch: a LangChain chat model over the switch. Only the provider SDK is replaced; skipped without langchain-core."""
+"""ChatLLMSwitch: a chat model over the switch. Only the provider SDK is replaced; skipped without the agentic extra."""
 import uuid
 
 import pytest
@@ -11,8 +11,8 @@ from langchain_core.prompts import ChatPromptTemplate  # noqa: E402
 from langchain_core.tools import tool  # noqa: E402
 
 from llmswitch import ChatCompletionError, LLMSwitchError  # noqa: E402
+from llmswitch.agentic.chat import ChatLLMSwitch  # noqa: E402
 from llmswitch.core.registry import ASYNC_CHAT_PROVIDER_REGISTRY, CHAT_PROVIDER_REGISTRY  # noqa: E402
-from llmswitch.integrations.langchain import ChatLLMSwitch  # noqa: E402
 from llmswitch.models import (  # noqa: E402
     ChatCompletion,
     ChatCompletionChunk,
@@ -109,7 +109,7 @@ def model(**options):
 
 # --- construction ----------------------------------------------------------------------------------
 
-def test_it_is_a_langchain_chat_model():
+def test_it_is_a_chat_model():
     assert isinstance(model(), BaseChatModel)
 
 
@@ -166,7 +166,7 @@ def test_per_call_stop_overrides_the_configured_stop():
     assert Script.calls[0]["stop"] == ["STOP"]
 
 
-def test_langchain_internal_keywords_are_not_sent():
+def test_framework_internal_keywords_are_not_sent():
     Script.responses = [completion("ok")]
     model().invoke("x", ls_custom_trace="abc", seed=3)
     assert "ls_custom_trace" not in Script.calls[0]
@@ -337,3 +337,20 @@ def test_concurrent_first_async_calls_share_one_client():
         thread.join()
     built.extend(results)
     assert len(set(built)) == 1
+
+
+def test_none_values_are_not_sent_to_the_provider():
+    Script.responses = [completion("ok")]
+    model().invoke("x", tool_choice=None, seed=None, temperature=None)
+    assert "tool_choice" not in Script.calls[0]
+    assert "seed" not in Script.calls[0]
+    assert "temperature" not in Script.calls[0]
+
+
+def test_the_chat_model_can_be_copied_and_pickled():
+    import copy
+    import pickle
+
+    llm = model(temperature=0.1)
+    assert copy.deepcopy(llm).temperature == 0.1
+    assert pickle.loads(pickle.dumps(llm)).temperature == 0.1

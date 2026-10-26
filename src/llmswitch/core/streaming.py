@@ -10,7 +10,7 @@ from typing import Any, Callable
 from .circuit_breaker import is_health_failure
 from .events import current_emitter
 from .execution import ExecutionOutcome, ExecutionStatus
-from .retry import _is_retryable, _retry_delay, _within_deadline
+from .retry import _fails_over, _is_retryable, _retry_delay, _within_deadline
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -81,6 +81,7 @@ class StreamHandle:
     limiter_scope: str | None = None
     iterator: Any = None
     prompt_tokens: int | None = None
+    probe: object | None = None  # the breaker's half-open probe token, when this stream holds the probe
 
 
 class SyncStreamSession:
@@ -139,15 +140,15 @@ class SyncStreamSession:
 
     def _abandon_handle(self, handle: StreamHandle | None) -> None:
         if handle is not None and handle.breaker is not None:
-            handle.breaker.abandon_probe()
+            handle.breaker.abandon(handle.probe)
         self._close_handle(handle)
 
     def _record_failure(self, handle: StreamHandle | None, exc: BaseException) -> None:
         if handle is not None and handle.breaker is not None:
             if isinstance(exc, Exception):
-                handle.breaker.record(ok=not is_health_failure(exc))
+                handle.breaker.record(ok=not is_health_failure(exc), probe=handle.probe)
             else:
-                handle.breaker.abandon_probe()
+                handle.breaker.abandon(handle.probe)
         status = ExecutionStatus.FAILED_RETRYABLE if isinstance(exc, Exception) and _is_retryable(exc) else ExecutionStatus.FAILED_TERMINAL
         self.outcome = ExecutionOutcome(
             status=status,
@@ -183,7 +184,7 @@ class SyncStreamSession:
         handle = self._active
         try:
             if handle is not None and handle.breaker is not None:
-                handle.breaker.record(ok=status == ExecutionStatus.COMPLETED)
+                handle.breaker.record(ok=status == ExecutionStatus.COMPLETED, probe=handle.probe)
             if self._on_complete is not None:
                 self._on_complete(
                     self._last_usage,
@@ -243,7 +244,7 @@ class SyncStreamSession:
             if self._finished:
                 raise
             primary_exc = exc
-            if self._backup_factory is None or not _is_retryable(exc):
+            if self._backup_factory is None or not _fails_over(exc):
                 raise
         self._emit("failover", error=type(primary_exc).__name__, status_code=getattr(primary_exc, "status_code", None))
         try:
@@ -364,7 +365,7 @@ class AsyncStreamSession:
         handle = getattr(self, "_active", None)
         if handle is not None and getattr(handle, "breaker", None) is not None:
             try:
-                handle.breaker.abandon_probe()
+                handle.breaker.abandon(handle.probe)
             except Exception:  # noqa: BLE001 - never raise from a finalizer
                 pass
 
@@ -383,15 +384,15 @@ class AsyncStreamSession:
 
     async def _abandon_handle(self, handle: StreamHandle | None) -> None:
         if handle is not None and handle.breaker is not None:
-            handle.breaker.abandon_probe()
+            handle.breaker.abandon(handle.probe)
         await self._close_handle(handle)
 
     async def _record_failure(self, handle: StreamHandle | None, exc: BaseException) -> None:
         if handle is not None and handle.breaker is not None:
             if isinstance(exc, Exception):
-                handle.breaker.record(ok=not is_health_failure(exc))
+                handle.breaker.record(ok=not is_health_failure(exc), probe=handle.probe)
             else:
-                handle.breaker.abandon_probe()
+                handle.breaker.abandon(handle.probe)
         status = (
             ExecutionStatus.CANCELLED if isinstance(exc, asyncio.CancelledError)
             else ExecutionStatus.FAILED_RETRYABLE if isinstance(exc, Exception) and _is_retryable(exc)
@@ -431,7 +432,7 @@ class AsyncStreamSession:
         handle = self._active
         try:
             if handle is not None and handle.breaker is not None:
-                handle.breaker.record(ok=status == ExecutionStatus.COMPLETED)
+                handle.breaker.record(ok=status == ExecutionStatus.COMPLETED, probe=handle.probe)
             if self._on_complete is not None:
                 result = self._on_complete(
                     self._last_usage,
@@ -504,7 +505,7 @@ class AsyncStreamSession:
             if self._finished:
                 raise
             primary_exc = exc
-            if self._backup_factory is None or not _is_retryable(exc):
+            if self._backup_factory is None or not _fails_over(exc):
                 raise
         self._emit("failover", error=type(primary_exc).__name__, status_code=getattr(primary_exc, "status_code", None))
         try:

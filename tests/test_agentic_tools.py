@@ -1,4 +1,4 @@
-"""The bounded tool loop. Uses a scripted chat model; skipped without langchain-core."""
+"""The bounded tool loop. Uses a scripted chat model; skipped without the agentic extra."""
 import pytest
 
 pytest.importorskip("langchain_core")
@@ -10,7 +10,7 @@ from langchain_core.tools import tool  # noqa: E402
 from pydantic import Field  # noqa: E402
 
 from llmswitch import LLMSwitchError  # noqa: E402
-from llmswitch.integrations.langchain import ToolLoopLimitError, arun_tool_loop, run_tool_loop  # noqa: E402
+from llmswitch.agentic.chat import ToolLoopLimitError, arun_tool_loop, run_tool_loop  # noqa: E402
 
 
 class Scripted(BaseChatModel):
@@ -155,7 +155,7 @@ def test_max_steps_must_be_a_positive_integer(bad):
 
 
 def test_duplicate_tool_names_are_rejected():
-    def add(a: int) -> int:  # shadows the LangChain tool name "add"
+    def add(a: int) -> int:  # shadows the tool named "add"
         """Shadow."""
         return a
 
@@ -197,8 +197,8 @@ async def test_the_async_loop_reports_failures_and_limits():
 def test_the_loop_runs_through_chat_llmswitch(monkeypatch):
     import uuid
 
+    from llmswitch.agentic.chat import ChatLLMSwitch
     from llmswitch.core.registry import CHAT_PROVIDER_REGISTRY
-    from llmswitch.integrations.langchain import ChatLLMSwitch
     from llmswitch.models import ChatCompletion, ChatCompletionMessage, ChatCompletionMessageToolCall, Choice, Function
 
     replies = [

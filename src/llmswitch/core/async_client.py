@@ -87,7 +87,7 @@ from .responses_capabilities import (
     validate_responses_create_request,
 )
 from .responses_management import prepare_management_call, raise_response_error
-from .retry import _async_retry_call, _is_retryable, _retry_call
+from .retry import _async_retry_call, _fails_over, _retry_call
 from .streaming import (
     AsyncStreamSession,
     StreamHandle,
@@ -196,12 +196,12 @@ class _AsyncChatCompletions(ProviderCache):
         if stream:
             async def primary_stream_factory():
                 try:
-                    with provider_call(self.config.provider, model_name, breaker=breaker, record_success=False):
+                    with provider_call(self.config.provider, model_name, breaker=breaker, record_success=False) as probe:
                         result = await self._instantiate_provider(self.config, provider_cls).create(
                             messages=truncated_messages, stream=True, **request_kwargs
                         )
                     return StreamHandle(
-                        result, breaker=breaker, limiter_scope=limiter_scope, prompt_tokens=total_tokens,
+                        result, breaker=breaker, limiter_scope=limiter_scope, prompt_tokens=total_tokens, probe=probe,
                     )
                 except Exception as exc:
                     raise_chat_error(self.config, exc, user_key)
@@ -239,13 +239,13 @@ class _AsyncChatCompletions(ProviderCache):
                             backup_plan.target.resolved_model,
                             breaker=backup_breaker,
                             record_success=False,
-                        ):
+                        ) as probe:
                             result = await backup_provider.create(
                                 messages=backup_messages, stream=True, **backup_request_kwargs_payload,
                             )
                         return StreamHandle(
                             result, breaker=backup_breaker, limiter_scope=backup_limiter_scope,
-                            prompt_tokens=backup_tokens,
+                            prompt_tokens=backup_tokens, probe=probe,
                         )
                     except Exception as exc:
                         raise_chat_error(backup_config, exc, user_key)
@@ -268,7 +268,7 @@ class _AsyncChatCompletions(ProviderCache):
                     messages=truncated_messages, stream=stream, **request_kwargs
                 )
         except (ChatCompletionError, APIConnectionError, RateLimitExceededError, TimeOutError) as primary_err:
-            if not getattr(self.config, "backup", None) or not _is_retryable(primary_err):
+            if not getattr(self.config, "backup", None) or not _fails_over(primary_err):
                 raise
             logger.warning("Primary async provider failed (%s), failing over to backup.", primary_err)
             emit("failover", from_provider=self.config.provider,
@@ -509,12 +509,12 @@ class _AsyncResponses(ProviderCache):
         if stream:
             async def primary_stream_factory():
                 try:
-                    with provider_call(self.config.provider, model_name, breaker=breaker, record_success=False):
+                    with provider_call(self.config.provider, model_name, breaker=breaker, record_success=False) as probe:
                         result = await self._instantiate_provider(self.config, provider_cls).create(
                             input=prepared_input, stream=True, **request_kwargs
                         )
                     return StreamHandle(
-                        result, breaker=breaker, limiter_scope=limiter_scope, prompt_tokens=total_tokens,
+                        result, breaker=breaker, limiter_scope=limiter_scope, prompt_tokens=total_tokens, probe=probe,
                     )
                 except Exception as exc:
                     raise_response_error(self.config, exc, user_key, "create")
@@ -553,13 +553,13 @@ class _AsyncResponses(ProviderCache):
                             backup_plan.target.resolved_model,
                             breaker=backup_breaker,
                             record_success=False,
-                        ):
+                        ) as probe:
                             result = await backup_provider.create(
                                 input=backup_input, stream=True, **backup_request_kwargs_payload,
                             )
                         return StreamHandle(
                             result, breaker=backup_breaker, limiter_scope=backup_limiter_scope,
-                            prompt_tokens=backup_tokens,
+                            prompt_tokens=backup_tokens, probe=probe,
                         )
                     except Exception as exc:
                         raise_response_error(self.config, exc, user_key, "create")
@@ -583,7 +583,7 @@ class _AsyncResponses(ProviderCache):
                 )
         except (ResponsesError, APIConnectionError, RateLimitExceededError, TimeOutError) as primary_err:
             if (side_effecting_request or stateful_request or not getattr(self.config, "backup", None)
-                    or not _is_retryable(primary_err)):
+                    or not _fails_over(primary_err)):
                 raise
             logger.warning("Primary async provider failed (%s), failing over to backup.", primary_err)
             emit("failover", from_provider=self.config.provider,

@@ -8,14 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- LangChain integration in `llmswitch.integrations.langchain`, installed with the `langchain` extra: `pip install "llmswitch-sdk[langchain]"`. Nothing is imported unless you use it, and a missing `langchain-core` gives the install command.
-- `ChatLLMSwitch`, a LangChain chat model over `LLMSwitch` and `AsyncLLMSwitch`. It supports `invoke`, `ainvoke`, `stream`, `astream`, `bind_tools` (with `tool_choice`), `close` and `aclose`. Rate limits, retries, failover and `on_event` apply to its calls. It uses chat completions, so every provider that supports chat works, including Anthropic and Vertex AI.
+- Agentic features in `llmswitch.agentic`, installed with the `agentic` extra: `pip install "llmswitch-sdk[agentic]"`. Nothing is imported unless you use it, and a missing extra gives the install command.
+- `ChatLLMSwitch`, a chat model over `LLMSwitch` and `AsyncLLMSwitch`. It supports `invoke`, `ainvoke`, `stream`, `astream`, `bind_tools` (with `tool_choice`), `close` and `aclose`. Rate limits, retries, failover and `on_event` apply to its calls. It uses chat completions, so every provider that supports chat works, including Anthropic and Vertex AI.
 - `run_tool_loop` and `arun_tool_loop`: a bounded tool loop that runs the tools the model asks for and sends the results back. Tool failures, unknown tool names and malformed arguments are returned to the model as error tool messages. `max_steps` limits the model calls, and `ToolLoopLimitError` is raised when the limit is reached.
-- Message conversion between LangChain messages and llmswitch's chat format, including images in OpenAI and LangChain standard shapes.
-- Examples `examples/langchain_chat.py` and `examples/langchain_tool_loop.py`.
+- Message conversion between agentic message objects and llmswitch's chat format, including images in OpenAI and standard shapes.
+- Examples `examples/agentic_chat.py` and `examples/agentic_tool_loop.py`.
 - Fixed in this release, found in review of 0.1.2 behaviour:
-  - A stream the caller stops early no longer leaves the circuit breaker stuck half-open. Every later call used to fail until the process restarted.
+  - A stream the caller stops early no longer leaves the circuit breaker stuck half-open. Release the stream with `close()`, or let it go out of scope, and the breaker recovers. A stream holds only its own trial slot, so a late stream cannot release another call's slot.
   - The in-process rate-limit table no longer refuses every new user once it holds 10,000 windows. It drops the oldest window and logs a warning once.
+  - A timeout now counts as a failure for the circuit breaker, and triggers backup failover on chat, responses and streams, as it already did for embeddings. It is still not retried.
   - A denied request gives back its reservation, so it no longer uses up the window budget.
   - Anthropic honours a per-call `model` when no `deployment_name` is set, as the other providers do. A configured deployment still wins.
   - A prompt that Vertex AI blocks raises `ContentFilterError`, instead of a 404 for non-streaming calls or an empty stream.
@@ -23,7 +24,7 @@ All notable changes to this project are documented here. The format follows
   - Credential headers `x-api-key`, `x-goog-api-key`, `proxy-authorization` and `cookie` are redacted in `live_logs` output.
   - Anthropic logs a warning when it drops a content part it does not support.
   - `ToolLoopLimitError` is exported from `llmswitch`, and `ChatLLMSwitch` raises a clear error for image content outside user messages.
-- A CI job, `test-core-only`, that runs the tests without LangChain installed, so the core package is checked on its own.
+- A CI job, `test-core-only`, that runs the tests without the agentic extra installed, so the core package is checked on its own.
 
 ## [0.1.2] - 2026-10-23
 
