@@ -33,7 +33,15 @@ except ImportError as exc:  # pragma: no cover - exercised by tests that hide th
     ) from exc
 
 from ..ratelimit.tokenizer import count_tokens
-from .chat import Tool, _as_messages, _async_results, _sync_results, _tool_map
+from .chat import Tool, _as_messages, _tool_map
+from .events import AgentEventHandler, notify
+from .execution import (
+    ToolExecutionResult,
+    aexecute_tool_calls,
+    aretry_failed_tool_calls,
+    execute_tool_calls,
+    retry_failed_tool_calls,
+)
 
 REFLECTION_PROMPT = (
     "Evaluate if the assistant answer is complete and correct for the user request. "
@@ -66,6 +74,15 @@ class AgentConfig:
     max_input_tokens_per_step: int | None = None
     reflection_enabled: bool = True
     reflection_max_retries: int = 2
+    tool_timeout_seconds: float = 30.0
+    parallel_tools: bool = True
+    max_concurrency: int = 4
+    tool_retry_attempts: int = 0
+    tool_retry_backoff_seconds: float = 0.0
+    retry_on_tool_not_found: bool = False
+    retry_non_idempotent_tools: bool = False
+    interrupt_on_tool_error: bool = False
+    escalate_on_retry_exhausted: bool = False
 
     def __post_init__(self) -> None:
         if self.max_iterations < 1:
@@ -76,6 +93,14 @@ class AgentConfig:
             raise ValueError("max_input_tokens_per_step must be at least 1 when set")
         if self.reflection_max_retries < 0:
             raise ValueError("reflection_max_retries must not be negative")
+        if self.tool_timeout_seconds <= 0:
+            raise ValueError("tool_timeout_seconds must be positive")
+        if self.max_concurrency < 1:
+            raise ValueError("max_concurrency must be at least 1")
+        if self.tool_retry_attempts < 0:
+            raise ValueError("tool_retry_attempts must not be negative")
+        if self.tool_retry_backoff_seconds < 0:
+            raise ValueError("tool_retry_backoff_seconds must not be negative")
 
 
 @dataclass
@@ -86,7 +111,7 @@ class AgentStep:
     assistant_content: str
     tool_calls: list[Any] = field(default_factory=list)
     model_used: str | None = None
-    tool_results: list[ToolMessage] = field(default_factory=list)
+    tool_results: list[ToolExecutionResult] = field(default_factory=list)
 
 
 @dataclass
@@ -185,10 +210,12 @@ class Agent:
         model: BaseChatModel,
         tools: Sequence[Tool] | None = None,
         config: AgentConfig | None = None,
+        event_handler: AgentEventHandler | None = None,
     ) -> None:
         self.model = model
         self.tools = list(tools or [])
         self.config = config or AgentConfig()
+        self.event_handler = event_handler
         self._tool_map = _tool_map(self.tools) if self.tools else {}
 
     # --- public API -------------------------------------------------------------------------
@@ -207,6 +234,7 @@ class Agent:
             if budget.input_exceeded(tokens):
                 return self._stopped("max_input_tokens_per_step_exceeded", messages, steps,
                                      input_tokens=tokens, limit=budget.max_input_tokens_per_step)
+            notify(self.event_handler, "on_step_start", step_number, {"messages": len(messages)})
             answer = bound.invoke(messages)
             record = self._record(step_number, answer)
             messages.append(answer)
@@ -225,10 +253,15 @@ class Agent:
                 reflection_retries += 1
                 messages.append(HumanMessage(content=f"Please revise your answer. Feedback: {feedback}"))
                 steps.append(record)
+                notify(self.event_handler, "on_step_end", step_number, {"finished": False})
                 continue
-            record.tool_results = _sync_results(answer, self._tool_map)
-            messages.extend(record.tool_results)
+            record.tool_results = self._run_tools(step_number, answer)
+            messages.extend(result.as_tool_message() for result in record.tool_results)
             steps.append(record)
+            outcome = self._after_tools(record.tool_results, messages, steps)
+            if outcome is not None:
+                return outcome
+            notify(self.event_handler, "on_step_end", step_number, {"finished": False})
         return self._stopped("max_iterations_reached", messages, steps)
 
     async def ainvoke(self, input: str | list[BaseMessage], *, max_runtime_seconds: float | None = None) -> dict[str, Any]:
@@ -245,6 +278,7 @@ class Agent:
             if budget.input_exceeded(tokens):
                 return self._stopped("max_input_tokens_per_step_exceeded", messages, steps,
                                      input_tokens=tokens, limit=budget.max_input_tokens_per_step)
+            notify(self.event_handler, "on_step_start", step_number, {"messages": len(messages)})
             answer = await bound.ainvoke(messages)
             record = self._record(step_number, answer)
             messages.append(answer)
@@ -263,10 +297,15 @@ class Agent:
                 reflection_retries += 1
                 messages.append(HumanMessage(content=f"Please revise your answer. Feedback: {feedback}"))
                 steps.append(record)
+                notify(self.event_handler, "on_step_end", step_number, {"finished": False})
                 continue
-            record.tool_results = await _async_results(answer, self._tool_map)
-            messages.extend(record.tool_results)
+            record.tool_results = await self._arun_tools(step_number, answer)
+            messages.extend(result.as_tool_message() for result in record.tool_results)
             steps.append(record)
+            outcome = self._after_tools(record.tool_results, messages, steps)
+            if outcome is not None:
+                return outcome
+            notify(self.event_handler, "on_step_end", step_number, {"finished": False})
         return self._stopped("max_iterations_reached", messages, steps)
 
     # --- helpers ----------------------------------------------------------------------------
@@ -318,8 +357,63 @@ class Agent:
                 return verdict
         raise ValueError(f"The reflection check did not return a verdict in {REFLECTION_ATTEMPTS} attempts.")
 
-    @staticmethod
-    def _completed(status: str, answer: AIMessage, messages: list[BaseMessage], steps: list[AgentStep]) -> dict[str, Any]:
+    def _run_tools(self, step_number: int, answer: AIMessage) -> list[ToolExecutionResult]:
+        """Run the requested tools, then retry the retryable failures."""
+        cfg = self.config
+        calls = list(answer.tool_calls)
+        results = execute_tool_calls(
+            step=step_number, tool_calls=calls, tool_map=self._tool_map, timeout_s=cfg.tool_timeout_seconds,
+            parallel=cfg.parallel_tools, max_concurrency=cfg.max_concurrency, handler=self.event_handler,
+        )
+        if cfg.tool_retry_attempts and any(not result.ok for result in results):
+            results = retry_failed_tool_calls(
+                step=step_number, tool_calls=calls, results=results, tool_map=self._tool_map,
+                timeout_s=cfg.tool_timeout_seconds, attempts=cfg.tool_retry_attempts,
+                backoff_seconds=cfg.tool_retry_backoff_seconds,
+                retry_on_tool_not_found=cfg.retry_on_tool_not_found,
+                retry_non_idempotent=cfg.retry_non_idempotent_tools,
+                parallel=cfg.parallel_tools, max_concurrency=cfg.max_concurrency, handler=self.event_handler,
+            )
+        return results
+
+    async def _arun_tools(self, step_number: int, answer: AIMessage) -> list[ToolExecutionResult]:
+        """Async :meth:`_run_tools`."""
+        cfg = self.config
+        calls = list(answer.tool_calls)
+        results = await aexecute_tool_calls(
+            step=step_number, tool_calls=calls, tool_map=self._tool_map, timeout_s=cfg.tool_timeout_seconds,
+            parallel=cfg.parallel_tools, max_concurrency=cfg.max_concurrency, handler=self.event_handler,
+        )
+        if cfg.tool_retry_attempts and any(not result.ok for result in results):
+            results = await aretry_failed_tool_calls(
+                step=step_number, tool_calls=calls, results=results, tool_map=self._tool_map,
+                timeout_s=cfg.tool_timeout_seconds, attempts=cfg.tool_retry_attempts,
+                backoff_seconds=cfg.tool_retry_backoff_seconds,
+                retry_on_tool_not_found=cfg.retry_on_tool_not_found,
+                retry_non_idempotent=cfg.retry_non_idempotent_tools,
+                parallel=cfg.parallel_tools, max_concurrency=cfg.max_concurrency, handler=self.event_handler,
+            )
+        return results
+
+    def _after_tools(self, results: list[ToolExecutionResult], messages: list[BaseMessage],
+                     steps: list[AgentStep]) -> dict[str, Any] | None:
+        """Decide whether a step with failed tools ends the run. Returns the result, or ``None`` to go on."""
+        failed = [result for result in results if not result.ok]
+        if not failed:
+            return None
+        if self.config.escalate_on_retry_exhausted:
+            return {
+                "status": "stopped", "reason": "tool_retry_exhausted",
+                "failed_tools": [{"tool_name": r.tool_name, "error": r.error, "attempts": r.attempts} for r in failed],
+                "messages": messages, "steps": steps,
+            }
+        if self.config.interrupt_on_tool_error:
+            return {"status": "interrupted", "reason": "tool_error", "messages": messages, "steps": steps}
+        return None
+
+    def _completed(self, status: str, answer: AIMessage, messages: list[BaseMessage],
+                   steps: list[AgentStep]) -> dict[str, Any]:
+        notify(self.event_handler, "on_step_end", steps[-1].step, {"finished": True})
         return {"status": status, "output": answer.content, "messages": messages, "steps": steps}
 
     @staticmethod

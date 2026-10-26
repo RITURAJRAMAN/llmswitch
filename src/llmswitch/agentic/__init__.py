@@ -21,6 +21,12 @@ _EXPORTS = {
     "Agent": ".agent",
     "AgentConfig": ".agent",
     "AgentStep": ".agent",
+    "ToolExecutionResult": ".execution",
+    "idempotent": ".execution",
+    "AgentEventHandler": ".events",
+    "AgentEvent": ".events",
+    "CollectingEventHandler": ".events",
+    "LoggingEventHandler": ".events",
 }
 
 __all__ = sorted(_EXPORTS)
