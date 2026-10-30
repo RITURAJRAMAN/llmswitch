@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.5] - 2026-10-30
+
+### Added
+
+- Typed endpoints. `client.chat`, `client.embeddings` and `client.responses` are typed as public interfaces (`ChatAPI`, `ChatCompletionsAPI`, `ResponsesAPI` and their async versions). Editors and mypy show only the public members, such as `client.chat.completions.create` and `client.chat.completions.parse`. Private helper classes and methods no longer appear.
+- Typed constructor options. `LLMSwitch` and `AsyncLLMSwitch` take `**kwargs: Unpack[LLMSwitchOptions]`, so editors list the options as you type, and mypy reports misspelled or mistyped options.
+- Docstrings with `Args`, `Returns` and `Raises` for the clients and their endpoints, the errors, the main response models, and the exported agentic classes and functions.
+- README: instructions for installing and developing with `uv`.
+
+### Changed
+
+- The clients keep their implementation objects under private attributes (`_chat_impl`, `_embeddings_impl`, `_responses_impl`). The public attributes refer to the same objects, so the behaviour is unchanged.
+- `build_config` and `_reject_unknown_options` accept any mapping, not only a `dict`.
+
+Runtime behaviour is unchanged: validation, rate limits, retries and provider calls work as in 0.1.4.
+
 ## [0.1.4] - 2026-10-27
 
 ### Added

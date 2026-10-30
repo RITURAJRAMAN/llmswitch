@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llmswitch-sdk"
-version = "0.1.4"
+version = "0.1.5"
 description = "One Python client for chat completions, embeddings and the Responses API across OpenAI, Azure OpenAI, Azure AI Foundry, Anthropic and Vertex AI."
 readme = "README.md"
 license = "MIT"

@@ -5,7 +5,7 @@ Azure AI Foundry, Anthropic and Vertex AI. Switch providers by changing the cons
 call sites stay the same. Rate limits, retries, a circuit breaker, backup failover and context handling
 are built in, and they behave the same for every provider.
 
-Supported in 0.1.4: sync and async chat completions (streaming and structured output), embeddings, the
+Supported in 0.1.5: sync and async chat completions (streaming and structured output), embeddings, the
 Responses API, rate limiting, retries, a circuit breaker, backup failover, context truncation, batching,
 observability hooks, and the agentic features (the optional `agentic` extra): a chat model with a bounded
 tool loop, and an agent with reflection, tool execution, checkpoints and resume, model routing, specialists
