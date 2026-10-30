@@ -12,7 +12,7 @@ import json
 import logging
 import random
 import time
-from typing import Any
+from typing import Any, Unpack
 
 from ..constants import (
     DEFAULT_COMPLETION_CONTEXT_WINDOW,
@@ -58,6 +58,8 @@ from .failover import (
     validate_backup_config,
     validate_backup_for_registry,
 )
+from .interfaces import ChatAPI, EmbeddingsAPI, ResponsesAPI
+from .options import LLMSwitchOptions
 from .planning import plan_chat, plan_responses
 from .preprocess import (
     ProviderCache,
@@ -1122,7 +1124,12 @@ class LLMSwitch:
     Use it as a context manager, or call ``close()`` when you are done, to release the provider connections.
     """
 
-    def __init__(self, **kwargs: Any) -> None:
+    # Typed for editors and mypy only. Each is set in __init__; the annotations add no runtime attribute.
+    chat: ChatAPI
+    embeddings: EmbeddingsAPI
+    responses: ResponsesAPI
+
+    def __init__(self, **kwargs: Unpack[LLMSwitchOptions]) -> None:
         """Create a client for one provider.
 
         Options that no provider defines are rejected. Options that another provider uses are accepted and ignored.
@@ -1204,27 +1211,31 @@ class LLMSwitch:
                 self.config.model,
             ),
         )
-        # Set up chat and embedding interfaces
-        self.chat = _Chat(self.config, self.rate_limiter)
-        self.embeddings = _Embeddings(self.config, self.rate_limiter)
-        self.responses = _Responses(self.config, self.rate_limiter)
-        self.chat.completions._on_event = on_event
-        self.embeddings._on_event = on_event
-        self.responses._on_event = on_event
+        # Set up chat and embedding interfaces. The implementations are kept under private names, because the
+        # public attributes are typed as the public interfaces, which hide their helper methods.
+        self._chat_impl = _Chat(self.config, self.rate_limiter)
+        self._embeddings_impl = _Embeddings(self.config, self.rate_limiter)
+        self._responses_impl = _Responses(self.config, self.rate_limiter)
+        self.chat = self._chat_impl
+        self.embeddings = self._embeddings_impl
+        self.responses = self._responses_impl
+        self._chat_impl.completions._on_event = on_event
+        self._embeddings_impl._on_event = on_event
+        self._responses_impl._on_event = on_event
         if share_clients:
-            self.chat.completions._share_clients = True
-            self.embeddings._share_clients = True
-            self.responses._share_clients = True
+            self._chat_impl.completions._share_clients = True
+            self._embeddings_impl._share_clients = True
+            self._responses_impl._share_clients = True
         if circuit_breaker:
-            self.chat.completions._breaker_enabled = True
-            self.responses._breaker_enabled = True
+            self._chat_impl.completions._breaker_enabled = True
+            self._responses_impl._breaker_enabled = True
             if isinstance(circuit_breaker, dict):
-                breaker_config = {
+                breaker_config: dict[str, Any] = {
                     k: circuit_breaker[k] for k in ("failure_threshold", "reset_timeout")
                     if k in circuit_breaker
                 }
-                self.chat.completions._breaker_config = breaker_config
-                self.responses._breaker_config = dict(breaker_config)
+                self._chat_impl.completions._breaker_config = breaker_config
+                self._responses_impl._breaker_config = dict(breaker_config)
 
     def __repr__(self) -> str:
         return (
@@ -1262,7 +1273,7 @@ class LLMSwitch:
         Returns:
             None
         """
-        self.chat.completions.close()
-        self.embeddings.close()
-        self.responses.close()
+        self._chat_impl.completions.close()
+        self._embeddings_impl.close()
+        self._responses_impl.close()
         self.rate_limiter.close()

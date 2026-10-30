@@ -75,6 +75,19 @@ Optional extras:
 The extras `anthropic`, `azure-foundry` and `vertexai` are still accepted so existing install commands
 keep working. They add nothing new.
 
+**With uv.** [uv](https://docs.astral.sh/uv/) installs the same package:
+
+```bash
+uv pip install "llmswitch-sdk[agentic]"
+```
+
+Or create a project environment first:
+
+```bash
+uv venv && source .venv/bin/activate
+uv pip install "llmswitch-sdk[agentic]"
+```
+
 ## Quick start
 
 ```python
@@ -940,6 +953,16 @@ pytest
 ruff check src tests examples
 mypy
 ```
+
+With uv, the same setup is:
+
+```bash
+uv venv && source .venv/bin/activate
+uv pip install -e ".[all,dev]"
+pytest
+```
+
+`uv pip install -e ".[redis,dev]"` gives the core environment, without the agentic extra.
 
 The tests use mocks and do not contact any provider. The agentic tests skip when the `agentic` extra is not
 installed, so `pip install -e ".[redis,dev]"` runs the core suite on its own. CI runs the full suite, the core

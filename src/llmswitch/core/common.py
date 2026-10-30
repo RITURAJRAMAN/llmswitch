@@ -34,7 +34,7 @@ def _known_option_names() -> set[str]:
     return names
 
 
-def _reject_unknown_options(kwargs: dict[str, Any]) -> None:
+def _reject_unknown_options(kwargs: Mapping[str, Any]) -> None:
     """Fail on options that no provider defines, so a typo is not silently ignored."""
     known = _known_option_names()
     unknown = sorted(name for name in kwargs if name not in known)
@@ -51,7 +51,7 @@ def _reject_unknown_options(kwargs: dict[str, Any]) -> None:
     )
 
 
-def build_config(kwargs: dict[str, Any]) -> Any:
+def build_config(kwargs: Mapping[str, Any]) -> Any:
     """Validate constructor kwargs against the provider's configuration model."""
     provider = kwargs.get("provider")
     if not isinstance(provider, str):
