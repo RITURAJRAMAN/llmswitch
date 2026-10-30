@@ -61,7 +61,19 @@ _IDEMPOTENT_KEY = "llmswitch_idempotent"
 
 @dataclass
 class ToolExecutionResult:
-    """The outcome of one tool call."""
+    """The outcome of one tool call.
+
+    Attributes:
+        tool_call_id (str): The id of the call. The tool message must carry the same id.
+        tool_name (str): The tool that was called.
+        args (dict): The arguments the model sent.
+        ok (bool): True when the tool returned a value.
+        content (str): The text sent back to the model, the value or the error.
+        error_kind (str): ``none`` on success, or ``parse``, ``not_found``, ``timeout`` or ``tool_error``.
+        error (str, optional): The error message, on failure.
+        duration_s (float): How long the call took, in seconds.
+        attempts (int): How many times the call ran, counting retries. Defaults to 1.
+    """
 
     tool_call_id: str
     tool_name: str
@@ -75,19 +87,34 @@ class ToolExecutionResult:
 
     @property
     def timed_out(self) -> bool:
+        """Whether the call stopped at its time limit.
+
+        Returns:
+            bool: True when ``error_kind`` is ``timeout``.
+        """
         return self.error_kind == "timeout"
 
     def as_tool_message(self) -> ToolMessage:
-        """The result as a tool message for the conversation."""
+        """The result as a tool message, ready to add to the conversation.
+
+        Returns:
+            ToolMessage: The message, with the content of the result and the id of the call.
+        """
         return ToolMessage(content=self.content, tool_call_id=self.tool_call_id,
                            status="success" if self.ok else "error")
 
 
 def idempotent(tool: Tool) -> Tool:
-    """Mark a tool as safe to retry after an error, and return it.
+    """Mark a tool as safe to retry after a failure, and return the tool.
 
-    Only mark a tool idempotent when running it twice has the same effect as running it once,
-    for example a read-only lookup. Works on plain functions and on tool objects.
+    Only mark a tool idempotent when running it twice has the same effect as running it once, for example a read-only
+    lookup. It works on plain functions and on tool objects.
+
+    Args:
+        tool: The tool to mark: a plain function or a LangChain tool object.
+
+    Returns:
+        The same tool, marked.
     """
     if isinstance(tool, BaseTool):
         tool.metadata = {**(tool.metadata or {}), _IDEMPOTENT_KEY: True}

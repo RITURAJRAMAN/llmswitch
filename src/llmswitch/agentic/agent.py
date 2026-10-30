@@ -76,16 +76,38 @@ _PHASES = ("awaiting_reflection", "awaiting_tools", "tools_done", "reflection_fe
 
 @dataclass(frozen=True)
 class AgentConfig:
-    """Limits and behaviour for an :class:`Agent`.
+    """Limits and behaviour of an ``Agent`` run. Every field has a default.
 
-    ``max_iterations`` is the most model calls one run may make to answer or to request tools; the
-    reflection checks are not counted. ``max_runtime_seconds`` is the
-    wall-clock limit for one run. ``reflection_max_retries`` is how many revisions a rejected answer
-    may get before the last answer is returned. ``max_input_tokens_per_step`` stops a run before a
-    call whose input would exceed the limit, using the library's own token count (an estimate).
-    ``tool_timeout_seconds`` limits each tool call; ``tool_retry_attempts`` retries the failures that
-    are safe to retry. ``interrupt_on_tool_error`` pauses the run after a failed tool, and
-    ``escalate_on_retry_exhausted`` stops it when a failure remains after the retries.
+    Budgets:
+        max_iterations (int): The most model calls one run may make to answer or to request tools. Reflection checks
+            are not counted. Defaults to 12.
+        max_runtime_seconds (float): The wall-clock limit for one run. Defaults to 180.
+        max_input_tokens_per_step (int, optional): Stops a run before a call whose input would be larger, counted by
+            the library's own estimate. None means no limit.
+
+    Reflection:
+        reflection_enabled (bool): Check each answer with a second model call that returns a JSON verdict. Defaults to
+            True.
+        reflection_max_retries (int): How many revisions a rejected answer may get before the last answer is returned.
+            Defaults to 2.
+
+    Tools:
+        tool_choice (str, optional): The ``tool_choice`` sent with each step. Defaults to ``"auto"``.
+        tool_timeout_seconds (float): The most time one tool call may take. Defaults to 30.
+        tool_isolation (str): ``"thread"`` (default) runs a sync tool on a thread. ``"process"`` runs it in a forked
+            child process that is killed at the timeout, so its work stops. POSIX only.
+        parallel_tools (bool): Run the tool calls of one step at the same time. Defaults to True.
+        max_concurrency (int): The most tool calls running at once. Defaults to 4.
+        tool_retry_attempts (int): Extra rounds for failures that are safe to retry. Defaults to 0.
+        tool_retry_backoff_seconds (float): The pause between retry rounds. Defaults to 0.
+        retry_on_tool_not_found (bool): Retry a call to a tool name that does not exist. Defaults to False.
+        retry_non_idempotent_tools (bool): Retry a failed tool that is not marked ``idempotent``. Defaults to False.
+        interrupt_on_tool_error (bool): Pause the run after a failed tool, so it can be resumed. Defaults to False.
+        escalate_on_retry_exhausted (bool): Stop the run when a tool failure remains after its retries. Defaults to
+            False.
+
+    Raises:
+        ValueError: A value is out of range, for example a negative budget or an unknown ``tool_isolation``.
     """
 
     max_iterations: int = 12
@@ -130,7 +152,15 @@ class AgentConfig:
 
 @dataclass
 class AgentStep:
-    """One model call in a run, and the tool results it caused."""
+    """One model call in a run, and the tool results it caused.
+
+    Attributes:
+        step (int): The step number, counted from 1.
+        assistant_content (str): The text of the model's answer for this step.
+        tool_calls (list): The tool calls the model asked for in this step.
+        model_used (str, optional): The model that answered this step. Shows which model a routing policy chose.
+        tool_results (list[ToolExecutionResult]): The result of each tool call, in order.
+    """
 
     step: int
     assistant_content: str
@@ -280,15 +310,13 @@ def _result_from_entry(entry: dict[str, Any]) -> ToolExecutionResult:
 
 
 class Agent:
-    """A think-act-observe agent over a chat model.
+    """A loop of model calls and tool calls, with budgets, reflection, checkpoints and routing.
 
-    ``model`` is a :class:`~llmswitch.agentic.ChatLLMSwitch` (or any chat model that supports
-    ``bind_tools``). ``tools`` are tool objects or plain functions. ``checkpoint_store`` decides where
-    checkpoints go; the default keeps them in memory, and :class:`~llmswitch.agentic.FileCheckpointStore`
-    keeps them on disk so a run can resume after a restart.
+    Each step calls the model. If the model asks for tools, they run and their results go back to the model. If it
+    answers, the answer is checked by reflection, and a rejected answer is revised. A run ends with a result
+    dictionary whose ``status`` says how it ended. A run that is ``interrupted`` can be continued with ``resume``.
 
-    Usage::
-
+    Example:
         agent = Agent(model=llm, tools=[get_weather], config=AgentConfig(max_iterations=6))
         result = agent.invoke("Weather in Paris, then a short summary.")
         if result["status"] == "interrupted":
@@ -306,6 +334,23 @@ class Agent:
         routing_policy: BaseRoutingPolicy | None = None,
         router: Callable[[list[BaseMessage], int], BaseChatModel] | None = None,
     ) -> None:
+        """Create an agent around a chat model.
+
+        Args:
+            model (ChatLLMSwitch): The chat model that makes the decisions. It must support ``bind_tools``.
+            tools (list, optional): Tool objects or plain functions with docstrings. Defaults to no tools.
+            config (AgentConfig, optional): Limits and behaviour. Defaults to ``AgentConfig()``.
+            event_handler (AgentEventHandler, optional): Receives the events of each run.
+            checkpoint_store (CheckpointStore, optional): Where checkpoints are kept. Defaults to an in-memory store.
+                Use ``FileCheckpointStore`` to resume a run in another process.
+            fallback_model (ChatLLMSwitch, optional): A second model for routing. Used by the routing policy or by
+                ``router``.
+            routing_policy (BaseRoutingPolicy, optional): Chooses between ``model`` and ``fallback_model`` for each
+                step.
+            router (callable, optional): A function ``router(messages, step)`` that returns the model for a step. It
+                takes
+                precedence over ``routing_policy``.
+        """
         self.model = model
         self.fallback_model = fallback_model
         self.routing_policy = routing_policy
@@ -321,7 +366,22 @@ class Agent:
     # --- public API -------------------------------------------------------------------------
 
     def invoke(self, input: str | list[BaseMessage], *, max_runtime_seconds: float | None = None) -> dict[str, Any]:
-        """Run the loop synchronously and return the result dictionary."""
+        """Run the agent on a task and return the result when it ends.
+
+        Args:
+            input (str or list): The task as text, or the conversation as LangChain messages.
+            max_runtime_seconds (float, optional): A shorter wall-clock limit for this run. It cannot lengthen the limit
+                in
+                the config.
+
+        Returns:
+            dict: The result. ``status`` is one of ``completed``, ``completed_with_reflection_limit``, ``interrupted``
+                or
+            ``stopped``. ``output`` holds the final answer when there is one. ``reason`` says why a run was interrupted
+                or
+            stopped, and ``checkpoint_id`` is set for an interrupted run. ``messages`` and ``steps`` give the full
+                history.
+        """
         routing = dict(self._routing_state)
         result = self._drive(
             messages=_as_messages(input), steps=[], step=1, budget=self._budget(max_runtime_seconds),
@@ -331,7 +391,15 @@ class Agent:
         return result
 
     async def ainvoke(self, input: str | list[BaseMessage], *, max_runtime_seconds: float | None = None) -> dict[str, Any]:
-        """Run the loop asynchronously and return the result dictionary."""
+        """Async :meth:`invoke`. Tool timeouts cancel a tool that is a coroutine.
+
+        Args:
+            input (str or list): The task as text, or the conversation as LangChain messages.
+            max_runtime_seconds (float, optional): A shorter wall-clock limit for this run.
+
+        Returns:
+            An awaitable that gives the result dictionary described in :meth:`invoke`.
+        """
         routing = dict(self._routing_state)
         result = await self._adrive(
             messages=_as_messages(input), steps=[], step=1, budget=self._budget(max_runtime_seconds),
@@ -343,9 +411,16 @@ class Agent:
     def resume(self, checkpoint_id: str, user_feedback: str | None = None) -> dict[str, Any]:
         """Continue an interrupted run from its checkpoint.
 
-        ``user_feedback`` is added to the conversation. If the checkpoint is at a model answer or at tools
-        that have not started, the feedback replaces that answer, and the step is redone. A checkpoint
-        whose tools have started cannot take feedback, because that work may already have happened.
+        Args:
+            checkpoint_id (str): The ``checkpoint_id`` from the interrupted result.
+            user_feedback (str, optional): Text added to the conversation. When the checkpoint is at a model answer, or
+                at
+                tools that have not started, the feedback replaces that answer and the step runs again.
+
+        Returns:
+            dict: The result of the continued run, in the same form as :meth:`invoke`. A checkpoint whose tools may
+                already
+            have run is returned as ``interrupted`` with reason ``uncertain_tool_execution``, and is not continued.
         """
         plan = self._restore(checkpoint_id, user_feedback)
         if "status" in plan:  # already a final result, such as an uncertain tool execution
@@ -354,7 +429,15 @@ class Agent:
         return result
 
     async def aresume(self, checkpoint_id: str, user_feedback: str | None = None) -> dict[str, Any]:
-        """Async :meth:`resume`."""
+        """Async :meth:`resume`.
+
+        Args:
+            checkpoint_id (str): The ``checkpoint_id`` from the interrupted result.
+            user_feedback (str, optional): Text added to the conversation, as in :meth:`resume`.
+
+        Returns:
+            An awaitable that gives the result dictionary described in :meth:`invoke`.
+        """
         plan = self._restore(checkpoint_id, user_feedback)
         if "status" in plan:
             return plan

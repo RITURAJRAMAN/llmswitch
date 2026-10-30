@@ -100,10 +100,29 @@ def invoke_specialists(
     contracts: Mapping[str, SpecialistContract] | None = None,
     required_capabilities: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Run the selected specialists on ``task`` and return one row per specialist.
+    """Run the specialists on one task and return one row per specialist.
 
-    ``shared_state`` gets each specialist's output under ``specialist_outputs.<name>``, and the state (or
-    the keys in ``shared_state_keys``, bounded by ``shared_state_max_bytes``) is added to the task prompt.
+    Rows come back in the order the specialists were given. A specialist that raises gets an ``error`` row, and the
+    others still run. A shared time limit is split among the specialists: each one gets what is left of it.
+
+    Args:
+        task (str): The task that every specialist receives.
+        specialists (dict[str, Agent]): The specialists, by name.
+        parallel (bool): Run the specialists at the same time. Defaults to True.
+        max_concurrency (int): The most specialists running at once. Defaults to 4.
+        max_runtime_seconds (float, optional): The shared time limit. A specialist still running at the limit gets a
+            ``timeout`` row.
+        shared_state (SharedState, optional): Each specialist's output is stored under ``specialist_outputs.<name>``,
+            and the state is added to each prompt.
+        shared_state_keys (set, optional): The keys of the shared state to include in each prompt.
+        shared_state_max_bytes (int): The most bytes of shared state put in a prompt. Defaults to 16000.
+        contracts (dict, optional): Each specialist's :class:`SpecialistContract`, by name. Adds ``weight`` and
+            ``capabilities`` to the rows.
+        required_capabilities (set, optional): Only specialists whose contracts cover these capabilities are asked.
+
+    Returns:
+        list[dict]: One row per specialist, with ``specialist``, ``status`` (``completed``, ``stopped``,
+        ``interrupted``, ``error`` or ``timeout``), ``output``, ``reason``, ``steps``, ``checkpoint_id`` and ``raw``.
     """
     deadline = _check_runtime(max_runtime_seconds)
     items = list(filter_specialists_by_capabilities(specialists, contracts, required_capabilities).items())
@@ -164,7 +183,23 @@ async def ainvoke_specialists(
     contracts: Mapping[str, SpecialistContract] | None = None,
     required_capabilities: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Async :func:`invoke_specialists`. A specialist that runs out of time is cancelled."""
+    """Async :func:`invoke_specialists`. A specialist that runs out of time is cancelled.
+
+    Args:
+        task (str): The task that every specialist receives.
+        specialists (dict[str, Agent]): The specialists, by name.
+        parallel (bool): Run the specialists at the same time. Defaults to True.
+        max_concurrency (int): The most specialists running at once. Defaults to 4.
+        max_runtime_seconds (float, optional): The shared time limit.
+        shared_state (SharedState, optional): Shared state, as in :func:`invoke_specialists`.
+        shared_state_keys (set, optional): The keys of the shared state to include in each prompt.
+        shared_state_max_bytes (int): The most bytes of shared state put in a prompt. Defaults to 16000.
+        contracts (dict, optional): Each specialist's :class:`SpecialistContract`, by name.
+        required_capabilities (set, optional): Only specialists whose contracts cover these capabilities are asked.
+
+    Returns:
+        An awaitable that gives the rows described in :func:`invoke_specialists`.
+    """
     deadline = _check_runtime(max_runtime_seconds)
     items = list(filter_specialists_by_capabilities(specialists, contracts, required_capabilities).items())
     if not items:
@@ -199,10 +234,18 @@ async def ainvoke_specialists(
 
 
 def make_subagent_tool(*, name: str, description: str, agent: Agent) -> Callable[[str], str]:
-    """Wrap an agent as a function that takes a task and returns a JSON summary of the run.
+    """Wrap an agent as a tool, so another agent can delegate to it.
 
-    The summary has ``status``, ``output``, ``reason`` and ``steps``. Give the function to another
-    agent's ``tools`` list, and the calling model decides when to delegate.
+    The tool takes the task as text and returns a JSON summary of the run. The calling model decides when to use it.
+
+    Args:
+        name (str): The name of the tool, as the calling model sees it.
+        description (str): What the tool does, as the calling model reads it. Write it for the model.
+        agent (Agent): The agent that does the work.
+
+    Returns:
+        callable: A function ``tool(task: str) -> str``, whose result is a JSON string with ``status``, ``output``,
+        ``reason`` and ``steps``.
     """
 
     def delegate(task: str) -> str:
@@ -217,6 +260,13 @@ def make_subagent_tool(*, name: str, description: str, agent: Agent) -> Callable
 
 
 def make_specialist_tools(specs: Mapping[str, tuple[str, Agent]]) -> list[Callable[[str], str]]:
-    """Wrap several agents as tools. ``specs`` maps each tool name to ``(description, agent)``."""
+    """Wrap several agents as tools, one per entry.
+
+    Args:
+        specs (dict): Each tool name mapped to a tuple ``(description, agent)``.
+
+    Returns:
+        list[callable]: One tool per entry, as :func:`make_subagent_tool` builds them.
+    """
     return [make_subagent_tool(name=name, description=description, agent=agent)
             for name, (description, agent) in specs.items()]

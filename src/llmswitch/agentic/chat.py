@@ -77,13 +77,27 @@ _ASYNC_CLIENT_LOCK = threading.Lock()
 
 
 class ChatLLMSwitch(BaseChatModel):
-    """
-    Chat model over llmswitch.
+    """A chat model for agents, built on ``LLMSwitch`` and ``AsyncLLMSwitch``.
 
-    Options that the model itself understands are fields: ``temperature``, ``max_tokens``,
-    ``stop``, and ``call_options`` (extra keyword arguments sent with every request).
-    Every other keyword argument is a switch option, passed to ``LLMSwitch`` (for example
-    ``provider``, ``api_key``, ``model``, ``endpoint``, ``backup``, ``on_event``).
+    It is a LangChain chat model, so it works with ``invoke``, ``ainvoke``, ``stream``, ``astream``, ``bind_tools``
+    and the rest of the chat model interface. Rate limits, retries, the circuit breaker, failover and ``on_event``
+    apply to its calls, the same as for ``LLMSwitch``. Use it with ``Agent``, ``run_tool_loop`` or on its own.
+
+    Options that the model itself understands are fields. Every other keyword argument is a switch option, passed to
+    ``LLMSwitch``: ``provider``, ``api_key``, ``model``, ``endpoint``, ``backup``, ``on_event`` and so on.
+
+    Attributes:
+        temperature (float, optional): Sampling temperature. Not sent when None.
+        max_tokens (int, optional): The most output tokens per call. Not sent when None.
+        stop (list[str], optional): Stop sequences. Not supported with ``api="responses"``.
+        call_options (dict): Extra keyword arguments sent with every request, for example
+            ``{"thinking": {"type": "enabled", "budget_tokens": 1024}}`` for Anthropic.
+        api (str): ``"chat"`` (default) for chat completions, or ``"responses"`` for the Responses API. The Responses
+            API is available for ``openai`` and ``azure_openai`` only.
+
+    Example:
+        llm = ChatLLMSwitch(provider="openai", api_key="sk-...", model="gpt-4o-mini", max_tokens=300)
+        print(llm.invoke("Say hello in French.").content)
     """
 
     temperature: float | None = None
@@ -97,6 +111,20 @@ class ChatLLMSwitch(BaseChatModel):
     _async_switch: Any = PrivateAttr(default=None)
 
     def __init__(self, **kwargs: Any) -> None:
+        """Create a chat model.
+
+        Options that the model itself understands are set as fields (``temperature``, ``max_tokens``, ``stop``,
+        ``call_options`` and ``api``). Every other keyword argument is a switch option, passed to ``LLMSwitch``, so the
+        same options apply: ``provider``, ``api_key``, ``model``, ``endpoint``, ``backup``, ``on_event``, the rate
+            limits and
+        the retry settings.
+
+        Args:
+            **kwargs: The model fields and the switch options described in the class docstring.
+
+        Raises:
+            ConfigurationError: A switch option is not defined by any provider.
+        """
         own_fields = set(type(self).model_fields)
         switch_options = {key: kwargs.pop(key) for key in list(kwargs) if key not in own_fields}
         super().__init__(**kwargs)
@@ -242,11 +270,17 @@ class ChatLLMSwitch(BaseChatModel):
         tool_choice: str | None = None,
         **kwargs: Any,
     ) -> Runnable[Any, AIMessage]:
-        """Return a copy of the model that sends ``tools`` with every request.
+        """Return a copy of the model that sends these tools with every request.
 
-        ``tools`` may be tool objects, Pydantic classes, plain functions or OpenAI-style
-        dicts. ``tool_choice`` accepts ``"auto"``, ``"none"``, ``"required"`` (or ``"any"``),
-        or the name of one tool to force.
+        Args:
+            tools (list): Tool objects, plain functions with docstrings, Pydantic classes, or OpenAI-style dicts.
+            tool_choice (str or bool, optional): ``"auto"`` lets the model decide. ``"none"`` (or False) forbids tools.
+                ``"required"`` or ``"any"`` forces a tool call. A tool name forces that tool. Defaults to None, which
+                leaves the choice to the provider.
+            **kwargs: Passed to the request, as for ``invoke``.
+
+        Returns:
+            ChatLLMSwitch: A model with the tools bound. Its replies can contain ``tool_calls``.
         """
         formatted = [convert_to_openai_tool(tool) for tool in tools]
         if tool_choice is not None:
@@ -336,15 +370,23 @@ def run_tool_loop(
     *,
     max_steps: int = 5,
 ) -> list[BaseMessage]:
-    """Run a bounded tool loop and return the whole conversation.
+    """Run a model with tools until it answers without asking for one, and return the conversation.
 
-    The model is bound to ``tools``. Each turn that requests tools runs them in order, and
-    their results go back to the model as tool messages. A failed tool, an unknown tool
-    name or malformed arguments become error tool messages, so the model can recover.
+    Each turn that asks for tools runs them in order, and the results go back to the model as tool messages. A failed
+    tool, an unknown tool name or malformed arguments become error messages, so the model can recover.
 
-    ``max_steps`` is the most model calls allowed. If the model still asks for tools on
-    the last one, :class:`ToolLoopLimitError` is raised. The returned list ends with the
-    model's final answer.
+    Args:
+        model (ChatLLMSwitch): The chat model to run. It must support ``bind_tools``.
+        messages (list): The conversation so far, as LangChain messages. Add the user's question as the last message.
+        tools (list): The tools the model may call. Plain functions need a docstring and a name.
+        max_steps (int): The most model calls allowed. Defaults to 5.
+
+    Returns:
+        list: The full conversation, from the input messages to the model's final answer, with every tool call and
+        result in order.
+
+    Raises:
+        ToolLoopLimitError: The model still asked for tools after ``max_steps`` model calls.
     """
     _check_steps(max_steps)
     mapping = _tool_map(tools)
@@ -368,7 +410,20 @@ async def arun_tool_loop(
     *,
     max_steps: int = 5,
 ) -> list[BaseMessage]:
-    """Async :func:`run_tool_loop`. Tools run one after another, so their order is kept."""
+    """Async :func:`run_tool_loop`. Tools run one after another, in the same order.
+
+    Args:
+        model (ChatLLMSwitch): The chat model to run. It must support ``bind_tools``.
+        messages (list): The conversation so far, as LangChain messages.
+        tools (list): The tools the model may call.
+        max_steps (int): The most model calls allowed. Defaults to 5.
+
+    Returns:
+        An awaitable that gives the full conversation, as :func:`run_tool_loop` does.
+
+    Raises:
+        ToolLoopLimitError: The model still asked for tools after ``max_steps`` model calls.
+    """
     _check_steps(max_steps)
     mapping = _tool_map(tools)
     bound = model.bind_tools(list(tools))

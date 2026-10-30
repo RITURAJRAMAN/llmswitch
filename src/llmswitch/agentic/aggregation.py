@@ -42,7 +42,15 @@ _FENCED_JSON = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 @dataclass
 class AggregatedResult:
-    """The consensus value, the rows it was built from, the strategy used, and how sure it is."""
+    """The result of combining specialist answers.
+
+    Attributes:
+        consensus (object): The combined answer. None when no specialist gave an answer.
+        inputs (list[dict]): The rows the answer was built from.
+        strategy (str): The aggregator that combined them, such as ``majority_vote``.
+        confidence (float, optional): How strongly the answer is supported, from 0 to 1.
+        metadata (dict): Extra details, such as the vote counts or the merge conflicts.
+    """
 
     consensus: Any
     inputs: list[dict[str, Any]]
@@ -55,6 +63,15 @@ class BaseAggregator:
     """Base class for aggregators. Subclasses implement :meth:`aggregate`."""
 
     def aggregate(self, results: list[dict[str, Any]]) -> AggregatedResult:
+        """Combine specialist rows into one result. Subclasses implement this.
+
+        Args:
+            results (list[dict]): The rows from ``invoke_specialists``, each with ``specialist``, ``status`` and
+                ``output``.
+
+        Returns:
+            AggregatedResult: The combined answer.
+        """
         raise NotImplementedError
 
 
@@ -111,13 +128,33 @@ def _weight(row: dict[str, Any], weight_key: str) -> float:
 
 
 class MajorityVoteAggregator(BaseAggregator):
-    """Pick the output that the most specialists gave."""
+    """Picks the answer that the most specialists gave.
+
+    Answers are compared as JSON, so ``{"a": 1}`` and ``'{"a": 1}'`` count as the same answer. A tie goes to the answer
+    that appeared first.
+    """
 
     def __init__(self, *, value_key: str = "output", include_failed: bool = False) -> None:
+        """Create the aggregator.
+
+        Args:
+            value_key (str): The row key that holds the answer. Defaults to ``output``.
+            include_failed (bool): Count rows whose status is ``error``, ``timeout``, ``interrupted`` or ``stopped``.
+                Defaults to False.
+        """
         self.value_key = value_key
         self.include_failed = include_failed
 
     def aggregate(self, results: list[dict[str, Any]]) -> AggregatedResult:
+        """Pick the answer that the most rows gave.
+
+        Args:
+            results (list[dict]): The specialist rows.
+
+        Returns:
+            AggregatedResult: The most common answer. ``confidence`` is its share of the rows, and ``metadata["votes"]``
+            counts each answer.
+        """
         rows = _eligible(results, self.include_failed)
         answers = _answers(rows, self.value_key)
         if not answers:
@@ -138,14 +175,36 @@ class MajorityVoteAggregator(BaseAggregator):
 
 
 class WeightedScoreAggregator(BaseAggregator):
-    """Pick the output with the largest total weight."""
+    """Picks the answer with the largest total weight.
+
+    Each row's ``weight`` comes from its specialist's contract. A row without a weight counts as 1.
+    """
 
     def __init__(self, *, value_key: str = "output", weight_key: str = "weight", include_failed: bool = False) -> None:
+        """Create the aggregator.
+
+        Args:
+            value_key (str): The row key that holds the answer. Defaults to ``output``.
+            weight_key (str): The row key that holds the weight. Defaults to ``weight``.
+            include_failed (bool): Count rows whose status is ``error``, ``timeout``, ``interrupted`` or ``stopped``.
+                Defaults to False.
+        """
         self.value_key = value_key
         self.weight_key = weight_key
         self.include_failed = include_failed
 
     def aggregate(self, results: list[dict[str, Any]]) -> AggregatedResult:
+        """Pick the answer with the largest total weight.
+
+        Args:
+            results (list[dict]): The specialist rows.
+
+        Returns:
+            AggregatedResult: The heaviest answer. ``confidence`` is its share of the total weight.
+
+        Raises:
+            ValueError: A weight is negative, infinite or not a number.
+        """
         rows = _eligible(results, self.include_failed)
         totals: dict[str, float] = {}
         values: dict[str, Any] = {}
@@ -173,20 +232,43 @@ class WeightedScoreAggregator(BaseAggregator):
 
 
 class JsonMergeAggregator(BaseAggregator):
-    """Merge the JSON-object outputs key by key. With no object outputs, fall back to a majority vote.
+    """Merges specialists' JSON-object answers into one object, key by key.
 
-    ``conflict_policy`` decides a key that two specialists set differently: ``last_writer_wins`` keeps the
-    later value, ``first_writer_wins`` keeps the earlier one, and ``error`` raises ``ValueError``. Every
-    conflict is listed in the result's ``metadata["conflicts"]``.
+    When no answer is an object, it falls back to a majority vote.
     """
 
     def __init__(self, *, conflict_policy: str = "last_writer_wins", include_failed: bool = False) -> None:
+        """Create the aggregator.
+
+        Args:
+            conflict_policy (str): What to do when two specialists give the same key different values.
+                ``last_writer_wins``
+                (default) keeps the later value, ``first_writer_wins`` keeps the earlier one, and ``error`` raises.
+            include_failed (bool): Count rows whose status is ``error``, ``timeout``, ``interrupted`` or ``stopped``.
+                Defaults to False.
+
+        Raises:
+            ValueError: ``conflict_policy`` is not one of the three names above.
+        """
         if conflict_policy not in _CONFLICT_POLICIES:
             raise ValueError("conflict_policy must be one of 'last_writer_wins', 'first_writer_wins' or 'error'")
         self.conflict_policy = conflict_policy
         self.include_failed = include_failed
 
     def aggregate(self, results: list[dict[str, Any]]) -> AggregatedResult:
+        """Merge the object answers into one object.
+
+        Args:
+            results (list[dict]): The specialist rows.
+
+        Returns:
+            AggregatedResult: The merged object, with ``metadata["conflicts"]`` listing every key that was set
+                differently.
+            When no answer is an object, the majority vote instead.
+
+        Raises:
+            ValueError: A key conflicts and the policy is ``error``.
+        """
         rows = _eligible(results, self.include_failed)
         if not rows:
             return AggregatedResult(consensus=None, inputs=[], strategy="json_merge", confidence=0.0)
@@ -242,9 +324,23 @@ def aggregate_specialists(
     contracts: Mapping[str, SpecialistContract] | None = None,
     required_capabilities: set[str] | None = None,
 ) -> AggregatedResult:
-    """Run the specialists on ``task`` and aggregate their rows. The default aggregator is :class:`JsonMergeAggregator`.
+    """Run the specialists on a task, then combine their answers.
 
-    To weigh the specialists by their contracts, pass ``contracts`` and a :class:`WeightedScoreAggregator`.
+    Args:
+        task (str): The task that every specialist receives.
+        specialists (dict[str, Agent]): The specialists, by name.
+        aggregator (BaseAggregator, optional): How to combine the answers. Defaults to ``JsonMergeAggregator``.
+        parallel (bool): Run the specialists at the same time. Defaults to True.
+        max_concurrency (int): The most specialists running at once. Defaults to 4.
+        max_runtime_seconds (float, optional): The shared time limit for all the specialists.
+        shared_state (SharedState, optional): Shared state that each specialist can read and write.
+        shared_state_keys (set, optional): The keys of the shared state to include in each prompt.
+        shared_state_max_bytes (int): The most bytes of shared state put in a prompt. Defaults to 16000.
+        contracts (dict, optional): Each specialist's :class:`SpecialistContract`, by name.
+        required_capabilities (set, optional): Only specialists whose contracts cover these capabilities are asked.
+
+    Returns:
+        AggregatedResult: The combined answer.
     """
     rows = invoke_specialists(
         task=task,
@@ -275,7 +371,24 @@ async def aaggregate_specialists(
     contracts: Mapping[str, SpecialistContract] | None = None,
     required_capabilities: set[str] | None = None,
 ) -> AggregatedResult:
-    """Async :func:`aggregate_specialists`. Specialists that run out of time are cancelled."""
+    """Async :func:`aggregate_specialists`. Specialists that run out of time are cancelled.
+
+    Args:
+        task (str): The task that every specialist receives.
+        specialists (dict[str, Agent]): The specialists, by name.
+        aggregator (BaseAggregator, optional): How to combine the answers. Defaults to ``JsonMergeAggregator``.
+        parallel (bool): Run the specialists at the same time. Defaults to True.
+        max_concurrency (int): The most specialists running at once. Defaults to 4.
+        max_runtime_seconds (float, optional): The shared time limit for all the specialists.
+        shared_state (SharedState, optional): Shared state that each specialist can read and write.
+        shared_state_keys (set, optional): The keys of the shared state to include in each prompt.
+        shared_state_max_bytes (int): The most bytes of shared state put in a prompt. Defaults to 16000.
+        contracts (dict, optional): Each specialist's :class:`SpecialistContract`, by name.
+        required_capabilities (set, optional): Only specialists whose contracts cover these capabilities are asked.
+
+    Returns:
+        An awaitable that gives the combined :class:`AggregatedResult`.
+    """
     rows = await ainvoke_specialists(
         task=task,
         specialists=specialists,

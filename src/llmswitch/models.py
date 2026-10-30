@@ -43,8 +43,15 @@ class CompletionTokensDetails(BaseModel):
 
 
 class CompletionUsage(BaseModel):
-    """
-    Usage statistics for a completion, including token counts and details.
+    """Token counts for one call.
+
+    Attributes:
+        prompt_tokens (int): Tokens in the input.
+        completion_tokens (int): Tokens in the output.
+        total_tokens (int): The sum of the two.
+        prompt_tokens_details, completion_tokens_details (optional): Breakdowns, such as cached and reasoning tokens.
+        cache_read_input_tokens (int, optional): Input tokens served from the provider's prompt cache.
+        thinking_tokens (int): Tokens the model spent thinking, when the provider reports them.
     """
     completion_tokens: int
     prompt_tokens: int
@@ -64,15 +71,11 @@ class CompletionUsage(BaseModel):
 
     @property
     def cached_tokens(self) -> int:
-        """
-        Convenience accessor: total prompt tokens served from any server-side cache.
+        """Input tokens served from a server-side prompt cache, whatever the provider.
 
-        - OpenAI / Azure OpenAI: reads ``prompt_tokens_details.cached_tokens``
-          (automatic prefix caching, ≥1024-token static prefixes).
-        - Anthropic: reads ``cache_read_input_tokens``
-          (explicit ``cache_control`` breakpoints).
-        - Vertex AI Gemini: reads ``cache_read_input_tokens``
-          (``CachedContent`` resource).
+        Returns:
+            int: The cached prompt tokens. Read from ``prompt_tokens_details`` for OpenAI and Azure OpenAI, and from
+            ``cache_read_input_tokens`` for Anthropic and Vertex AI.
         """
         if isinstance(self.prompt_tokens_details, PromptTokensDetails):
             openai_cached = self.prompt_tokens_details.cached_tokens or 0
@@ -86,9 +89,10 @@ class CompletionUsage(BaseModel):
 
     @property
     def cache_savings_pct(self) -> float:
-        """
-        Percentage of prompt tokens served from cache (0–100).
-        Useful for quick cost-saving visibility in logs.
+        """The share of the prompt that came from the cache, for quick cost checks.
+
+        Returns:
+            float: A percentage from 0 to 100, rounded to two places. 0.0 when there were no prompt tokens.
         """
         if not self.prompt_tokens:
             return 0.0
@@ -96,7 +100,16 @@ class CompletionUsage(BaseModel):
 
 
 class ProviderExtensions(BaseModel):
-    """Versioned provider-specific fields excluded from the portable response contract."""
+    """Versioned provider-specific data, kept apart from the portable response fields.
+
+    Use it for values that only one provider sends, such as an Anthropic thinking block or a Gemini thought signature.
+    Portable code does not need it.
+
+    Attributes:
+        provider (str, optional): The provider that produced the data, such as ``anthropic``.
+        schema_version (int): The version of the layout of ``fields``. Defaults to 1.
+        fields (dict): The provider-specific values.
+    """
     provider: str | None = None
     schema_version: int = 1
     fields: dict[str, Any] = Field(default_factory=dict)
@@ -112,8 +125,12 @@ class Function(BaseModel):
 
 
 class ChatCompletionMessageToolCall(BaseModel):
-    """
-    Represents a tool call in a chat completion message.
+    """A tool the model asked to run.
+
+    Attributes:
+        id (str): The id that the tool result must refer to.
+        type (str): Always ``function``.
+        function (Function): The tool's ``name`` and its ``arguments``, a JSON string.
     """
     id: str
     function: Function
@@ -131,8 +148,16 @@ class ChatCompletionAudio(BaseModel):
 
 
 class ChatCompletionMessage(BaseModel):
-    """
-    Represents a message in a chat completion, including role, content, and tool calls.
+    """The message of a chat completion reply.
+
+    Attributes:
+        role (str): The role, usually ``assistant``.
+        content (str or None): The text of the reply. None when the reply is only tool calls.
+        tool_calls (list[ChatCompletionMessageToolCall], optional): The tools the model asked to run.
+        parsed (object, optional): The instance of the Pydantic class passed to ``parse``.
+        thinking (str, optional): The text of the model's thinking, for providers that expose it.
+        thinking_signature (str, optional): The signature of the thinking block, which must be sent back unchanged.
+        extensions (ProviderExtensions, optional): Provider-specific data, such as signatures to send back.
     """
     role: str
     content: Optional[str] = None
@@ -151,6 +176,11 @@ class ChatCompletionMessage(BaseModel):
 
     @property
     def provider_extensions(self) -> ProviderExtensions:
+        """The provider-specific fields of this object, which sit outside the portable response contract.
+
+        Returns:
+            ProviderExtensions: The extension block, or an empty one when the provider sent none.
+        """
         return self.extensions or ProviderExtensions(fields={})
 
 
@@ -182,8 +212,15 @@ class ChoiceLogprobs(BaseModel):
 
 
 class Choice(BaseModel):
-    """
-    Represents a single choice in a chat completion, including message and finish reason.
+    """One reply in a ``ChatCompletion``.
+
+    Attributes:
+        index (int): The position of the reply in ``choices``.
+        message (ChatCompletionMessage): The reply itself.
+        finish_reason (str, optional): Why generation stopped, such as ``stop``, ``length`` or ``tool_calls``.
+        logprobs (ChoiceLogprobs, optional): Token probabilities, when requested.
+        content_filter_results (dict, optional): The provider's content filter results, when it sends them.
+        extensions (ProviderExtensions, optional): Provider-specific data.
     """
     index: int
     message: ChatCompletionMessage
@@ -196,12 +233,26 @@ class Choice(BaseModel):
 
     @property
     def provider_extensions(self) -> ProviderExtensions:
+        """The provider-specific fields of this object, which sit outside the portable response contract.
+
+        Returns:
+            ProviderExtensions: The extension block, or an empty one when the provider sent none.
+        """
         return self.extensions or ProviderExtensions(fields={})
 
 
 class ChatCompletion(BaseModel):
-    """
-    Represents a full chat completion response, including choices and usage.
+    """A chat completion: the reply of ``chat.completions.create`` when ``stream`` is False.
+
+    Attributes:
+        id (str): The id of the completion.
+        object (str): Always ``chat.completion``.
+        created (int): The Unix time when the completion was created.
+        model (str): The model that produced it.
+        choices (list[Choice]): The replies. Usually one; more when ``n`` asks for several.
+        usage (CompletionUsage, optional): Token counts for the call.
+        system_fingerprint (str, optional): The backend configuration the reply came from, when the provider sends it.
+        extensions (ProviderExtensions, optional): Provider-specific data.
     """
     id: str
     object: Literal["chat.completion"] = "chat.completion"
@@ -246,8 +297,16 @@ class ChoiceDeltaToolCall(BaseModel):
 
 
 class ChoiceDelta(BaseModel):
-    """
-    Represents a delta (change) in a choice for streaming chat completions.
+    """The new content in one streamed chunk.
+
+    Attributes:
+        role (str, optional): The role of the message, usually ``assistant``. Sent on the first chunk.
+        content (str, optional): The new text.
+        tool_calls (list[ChoiceDeltaToolCall], optional): Fragments of tool calls. Join the ``arguments`` text across
+            chunks that share an ``index``.
+        thinking (str, optional): The new text of a thinking block, when the model thinks.
+        thinking_signature (str, optional): The signature that closes a thinking block.
+        extensions (ProviderExtensions, optional): Provider-specific data, such as a complete thinking block.
     """
     role: Literal["developer", "system", "user", "assistant", "tool", "model"] | None = "assistant"
     content: Optional[str] = None
@@ -261,12 +320,22 @@ class ChoiceDelta(BaseModel):
 
     @property
     def provider_extensions(self) -> ProviderExtensions:
+        """The provider-specific fields of this object, which sit outside the portable response contract.
+
+        Returns:
+            ProviderExtensions: The extension block, or an empty one when the provider sent none.
+        """
         return self.extensions or ProviderExtensions(fields={})
 
 
 class ChunkDelta(BaseModel):
-    """
-    Represents a chunk delta in streaming chat completions.
+    """The change to one reply in a streamed chunk.
+
+    Attributes:
+        index (int): The position of the reply in the completion.
+        delta (ChoiceDelta): The new content, tool calls or thinking in this chunk.
+        finish_reason (str, optional): Set on the final chunk for this reply.
+        extensions (ProviderExtensions, optional): Provider-specific data.
     """
     index: int
     delta: ChoiceDelta
@@ -282,12 +351,28 @@ class ChunkDelta(BaseModel):
 
     @property
     def provider_extensions(self) -> ProviderExtensions:
+        """The provider-specific fields of this object, which sit outside the portable response contract.
+
+        Returns:
+            ProviderExtensions: The extension block, or an empty one when the provider sent none.
+        """
         return self.extensions or ProviderExtensions(fields={})
 
 
 class ChatCompletionChunk(BaseModel):
-    """
-    Represents a streaming chat completion chunk, including choices and usage.
+    """One piece of a streamed chat completion.
+
+    A stream is a sequence of chunks. Join the ``delta`` content of each chunk to rebuild the reply. The last chunk
+    can carry ``usage`` and a ``finish_reason``.
+
+    Attributes:
+        id (str): The id of the completion this chunk belongs to.
+        object (str): Always ``chat.completion.chunk``.
+        created (int): The Unix time of the chunk.
+        model (str): The model that produced it.
+        choices (list[ChunkDelta]): The changes to each reply. Each has a ``delta`` and a ``finish_reason``.
+        usage (CompletionUsage, optional): Token counts, sent on the final chunk when the provider reports them.
+        extensions (ProviderExtensions, optional): Provider-specific data.
     """
     id: str
     object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
@@ -301,6 +386,11 @@ class ChatCompletionChunk(BaseModel):
 
     @property
     def provider_extensions(self) -> ProviderExtensions:
+        """The provider-specific fields of this object, which sit outside the portable response contract.
+
+        Returns:
+            ProviderExtensions: The extension block, or an empty one when the provider sent none.
+        """
         return self.extensions or ProviderExtensions(fields={})
 
     def __str__(self):
@@ -317,8 +407,12 @@ class Usage(BaseModel):
 
 
 class Embedding(BaseModel):
-    """
-    Represents a single embedding vector and its metadata.
+    """One embedding vector.
+
+    Attributes:
+        embedding (list[float]): The vector.
+        index (int): The position of the input text this vector belongs to.
+        object (str): Always ``embedding``.
     """
     embedding: list[float]
     index: int
@@ -326,8 +420,13 @@ class Embedding(BaseModel):
 
 
 class CreateEmbeddingResponse(BaseModel):
-    """
-    Represents the response for an embedding creation request.
+    """The reply of ``embeddings.create``.
+
+    Attributes:
+        data (list[Embedding]): One vector per input text, in the order of the input when ``restore_order`` is set.
+        model (str): The model that produced the vectors.
+        usage (Usage, optional): Token counts for the call.
+        extensions (ProviderExtensions, optional): Provider-specific data.
     """
     data: list[Embedding]
     model: str | None = None
@@ -337,6 +436,11 @@ class CreateEmbeddingResponse(BaseModel):
 
     @property
     def provider_extensions(self) -> ProviderExtensions:
+        """The provider-specific fields of this object, which sit outside the portable response contract.
+
+        Returns:
+            ProviderExtensions: The extension block, or an empty one when the provider sent none.
+        """
         return self.extensions or ProviderExtensions(fields={})
     created: int
 
@@ -360,7 +464,16 @@ class ResponseOutputTokensDetails(BaseModel):
 
 
 class ResponseUsage(BaseModel):
-    """Token usage for a Responses API call."""
+    """Token counts for one Responses call.
+
+    Attributes:
+        input_tokens (int): Tokens in the input.
+        output_tokens (int): Tokens in the output, including reasoning tokens.
+        total_tokens (int): The sum of the two.
+        input_tokens_details (ResponseInputTokensDetails, optional): Breakdown of the input, such as cached tokens.
+        output_tokens_details (ResponseOutputTokensDetails, optional): Breakdown of the output, such as reasoning
+            tokens.
+    """
     model_config = _RESPONSES_EXTRA
     input_tokens: int = 0
     output_tokens: int = 0
@@ -370,13 +483,21 @@ class ResponseUsage(BaseModel):
 
     @property
     def cached_tokens(self) -> int:
-        """Input tokens served from the server-side prompt cache."""
+        """Input tokens served from the server-side prompt cache.
+
+        Returns:
+            int: The cached input tokens, or 0 when the provider sent no breakdown.
+        """
         details = self.input_tokens_details
         return int(getattr(details, "cached_tokens", 0) or 0) if details else 0
 
     @property
     def reasoning_tokens(self) -> int:
-        """Output tokens spent on reasoning (o-series / GPT-5 reasoning models)."""
+        """Output tokens spent on reasoning, for reasoning models.
+
+        Returns:
+            int: The reasoning tokens, or 0 when the provider sent no breakdown.
+        """
         details = self.output_tokens_details
         return int(getattr(details, "reasoning_tokens", 0) or 0) if details else 0
 
@@ -446,12 +567,17 @@ class McpApprovalRequest(BaseModel):
 
 
 class ResponseOutputItem(BaseModel):
-    """
-    A single item in a Response's ``output`` array.
+    """One item of a response's ``output``: a message, a tool call or a reasoning block.
 
-    Covers every output item type (message, reasoning, function_call, built-in
-    tool calls, …) with one permissive shape; ``type`` discriminates and unknown
-    fields are preserved verbatim.
+    Attributes:
+        type (str): The kind of item, such as ``message``, ``function_call`` or ``reasoning``.
+        id (str, optional): The id of the item.
+        status (str, optional): The status of the item.
+        content (list, optional): The parts of a message.
+        name (str, optional): The tool name, for a tool call.
+        arguments (str, optional): The tool arguments as a JSON string, for a tool call.
+        call_id (str, optional): The id a tool result must refer to.
+        parsed (object, optional): The parsed structured output, when ``parse`` was used.
     """
     model_config = _RESPONSES_EXTRA
     type: str
@@ -468,11 +594,20 @@ class ResponseOutputItem(BaseModel):
 
     @property
     def provider_extensions(self) -> ProviderExtensions:
+        """The provider-specific fields of this object, which sit outside the portable response contract.
+
+        Returns:
+            ProviderExtensions: The extension block, or an empty one when the provider sent none.
+        """
         return self.extensions or ProviderExtensions(fields={})
 
     @property
     def text(self) -> str:
-        """Concatenated ``output_text`` parts of a message item ("" for other types)."""
+        """The text of a message item.
+
+        Returns:
+            str: The concatenated ``output_text`` parts of a message item. An empty string for any other type.
+        """
         parts: list[str] = []
         for part in self.content or []:
             part_type = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
@@ -589,6 +724,11 @@ class ResponseMcpApprovalRequestItem(ResponseOutputItem):
 
     @property
     def approval_request(self) -> McpApprovalRequest:
+        """The approval request this item asks the application to decide on.
+
+        Returns:
+            McpApprovalRequest: The pending call, with its approval request id, server label, tool name and arguments.
+        """
         return McpApprovalRequest(approval_request_id=self.id, server_label=self.server_label,
                                   name=self.name, arguments=self.arguments)
 
@@ -603,6 +743,11 @@ class ResponseMcpCallItem(ResponseOutputItem):
 
     @property
     def approval_request(self) -> Optional[McpApprovalRequest]:
+        """The approval request behind this call, when the call needed approval.
+
+        Returns:
+            McpApprovalRequest or None: The request, or None when the call did not need approval.
+        """
         if not self.approval_request_id:
             return None
         return McpApprovalRequest(approval_request_id=self.approval_request_id, server_label=self.server_label,
@@ -630,9 +775,17 @@ def response_output_item_from_data(data: dict[str, Any]) -> ResponseOutputItem:
 
 
 class Response(BaseModel):
-    """
-    Unified Responses API response object (``responses.create`` / ``retrieve`` /
-    ``cancel``).
+    """A Responses API response: the reply of ``responses.create``, ``retrieve``, ``cancel`` and ``wait``.
+
+    Attributes:
+        id (str): The id of the response. Use it with ``retrieve``, ``wait``, ``cancel`` and ``delete``.
+        status (str): ``completed``, ``failed``, ``incomplete``, ``in_progress``, ``queued`` or ``cancelled``.
+        output (list[ResponseOutputItem]): The items the model produced: messages, tool calls and reasoning.
+        usage (ResponseUsage, optional): Token counts for the call.
+        error (ResponseError, optional): Set when ``status`` is ``failed``.
+        incomplete_details (ResponseIncompleteDetails, optional): Set when ``status`` is ``incomplete``.
+        model (str): The model that produced it.
+        extensions (ProviderExtensions, optional): Provider-specific data.
     """
     model_config = _RESPONSES_EXTRA
     id: str
@@ -673,16 +826,30 @@ class Response(BaseModel):
 
     @property
     def provider_extensions(self) -> ProviderExtensions:
+        """The provider-specific fields of this object, which sit outside the portable response contract.
+
+        Returns:
+            ProviderExtensions: The extension block, or an empty one when the provider sent none.
+        """
         return self.extensions or ProviderExtensions(fields={})
 
     @property
     def output_text(self) -> str:
-        """Concatenated text of every assistant message in ``output``."""
+        """All the assistant text of the response, joined in order.
+
+        Returns:
+            str: The text of every ``message`` item in ``output``. An empty string when there is none.
+        """
         return "".join(item.text for item in self.output if item.type == "message")
 
     @property
     def output_parsed(self) -> Optional[Any]:
-        """The deserialized structured output, when ``parse`` was used."""
+        """The structured output of a call to ``responses.parse``.
+
+        Returns:
+            object or None: An instance of the Pydantic class passed as ``text_format``, or None when no output was
+                parsed.
+        """
         for item in self.output:
             if item.parsed is not None:
                 return item.parsed
@@ -696,19 +863,31 @@ class Response(BaseModel):
 
     @property
     def web_sources(self) -> list[WebSearchSource]:
-        """Flatten included web-search sources from all typed tool-call items."""
+        """The web sources that the built-in web search tool returned.
+
+        Returns:
+            list: The sources of every web search call in ``output``, in order.
+        """
         return [source for item in self.output if isinstance(item, ResponseWebSearchCallItem)
                 for source in item.sources]
 
     @property
     def file_search_results(self) -> list[FileSearchResult]:
-        """Flatten included file-search results from all typed tool-call items."""
+        """The results that the built-in file search tool returned.
+
+        Returns:
+            list: The results of every file search call in ``output``, in order.
+        """
         return [result for item in self.output if isinstance(item, ResponseFileSearchCallItem)
                 for result in item.search_results]
 
     @property
     def code_interpreter_outputs(self) -> list[CodeInterpreterOutput]:
-        """Flatten provider-side code-interpreter outputs and artifact references."""
+        """The outputs and artifact references of the code interpreter tool.
+
+        Returns:
+            list: The outputs of every code interpreter call in ``output``, in order.
+        """
         return [output for item in self.output if isinstance(item, ResponseCodeInterpreterCallItem)
                 for output in item.interpreter_outputs]
 
@@ -719,7 +898,11 @@ class Response(BaseModel):
 
     @property
     def computer_actions(self) -> list[ComputerAction]:
-        """Flatten requested actions for inspection; use call items to retain IDs."""
+        """The computer actions the model requested, for the application to run.
+
+        Returns:
+            list: The requested actions of every computer call in ``output``. Use the call items to keep their ids.
+        """
         return [action for item in self.output if isinstance(item, ResponseComputerCallItem)
                 for action in item.computer_actions]
 
@@ -735,9 +918,14 @@ class Response(BaseModel):
 
 
 class ResponseItem(BaseModel):
-    """
-    An item returned by ``responses.input_items.list`` — an input or output item
-    belonging to a response. Same permissive shape as :class:`ResponseOutputItem`.
+    """An input or output item of a response, as listed by ``input_items.list`` or a conversation.
+
+    Attributes:
+        type (str): The kind of item.
+        id (str, optional): The id of the item.
+        role (str, optional): The role of a message item.
+        content (list, optional): The parts of a message item.
+        name, arguments, call_id (optional): The tool call fields, for a tool call item.
     """
     model_config = _RESPONSES_EXTRA
     type: Optional[str] = None
@@ -752,6 +940,11 @@ class ResponseItem(BaseModel):
 
     @property
     def provider_extensions(self) -> ProviderExtensions:
+        """The provider-specific fields of this object, which sit outside the portable response contract.
+
+        Returns:
+            ProviderExtensions: The extension block, or an empty one when the provider sent none.
+        """
         return self.extensions or ProviderExtensions(fields={})
 
 
@@ -770,6 +963,11 @@ class ResponseItemList(BaseModel):
 
     @property
     def provider_extensions(self) -> ProviderExtensions:
+        """The provider-specific fields of this object, which sit outside the portable response contract.
+
+        Returns:
+            ProviderExtensions: The extension block, or an empty one when the provider sent none.
+        """
         return self.extensions or ProviderExtensions(fields={})
 
     def __iter__(self):
@@ -791,6 +989,11 @@ class InputTokenCountResponse(BaseModel):
 
     @property
     def provider_extensions(self) -> ProviderExtensions:
+        """The provider-specific fields of this object, which sit outside the portable response contract.
+
+        Returns:
+            ProviderExtensions: The extension block, or an empty one when the provider sent none.
+        """
         return self.extensions or ProviderExtensions(fields={})
 
     def __str__(self):
@@ -809,6 +1012,11 @@ class CompactedResponse(BaseModel):
 
     @property
     def provider_extensions(self) -> ProviderExtensions:
+        """The provider-specific fields of this object, which sit outside the portable response contract.
+
+        Returns:
+            ProviderExtensions: The extension block, or an empty one when the provider sent none.
+        """
         return self.extensions or ProviderExtensions(fields={})
 
     def __str__(self):
@@ -825,6 +1033,11 @@ class ResponseDeleted(BaseModel):
 
     @property
     def provider_extensions(self) -> ProviderExtensions:
+        """The provider-specific fields of this object, which sit outside the portable response contract.
+
+        Returns:
+            ProviderExtensions: The extension block, or an empty one when the provider sent none.
+        """
         return self.extensions or ProviderExtensions(fields={})
 
     def __str__(self):
@@ -832,7 +1045,15 @@ class ResponseDeleted(BaseModel):
 
 
 class Conversation(BaseModel):
-    """A server-stored Responses conversation."""
+    """A conversation stored with the provider.
+
+    Attributes:
+        id (str): The id of the conversation.
+        object (str): Always ``conversation``.
+        created_at (int, optional): The Unix time when it was created.
+        metadata (dict, optional): The metadata set when it was created or last updated.
+        extensions (ProviderExtensions, optional): Provider-specific data.
+    """
     model_config = _RESPONSES_EXTRA
     id: str
     object: str = "conversation"
@@ -842,6 +1063,11 @@ class Conversation(BaseModel):
 
     @property
     def provider_extensions(self) -> ProviderExtensions:
+        """The provider-specific fields of this object, which sit outside the portable response contract.
+
+        Returns:
+            ProviderExtensions: The extension block, or an empty one when the provider sent none.
+        """
         return self.extensions or ProviderExtensions(fields={})
 
 
@@ -855,16 +1081,26 @@ class ConversationDeleted(BaseModel):
 
     @property
     def provider_extensions(self) -> ProviderExtensions:
+        """The provider-specific fields of this object, which sit outside the portable response contract.
+
+        Returns:
+            ProviderExtensions: The extension block, or an empty one when the provider sent none.
+        """
         return self.extensions or ProviderExtensions(fields={})
 
 
 class ResponseStreamEvent(BaseModel):
-    """
-    A single server-sent event from a streaming ``responses.create``.
+    """One server-sent event of a streamed Responses call.
 
-    ``type`` discriminates the ~40 event kinds (``response.created``,
-    ``response.output_text.delta``, ``response.completed``, …); the payload
-    fields relevant to that kind are populated and everything else is preserved.
+    Events arrive in order. Text arrives as ``*.delta`` events, and a terminal event
+    (``response.completed``, ``response.failed`` or ``response.incomplete``) carries the final response.
+
+    Attributes:
+        type (str): The kind of event, such as ``response.output_text.delta``.
+        sequence_number (int, optional): The position of the event in the stream.
+        delta (str, optional): The new text or arguments, for delta events.
+        item (ResponseOutputItem, optional): The item this event adds or completes.
+        response (Response, optional): The response, on lifecycle and terminal events.
     """
     model_config = _RESPONSES_EXTRA
     type: str
@@ -880,11 +1116,20 @@ class ResponseStreamEvent(BaseModel):
 
     @property
     def provider_extensions(self) -> ProviderExtensions:
+        """The provider-specific fields of this object, which sit outside the portable response contract.
+
+        Returns:
+            ProviderExtensions: The extension block, or an empty one when the provider sent none.
+        """
         return self.extensions or ProviderExtensions(fields={})
 
     @property
     def usage(self) -> Optional[ResponseUsage]:
-        """Usage from a terminal event, so streams can be metered like chat chunks."""
+        """The usage of the response, read from a terminal event, so streams can be metered like chat streams.
+
+        Returns:
+            ResponseUsage or None: The usage from ``response``, or None for events that carry no response.
+        """
         return self.response.usage if self.response is not None else None
 
     def __str__(self):

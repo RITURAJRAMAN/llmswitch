@@ -23,26 +23,88 @@ logger = logging.getLogger(__name__)
 
 @runtime_checkable
 class AgentEventHandler(Protocol):
-    """Callback interface for agent events.
+    """Callbacks for what an agent does. Implement any of these methods; missing ones are skipped.
 
-    Step and routing events are called on the thread that runs the agent. Tool events can be called from a
-    worker thread, when tools run in parallel, so a handler must be safe to call from several threads.
+    Step and routing events are called on the thread that runs the agent. Tool events can be called from a worker
+    thread when tools run in parallel, so a handler must be safe to call from several threads.
     """
 
-    def on_step_start(self, step: int, context: dict[str, Any]) -> None: ...
+    def on_step_start(self, step: int, context: dict[str, Any]) -> None:
+        """Called when a step starts.
 
-    def on_tool_start(self, step: int, tool_name: str, args: dict[str, Any]) -> None: ...
+        Args:
+            step (int): The step number.
+            context (dict): Details of the step, such as the number of messages.
 
-    def on_tool_end(self, step: int, tool_name: str, result: Any, duration_s: float) -> None: ...
+        Returns:
+            None
+        """
+        ...
 
-    def on_tool_error(self, step: int, tool_name: str, error: str, duration_s: float) -> None: ...
+    def on_tool_start(self, step: int, tool_name: str, args: dict[str, Any]) -> None:
+        """Called when a tool call starts.
 
-    def on_step_end(self, step: int, context: dict[str, Any]) -> None: ...
+        Args:
+            step (int): The step number.
+            tool_name (str): The tool being called.
+            args (dict): The arguments of the call.
+
+        Returns:
+            None
+        """
+        ...
+
+    def on_tool_end(self, step: int, tool_name: str, result: Any, duration_s: float) -> None:
+        """Called when a tool call finishes successfully.
+
+        Args:
+            step (int): The step number.
+            tool_name (str): The tool that ran.
+            result (object): The value the tool returned.
+            duration_s (float): How long the call took, in seconds.
+
+        Returns:
+            None
+        """
+        ...
+
+    def on_tool_error(self, step: int, tool_name: str, error: str, duration_s: float) -> None:
+        """Called when a tool call fails, times out or is refused.
+
+        Args:
+            step (int): The step number.
+            tool_name (str): The tool that failed.
+            error (str): The error message.
+            duration_s (float): How long the call took, in seconds.
+
+        Returns:
+            None
+        """
+        ...
+
+    def on_step_end(self, step: int, context: dict[str, Any]) -> None:
+        """Called when a step ends.
+
+        Args:
+            step (int): The step number.
+            context (dict): Details of the step, such as whether the run finished.
+
+        Returns:
+            None
+        """
+        ...
 
 
 @dataclass
 class AgentEvent:
-    """One recorded event: its name, the step it belongs to, and its payload."""
+    """One recorded event of a run.
+
+    Attributes:
+        event (str): The name of the event, such as ``tool_start``.
+        step (int): The step the event belongs to.
+        payload (dict): The details of the event.
+        ts (float): The time the event was recorded, in seconds since the epoch.
+    """
 
     event: str
     step: int
@@ -51,26 +113,81 @@ class AgentEvent:
 
 
 class CollectingEventHandler:
-    """Keeps every event in ``events`` in the order they happened."""
+    """Keeps every event in the order they happened, in ``events``, for tests and debugging.
+
+    Attributes:
+        events (list[AgentEvent]): The recorded events.
+    """
 
     def __init__(self) -> None:
+        """Create an empty collector."""
         self.events: list[AgentEvent] = []
 
     def on_step_start(self, step: int, context: dict[str, Any]) -> None:
+        """Record a step start.
+
+        Args:
+            step (int): The step number.
+            context (dict): Details of the step.
+
+        Returns:
+            None
+        """
         self.events.append(AgentEvent("step_start", step, context))
 
     def on_tool_start(self, step: int, tool_name: str, args: dict[str, Any]) -> None:
+        """Record a tool call start.
+
+        Args:
+            step (int): The step number.
+            tool_name (str): The tool being called.
+            args (dict): The arguments of the call.
+
+        Returns:
+            None
+        """
         self.events.append(AgentEvent("tool_start", step, {"tool_name": tool_name, "args": args}))
 
     def on_tool_end(self, step: int, tool_name: str, result: Any, duration_s: float) -> None:
+        """Record a successful tool call.
+
+        Args:
+            step (int): The step number.
+            tool_name (str): The tool that ran.
+            result (object): The value the tool returned.
+            duration_s (float): How long the call took, in seconds.
+
+        Returns:
+            None
+        """
         self.events.append(AgentEvent("tool_end", step, {"tool_name": tool_name, "duration_s": duration_s,
                                                          "result": result}))
 
     def on_tool_error(self, step: int, tool_name: str, error: str, duration_s: float) -> None:
+        """Record a failed tool call.
+
+        Args:
+            step (int): The step number.
+            tool_name (str): The tool that failed.
+            error (str): The error message.
+            duration_s (float): How long the call took, in seconds.
+
+        Returns:
+            None
+        """
         self.events.append(AgentEvent("tool_error", step, {"tool_name": tool_name, "duration_s": duration_s,
                                                            "error": error}))
 
     def on_step_end(self, step: int, context: dict[str, Any]) -> None:
+        """Record a step end.
+
+        Args:
+            step (int): The step number.
+            context (dict): Details of the step.
+
+        Returns:
+            None
+        """
         self.events.append(AgentEvent("step_end", step, context))
 
 
@@ -96,25 +213,84 @@ def _shape(value: Any) -> dict[str, Any]:
 
 
 class LoggingEventHandler:
-    """Writes one log line per event, with names and types only."""
+    """Writes each event to a logger, so the agent's activity appears in your application's logs.
+
+    It logs tool names and the names of exception classes, never argument or result values, so no user data reaches
+    the log by default.
+    """
 
     def __init__(self, logger_name: str = "llmswitch.agentic") -> None:
+        """Create the handler.
+
+        Args:
+            logger_name (str): The name of the logger to write to. Defaults to ``llmswitch.agentic``.
+        """
         self.logger = logging.getLogger(logger_name)
 
     def on_step_start(self, step: int, context: dict[str, Any]) -> None:
+        """Log a step start.
+
+        Args:
+            step (int): The step number.
+            context (dict): Details of the step.
+
+        Returns:
+            None
+        """
         self.logger.info("step_start | step=%s | context=%s", step, _shape(context))
 
     def on_tool_start(self, step: int, tool_name: str, args: dict[str, Any]) -> None:
+        """Log a tool call start.
+
+        Args:
+            step (int): The step number.
+            tool_name (str): The tool being called.
+            args (dict): The arguments of the call.
+
+        Returns:
+            None
+        """
         self.logger.info("tool_start | step=%s | tool=%s | args=%s", step, tool_name, _shape(args))
 
     def on_tool_end(self, step: int, tool_name: str, result: Any, duration_s: float) -> None:
+        """Log a successful tool call.
+
+        Args:
+            step (int): The step number.
+            tool_name (str): The tool that ran.
+            result (object): The value the tool returned.
+            duration_s (float): How long the call took, in seconds.
+
+        Returns:
+            None
+        """
         self.logger.info("tool_end | step=%s | tool=%s | duration_s=%.3f | result=%s",
                          step, tool_name, duration_s, _shape(result))
 
     def on_tool_error(self, step: int, tool_name: str, error: str, duration_s: float) -> None:
         # Errors start with the exception's class name, so only that prefix is logged, not the message.
+        """Log a failed tool call.
+
+        Args:
+            step (int): The step number.
+            tool_name (str): The tool that failed.
+            error (str): The error message.
+            duration_s (float): How long the call took, in seconds.
+
+        Returns:
+            None
+        """
         self.logger.warning("tool_error | step=%s | tool=%s | duration_s=%.3f | error_type=%s",
                             step, tool_name, duration_s, error.split(":", 1)[0][:80])
 
     def on_step_end(self, step: int, context: dict[str, Any]) -> None:
+        """Log a step end.
+
+        Args:
+            step (int): The step number.
+            context (dict): Details of the step.
+
+        Returns:
+            None
+        """
         self.logger.info("step_end | step=%s | context=%s", step, _shape(context))

@@ -101,10 +101,11 @@ logger = logging.getLogger(__name__)
 
 
 class _AsyncChatCompletions(ProviderCache):
-    """
-    Async chat completions handler. Applies rate limiting and message truncation
-    off the event loop, then delegates to the async provider. Supports
-    non-streaming (await) and streaming (async generator) modes.
+    """Async chat completions: ``await client.chat.completions.create`` and ``parse``.
+
+    Each call applies message truncation, rate limiting, retries, the circuit breaker and backup failover, and counts
+    its tokens against the chat limits (``rpm`` and ``tpm``). Rate limit waits use ``asyncio.sleep``, so other tasks
+    keep running.
     """
 
     def __init__(self, config: Any, rate_limiter: "RedisRateLimiter") -> None:
@@ -161,10 +162,30 @@ class _AsyncChatCompletions(ProviderCache):
     @traced("chat.completions")
     async def create(self, messages: list[dict[str, Any]], stream: bool = False,
                      truncate: bool = False, **kwargs: Any) -> Any:
-        """
-        Async chat completion. See ``_ChatCompletions.create`` for full parameter
-        documentation. For o1/o3/o4-mini reasoning models pass
-        ``max_completion_tokens`` instead of ``max_tokens``.
+        """Create a chat completion, asynchronously.
+
+        Args:
+            messages (list[dict]): The conversation, as dicts with ``role`` and ``content``. ``content`` can be a
+                string or a list of content parts for images (multimodal input).
+            stream (bool): When True, return an async iterator of chunks instead of one reply. Defaults to False.
+            truncate (bool): When True, drop the oldest messages so the input fits ``completion_context_window``.
+                Defaults to False.
+            **kwargs: Passed to the provider unchanged. Common ones are ``model`` (a per-call model, unless a
+                ``deployment_name`` is configured), ``max_tokens`` or ``max_completion_tokens``, ``temperature``,
+                ``tools``, ``tool_choice``, ``response_format`` and ``stop``. The library also reads ``live_logs``
+                (default False) and ``max_retries`` (overrides the configured retries).
+
+        Returns:
+            An awaitable that gives a ChatCompletion when ``stream`` is False. When ``stream`` is True, the awaitable
+            gives an async iterator of ChatCompletionChunk.
+
+        Raises:
+            RateLimitExceededError: The rate limit window stayed full beyond ``rate_limit_max_wait``, or
+                ``on_rate_limit`` is ``"raise"``.
+            AuthenticationError: The provider rejected the credentials.
+            ChatCompletionError: The provider failed. ``status_code`` tells whether it was a client or server error.
+            ContentFilterError: The provider blocked the prompt or the reply.
+            LLMSwitchError: Any other failure. Every error raised by this library is a subclass of it.
         """
         validate_messages(messages)
         live_logs = kwargs.pop("live_logs", False)
@@ -332,72 +353,169 @@ class _AsyncChatCompletions(ProviderCache):
 
     async def parse(self, messages: list[dict[str, Any]], response_format: Any, truncate: bool = False,
                     **kwargs: Any) -> Any:
-        """
-        Async structured-output helper mirroring
-        ``client.beta.chat.completions.parse``. Always non-streaming.
+        """Structured output, asynchronously: the reply parsed into a Pydantic model.
+
+        Pass a Pydantic model class as ``response_format``. The deserialized instance is returned on
+        ``choice.message.parsed``, for every provider. The call is never streamed.
+
+        Args:
+            messages (list[dict]): The conversation, as in ``create``.
+            response_format (type): A Pydantic model class that describes the reply.
+            truncate (bool): Truncate the messages to fit the context window. Defaults to False.
+            **kwargs: Passed to the provider, as in ``create``.
+
+        Returns:
+            An awaitable that gives a ChatCompletion. Its ``choices[0].message.parsed`` holds an instance of
+            ``response_format``.
+
+        Raises:
+            The same errors as ``create``.
         """
         return await self.create(messages, stream=False, truncate=truncate,
                                  response_format=response_format, **kwargs)
 
 
 class _AsyncResponseInputItems:
-    """``switch.responses.input_items`` sub-namespace (async)."""
+    """The input items of a response: ``client.responses.input_items``."""
 
     def __init__(self, responses: "_AsyncResponses") -> None:
         self._responses = responses
 
     async def list(self, response_id: str, **kwargs: Any) -> Any:
-        """List the input items of a response (cursor page)."""
+        """List the input items of a stored response, one page at a time.
+
+        Args:
+            response_id (str): The id of the response.
+            **kwargs: Passed to the provider, for example paging options.
+
+        Returns:
+            An awaitable that gives a ResponseItemList, one page of items.
+        """
         return await self._responses._management_call("list_input_items", response_id, **kwargs)
 
 
 class _AsyncResponseInputTokens:
-    """``switch.responses.input_tokens`` sub-namespace (async)."""
+    """Token counting for Responses requests: ``client.responses.input_tokens``."""
 
     def __init__(self, responses: "_AsyncResponses") -> None:
         self._responses = responses
 
     async def count(self, **kwargs: Any) -> Any:
-        """Count the input tokens a Responses request would consume."""
+        """Count the input tokens a Responses request would use, without running it.
+
+        Args:
+            **kwargs: The request to count, as for ``create`` (``input``, ``model``, ``instructions`` and so on).
+
+        Returns:
+            An awaitable that gives an InputTokenCountResponse, with the number of input tokens.
+        """
         return await self._responses._management_call("count_input_tokens", **kwargs)
 
 
 class _AsyncConversations:
-    """``switch.responses.conversations`` resource namespace (async)."""
+    """Conversations stored with the provider: ``client.responses.conversations``."""
 
     def __init__(self, responses: "_AsyncResponses") -> None:
         self._responses = responses
 
     async def create(self, items: Any = None, **kwargs: Any) -> Any:
+        """Create a conversation, optionally seeded with items.
+
+        Args:
+            items (list, optional): Items to start the conversation with.
+            **kwargs: Passed to the provider, for example metadata.
+
+        Returns:
+            An awaitable that gives a Conversation.
+        """
         return await self._responses._management_call("create_conversation", items, **kwargs)
 
     async def retrieve(self, conversation_id: str, **kwargs: Any) -> Any:
+        """Retrieve a conversation by its id.
+
+        Args:
+            conversation_id (str): The id of the conversation.
+            **kwargs: Passed to the provider.
+
+        Returns:
+            An awaitable that gives a Conversation.
+        """
         return await self._responses._management_call("retrieve_conversation", conversation_id, **kwargs)
 
     async def update(self, conversation_id: str, **kwargs: Any) -> Any:
+        """Change a conversation, for example its metadata.
+
+        Args:
+            conversation_id (str): The id of the conversation.
+            **kwargs: The fields to change, as the provider accepts them.
+
+        Returns:
+            An awaitable that gives the Conversation, after the change.
+        """
         return await self._responses._management_call("update_conversation", conversation_id, **kwargs)
 
     async def delete(self, conversation_id: str, **kwargs: Any) -> Any:
+        """Delete a conversation by its id.
+
+        Args:
+            conversation_id (str): The id of the conversation to delete.
+            **kwargs: Passed to the provider.
+
+        Returns:
+            An awaitable that gives a ConversationDeleted, which confirms the deletion.
+        """
         return await self._responses._management_call("delete_conversation", conversation_id, **kwargs)
 
     async def list_items(self, conversation_id: str, **kwargs: Any) -> Any:
+        """List the items of a conversation, one page at a time.
+
+        Args:
+            conversation_id (str): The id of the conversation.
+            **kwargs: Passed to the provider, for example paging options.
+
+        Returns:
+            An awaitable that gives a ResponseItemList, one page of items.
+        """
         return await self._responses._management_call("list_conversation_items", conversation_id, **kwargs)
 
     async def retrieve_item(self, conversation_id: str, item_id: str, **kwargs: Any) -> Any:
+        """Retrieve one item of a conversation.
+
+        Args:
+            conversation_id (str): The id of the conversation.
+            item_id (str): The id of the item.
+            **kwargs: Passed to the provider.
+
+        Returns:
+            An awaitable that gives a ResponseItem.
+        """
         return await self._responses._management_call("retrieve_conversation_item", conversation_id, item_id, **kwargs)
 
     async def delete_item(self, conversation_id: str, item_id: str, **kwargs: Any) -> Any:
+        """Delete one item from a conversation.
+
+        Args:
+            conversation_id (str): The id of the conversation.
+            item_id (str): The id of the item to delete.
+            **kwargs: Passed to the provider.
+
+        Returns:
+            An awaitable that gives the provider's confirmation of the deletion.
+        """
         return await self._responses._management_call("delete_conversation_item", conversation_id, item_id, **kwargs)
 
 
 class _AsyncResponses(ProviderCache):
-    """
-    Async Responses API handler (``switch.responses.*``).
+    """The async Responses API: ``client.responses``.
 
-    Mirrors :class:`llmswitch.core.sync_client._Responses`: ``create`` runs the
-    full pipeline (truncation, rate limiting, retries, circuit breaker, backup
-    failover, token accounting) with pre-flight work off-loaded to a worker
-    thread; the management verbs are retried and error-translated but not metered.
+    ``create`` runs the same pipeline as chat completions: truncation, rate limiting, retries, the circuit breaker,
+    backup failover and token accounting. It shares the chat limits, because both reach the same deployment quota.
+    The management calls (``retrieve``, ``delete``, ``cancel``, ``compact``, ``input_items.list``,
+    ``input_tokens.count`` and ``conversations``) are retried and their errors translated, but they are not metered.
+
+    Native for ``openai`` and ``azure_openai``. For ``anthropic`` and ``vertexai`` the calls are emulated on top of
+    chat completions, and server-side state or hosted tools raise ``UnsupportedCapabilityError``. ``azure_foundry``
+    has no Responses API.
     """
 
     def __init__(self, config: Any, rate_limiter: "RedisRateLimiter") -> None:
@@ -413,7 +531,12 @@ class _AsyncResponses(ProviderCache):
         self.conversations = _AsyncConversations(self)
 
     def capabilities(self) -> Any:
-        """Return the resolved Responses capability contract for this target."""
+        """Return the Responses capabilities that apply to this client.
+
+        Returns:
+            ResponseCapabilities: For each Responses feature, whether this provider and model support it, and why not
+            when it does not.
+        """
         return resolve_response_capabilities(self.config)
 
     def _provider_class(self) -> type:
@@ -479,7 +602,28 @@ class _AsyncResponses(ProviderCache):
     @traced("responses")
     async def create(self, input: Any = None, stream: bool = False, truncate: bool = False,  # noqa: A002
                      **kwargs: Any) -> Any:
-        """Async Responses create. See ``_Responses.create`` for full parameter documentation."""
+        """Create a model response, asynchronously.
+
+        Args:
+            input (str or list): A string prompt, or a list of Responses input items, such as messages, function call
+                outputs or images.
+            stream (bool): When True, return an async iterator of server-sent events instead of one response. Defaults
+                to
+                False.
+            truncate (bool): When True, truncate a string input so it fits the context window. Defaults to False.
+            **kwargs: Passed to the provider. Common ones are ``model``, ``instructions``, ``tools``, ``text``,
+                ``previous_response_id``, ``conversation``, ``background``, ``max_output_tokens`` and ``store``. The
+                library also reads ``live_logs`` and ``max_retries``, as in chat completions.
+
+        Returns:
+            An awaitable that gives a Response when ``stream`` is False. When ``stream`` is True, it gives an async
+            iterator of ResponseStreamEvent.
+
+        Raises:
+            UnsupportedCapabilityError: The provider or model does not support a requested feature.
+            InvalidResponseRequestError: The request has an option that the Responses API does not accept.
+            ResponsesError: The provider failed.
+        """
         live_logs = kwargs.pop("live_logs", False)
         _max_retries: int = kwargs.pop("max_retries", getattr(self.config, "max_retries", DEFAULT_MAX_RETRIES))
         _base_delay: float = getattr(self.config, "retry_base_delay", DEFAULT_RETRY_BASE_DELAY)
@@ -650,24 +794,76 @@ class _AsyncResponses(ProviderCache):
         return result
 
     async def stream(self, input: Any = None, truncate: bool = False, **kwargs: Any) -> Any:  # noqa: A002
-        """Streaming shorthand for ``create(..., stream=True)``."""
+        """Stream a model response asynchronously. This is ``create`` with ``stream=True``.
+
+        Args:
+            input (str or list): The prompt or input items, as in ``create``.
+            truncate (bool): Truncate a string input to fit the context window. Defaults to False.
+            **kwargs: Passed to the provider, as in ``create``.
+
+        Returns:
+            An async iterator of ResponseStreamEvent.
+        """
         return await self.create(input, stream=True, truncate=truncate, **kwargs)
 
     async def create_background(self, input: Any = None, truncate: bool = False, **kwargs: Any) -> Any:  # noqa: A002
-        """Create a stored background response suitable for retrieval and cancellation."""
+        """Create a stored background response, asynchronously.
+
+        The response can be polled, retrieved or cancelled later.
+
+        Args:
+            input (str or list): The prompt or input items, as in ``create``.
+            truncate (bool): Truncate a string input to fit the context window. Defaults to False.
+            **kwargs: Passed to the provider, as in ``create``.
+
+        Returns:
+            An awaitable that gives a Response, usually still in progress. Use ``wait`` to block until it finishes, or
+            ``retrieve`` to check it.
+        """
         kwargs["background"] = True
         kwargs.setdefault("store", True)
         return await self.create(input, stream=False, truncate=truncate, **kwargs)
 
     async def submit_mcp_approval(self, previous_response_id: str, approval: Any, **kwargs: Any) -> Any:
-        """Continue a response after explicit application approval or rejection of an MCP call."""
+        """Continue a response after the application approves or rejects an MCP tool call.
+
+        Args:
+            previous_response_id (str): The id of the response that asked for approval.
+            approval (McpApprovalDecision): The approval or rejection for the pending MCP call.
+            **kwargs: Passed to the provider, as in ``create``.
+
+        Returns:
+            An awaitable that gives a Response, the continuation of the earlier one.
+        """
         item = approval.to_input_item() if hasattr(approval, "to_input_item") else dict(approval)
         return await self.create([item], previous_response_id=previous_response_id, **kwargs)
 
     async def wait(self, response_id: str, *, timeout: float = 600.0, poll_interval: float = 1.0,
                    max_poll_interval: float = 10.0, cancel_on_timeout: bool = False,
                    on_poll: Any = None, **kwargs: Any) -> Any:
-        """Asynchronously poll a background response until it reaches a terminal state."""
+        """Poll a background response until it reaches a final state, without blocking the event loop.
+
+        The final states are ``completed``, ``failed``, ``incomplete`` and ``cancelled``. The wait between polls starts
+            at
+        ``poll_interval`` and grows, up to ``max_poll_interval``.
+
+        Args:
+            response_id (str): The id of the response to wait for.
+            timeout (float): The most seconds to wait. Defaults to 600.
+            poll_interval (float): Seconds between the first polls. Defaults to 1.0.
+            max_poll_interval (float): The longest wait between polls. Defaults to 10.0.
+            cancel_on_timeout (bool): When True, cancel the response if the timeout passes. Defaults to False.
+            on_poll (callable, optional): Called after each poll as ``on_poll(response, attempts)``, where
+                ``attempts`` counts the polls so far. It may be a coroutine function, which is awaited.
+            **kwargs: Passed to the retrieve call on each poll.
+
+        Returns:
+            An awaitable that gives a Response in a final state.
+
+        Raises:
+            ValueError: A timeout or an interval is zero or negative.
+            TimeOutError: The timeout passed before the response reached a final state.
+        """
         if timeout <= 0 or poll_interval <= 0 or max_poll_interval <= 0:
             raise ValueError("timeout, poll_interval, and max_poll_interval must be positive")
         deadline = asyncio.get_running_loop().time() + timeout
@@ -696,40 +892,85 @@ class _AsyncResponses(ProviderCache):
 
     async def parse(self, input: Any = None, text_format: Any = None, truncate: bool = False,  # noqa: A002
                     **kwargs: Any) -> Any:
-        """Async structured-output helper mirroring ``client.responses.parse``. Always non-streaming."""
+        """Structured output for the async Responses API.
+
+        Pass a Pydantic model class as ``text_format``. The deserialized instance is returned on
+        ``response.output_parsed``. The call is never streamed.
+
+        Args:
+            input (str or list): The prompt or input items, as in ``create``.
+            text_format (type): A Pydantic model class that describes the output.
+            truncate (bool): Truncate a string input to fit the context window. Defaults to False.
+            **kwargs: Passed to the provider, as in ``create``.
+
+        Returns:
+            An awaitable that gives a Response. Its ``output_parsed`` holds an instance of ``text_format``.
+        """
         return await self.create(input, stream=False, truncate=truncate, text_format=text_format, **kwargs)
 
     async def retrieve(self, response_id: str, **kwargs: Any) -> Any:
-        """Retrieve a previously created response by id."""
+        """Retrieve a stored response by its id, asynchronously.
+
+        Args:
+            response_id (str): The id of the response.
+            **kwargs: Passed to the provider.
+
+        Returns:
+            An awaitable that gives a Response.
+        """
         return await self._management_call("retrieve", response_id, **kwargs)
 
     async def delete(self, response_id: str, **kwargs: Any) -> Any:
-        """Delete a stored response by id."""
+        """Delete a stored response by its id, asynchronously.
+
+        Args:
+            response_id (str): The id of the response to delete.
+            **kwargs: Passed to the provider.
+
+        Returns:
+            An awaitable that gives a ResponseDeleted, which confirms the deletion.
+        """
         return await self._management_call("delete", response_id, **kwargs)
 
     async def cancel(self, response_id: str, **kwargs: Any) -> Any:
-        """Cancel an in-progress background response."""
+        """Cancel a background response that is still in progress, asynchronously.
+
+        Args:
+            response_id (str): The id of the response to cancel.
+            **kwargs: Passed to the provider.
+
+        Returns:
+            An awaitable that gives a Response, with its status after the cancellation.
+        """
         return await self._management_call("cancel", response_id, **kwargs)
 
     async def compact(self, **kwargs: Any) -> Any:
-        """Compact a response's conversation history into a shorter one."""
+        """Compact a conversation's history into a shorter form that keeps its meaning.
+
+        Args:
+            **kwargs: Passed to the provider, for example the model and the history to compact.
+
+        Returns:
+            An awaitable that gives a CompactedResponse.
+        """
         return await self._management_call("compact", **kwargs)
 
 
 class _AsyncChat:
-    """Wrapper for async chat completions, used by AsyncLLMSwitch."""
+    """Chat namespace of ``AsyncLLMSwitch``. Use ``chat.completions``.
+
+    Attributes:
+        completions: The async chat completions resource, with ``create`` and ``parse``.
+    """
 
     def __init__(self, config: Any, rate_limiter: "RedisRateLimiter") -> None:
         self.completions = _AsyncChatCompletions(config, rate_limiter)
 
 
 class _AsyncEmbeddings(ProviderCache):
-    """
-    Async embeddings facade with the same pipeline as ``_Embeddings``: rate limiting,
-    batching, retries, and backup failover. Providers with a native async embedding
-    class (see ``ASYNC_EMBEDDING_PROVIDER_REGISTRY``) are awaited directly; the others
-    run their sync provider in a worker thread. Blocking tokenization and limiter
-    calls always run off the event loop.
+    """Async embeddings: ``await client.embeddings.create``.
+
+    Calls count against the embedding limits (``embedding_rpm`` and ``embedding_tpm``), not the chat limits.
     """
 
     def __init__(self, config: Any, rate_limiter: "RedisRateLimiter") -> None:
@@ -749,7 +990,27 @@ class _AsyncEmbeddings(ProviderCache):
     @traced("embeddings")
     async def create(self, input: str | list[str], batching: bool = False, batchsize: int = 32,  # noqa: A002
                      **kwargs: Any):
-        """Create embeddings. See ``_Embeddings.create`` for the parameters."""
+        """Create embedding vectors for one text or a list of texts, asynchronously.
+
+        Args:
+            input (str or list[str]): The text or texts to embed.
+            batching (bool): Split a long list into batches of ``batchsize`` texts, sent one batch at a time.
+                Defaults to False.
+            batchsize (int): Texts per batch when ``batching`` is set. Defaults to 32.
+            **kwargs: Passed to the provider unchanged, for example ``model`` and ``dimensions``. The library also
+                reads ``restore_order`` (default True), which returns the vectors in the order of ``input`` when
+                batches finish out of order.
+
+        Returns:
+            An awaitable that gives a CreateEmbeddingResponse. Its ``data`` list holds one Embedding per input text,
+                each
+            with ``index`` and ``embedding`` (a list of floats).
+
+        Raises:
+            RateLimitExceededError: The embedding rate limit stayed full beyond ``rate_limit_max_wait``.
+            EmbeddingGenerationError: The provider failed.
+            LLMSwitchError: Any other failure.
+        """
         input = normalize_embedding_input(input)
         if batchsize <= 0:
             raise ValueError("batchsize must be positive")
@@ -841,25 +1102,37 @@ class _AsyncEmbeddings(ProviderCache):
 
 
 class AsyncLLMSwitch:
-    """
-    Async entry point mimicking the OpenAI async client. Chat completions use the
-    provider's native async client. ``.embeddings`` uses the native async client for
-    azure_foundry and a worker thread for the other providers, so the event loop stays free.
+    """Asynchronous client for chat completions, embeddings and the Responses API.
 
-    Providers with native async chat: azure_openai, azure_foundry, openai, anthropic, vertexai.
+    It has the same surface as ``LLMSwitch``, with every call awaitable. Streams are async iterators. Use it with
+    ``async with`` or call ``await aclose()`` when you are done, to release the provider connections.
 
-    Usage::
+    Attributes:
+        chat: Chat completions. Use ``await chat.completions.create`` and ``await chat.completions.parse``.
+        embeddings: Embeddings. Use ``await embeddings.create``.
+        responses: The Responses API. Use ``await responses.create``, ``responses.stream``, ``await responses.parse``
+            and the background, retrieval and conversation helpers.
 
-        switch = AsyncLLMSwitch(provider="openai", api_key="...", model="gpt-4o")
-        # Non-streaming
-        response = await switch.chat.completions.create(messages=[...])
-        # Streaming
-        async for chunk in await switch.chat.completions.create(messages=[...], stream=True):
-            print(chunk.choices[0].delta.content, end="")
+    Example:
+        async with AsyncLLMSwitch(provider="anthropic", api_key="...", model="claude-opus-4-5") as client:
+            reply = await client.chat.completions.create(messages=[{"role": "user", "content": "Hello"}],
+                                                         max_tokens=300)
+            print(reply.choices[0].message.content)
     """
 
     def __init__(self, **kwargs: Any) -> None:
-        """Initialize AsyncLLMSwitch. Accepts the same kwargs as LLMSwitch."""
+        """Create an async client for one provider.
+
+        Takes the same options as ``LLMSwitch.__init__``. See that method for the full list, its defaults and the
+        errors it raises.
+
+        Args:
+            **kwargs: The provider and the options described in ``LLMSwitch.__init__``.
+
+        Raises:
+            ConfigurationError: An option is not defined by any provider. Reserved unified options set in
+                ``client_options`` are rejected too.
+        """
         token_counter = kwargs.pop("token_counter", None)
         on_event = kwargs.pop("on_event", None)
         if on_event is not None and not callable(on_event):
@@ -916,13 +1189,34 @@ class AsyncLLMSwitch:
         )
 
     async def __aenter__(self) -> "AsyncLLMSwitch":
+        """Return the client, so that it can be used in an ``async with`` block.
+
+        Returns:
+            AsyncLLMSwitch: This client.
+        """
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Close the client when an ``async with`` block ends.
+
+        Exceptions raised inside the block are not suppressed.
+
+        Args:
+            exc_type: The exception class, or None when the block ended normally.
+            exc_val: The exception instance, or None.
+            exc_tb: The traceback, or None.
+
+        Returns:
+            None
+        """
         await self.aclose()
 
     async def aclose(self) -> None:
-        """Close async resources held by the switch."""
+        """Close the provider connections held by this client.
+
+        Returns:
+            None
+        """
         await self.chat.completions.aclose()
         await self.embeddings.aclose()
         await self.responses.aclose()
