@@ -51,10 +51,6 @@ class BaseLLMConfig(BaseModel):
         description="Provider deployment/model alias; when supplied it is the default effective model",
     )
 
-    @property
-    def effective_model(self) -> Optional[str]:
-        """Return the unified deployment-first default model identifier."""
-        return self.deployment_name or self.model
     rpm: int = Field(default=DEFAULT_RPM, ge=0, description="Requests per minute limit (chat)")
     tpm: int = Field(default=DEFAULT_TPM, ge=0, description="Tokens per minute limit (chat)")
     embedding_rpm: int = Field(default=DEFAULT_EMBEDDING_RPM, ge=0,
