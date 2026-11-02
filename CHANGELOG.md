@@ -9,6 +9,7 @@ All notable changes to this project are documented here. The format follows
 ### Added
 
 - Embeddings on Vertex AI, for example `gemini-embedding-001`, through `embeddings.create`. Options `task_type`, `title`, `output_dimensionality` and `auto_truncate` are passed on; `usage` reports the tokens the service counted.
+- Native async embeddings for `openai`, `azure_openai` and `vertexai`, on the SDKs' async clients. Each one keeps the same rate limiting, batching, retries, failover and error mapping as its sync provider.
 
 ### Changed
 

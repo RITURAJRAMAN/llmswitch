@@ -3,8 +3,7 @@ core.async_client
 
 Asynchronous chat handler and the public ``AsyncLLMSwitch`` entry point.
 Chat completions use the provider's native async client; embeddings are exposed
-via ``.embeddings``: Azure AI Foundry uses its native async client, and the other providers
-run their synchronous embedding provider in a worker thread.
+via ``.embeddings``: OpenAI, Azure OpenAI, Azure AI Foundry and Vertex AI all use their native async clients.
 
 Non-blocking I/O
 ----------------
@@ -89,7 +88,7 @@ from .responses_capabilities import (
     validate_responses_create_request,
 )
 from .responses_management import prepare_management_call, raise_response_error
-from .retry import _async_retry_call, _fails_over, _retry_call
+from .retry import _async_retry_call, _fails_over
 from .streaming import (
     AsyncStreamSession,
     StreamHandle,
@@ -983,11 +982,9 @@ class _AsyncEmbeddings(ProviderCache):
         self._provider_cache: dict[tuple[type, tuple[Any, ...]], Any] = {}
 
     @staticmethod
-    def _target_class(provider: str) -> tuple[type, bool]:
-        """Return the embedding provider class and whether it is natively async."""
-        if provider in ASYNC_EMBEDDING_PROVIDER_REGISTRY:
-            return ASYNC_EMBEDDING_PROVIDER_REGISTRY[provider], True
-        return provider_class(provider, EMBEDDING_PROVIDER_REGISTRY, "embeddings"), False
+    def _target_class(provider: str) -> type:
+        """Return the native async embedding provider class for ``provider``."""
+        return provider_class(provider, ASYNC_EMBEDDING_PROVIDER_REGISTRY, "embeddings")
 
     @traced("embeddings")
     async def create(self, input: str | list[str], batching: bool = False, batchsize: int = 32,  # noqa: A002
@@ -1033,7 +1030,7 @@ class _AsyncEmbeddings(ProviderCache):
 
         async def run_target(target_config: Any, target_plan: Any) -> Any:
             model = target_plan.target.resolved_model
-            provider_cls, native = self._target_class(target_config.provider)
+            provider_cls = self._target_class(target_config.provider)
 
             def count_all() -> list[int]:
                 counts: dict[str, int] = {}
@@ -1065,11 +1062,7 @@ class _AsyncEmbeddings(ProviderCache):
                         "base_delay": target_config.retry_base_delay,
                         "max_delay": DEFAULT_RETRY_MAX_DELAY, "deadline": self.config.retry_deadline,
                     }
-                    if native:
-                        result = await _async_retry_call(provider.create, texts, **retry_options, **request_kwargs)
-                    else:
-                        result = await asyncio.to_thread(
-                            _retry_call, provider.create, texts, **retry_options, **request_kwargs)
+                    result = await _async_retry_call(provider.create, texts, **retry_options, **request_kwargs)
                     acc.add(result, indices)
                 except Exception as exc:
                     raise_embedding_error(target_config, exc)

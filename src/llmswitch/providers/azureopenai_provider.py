@@ -16,7 +16,7 @@ Classes:
 import logging
 import time
 from collections.abc import AsyncGenerator, Generator
-from typing import Any
+from typing import Any, Optional
 
 import openai
 from openai import AsyncAzureOpenAI, AzureOpenAI
@@ -351,11 +351,43 @@ class AzureOpenAIChatProvider(BaseChatProvider):
                 close_stream(stream)
 
 
+def _azure_embedding_response(response: Any) -> CreateEmbeddingResponse:
+    """Map an Azure OpenAI embeddings reply to the unified response."""
+    data = [Embedding(index=item.index, embedding=item.embedding, object=item.object) for item in response.data]
+    usage = Usage(prompt_tokens=response.usage.prompt_tokens, total_tokens=response.usage.total_tokens)
+    extensions = provider_extensions_from_raw("azure_openai", response, {"object", "model", "data", "usage"})
+    return CreateEmbeddingResponse(
+        object=response.object,
+        created=int(time.time()),
+        model=response.model,
+        data=data,
+        usage=usage,
+        extensions=extensions,
+    )
+
+
+def _translate_azure_embedding_error(exc: Exception, endpoint: Optional[str]) -> Exception:
+    """Return the library error for a failed Azure OpenAI embeddings call."""
+    if isinstance(exc, ConnectionError):
+        logger.error("Connection error in embedding creation: %s | Exception: %s", endpoint, exc)
+        return APIConnectionError(endpoint)
+    if isinstance(exc, PermissionError):
+        logger.error("Authentication error in embedding creation | Exception: %s", exc)
+        return AuthenticationError()
+    if isinstance(exc, ValueError):
+        logger.error("Invalid response in embedding creation | Exception: %s", exc)
+        return InvalidResponseError(str(exc))
+    logger.error("Embedding generation error | Exception: %s", exc)
+    return EmbeddingGenerationError(str(exc), status_code=getattr(exc, "status_code", 500))
+
+
 class AzureOpenAIEmbeddingProvider(BaseEmbeddingProvider):
     """
     Azure OpenAI Embedding Provider.
     Adapts Azure-hosted OpenAI embedding models into the unified LLM Switch response format.
     """
+
+    _client_class: type = AzureOpenAI
 
     def __init__(self, **kwargs):
         """
@@ -364,7 +396,7 @@ class AzureOpenAIEmbeddingProvider(BaseEmbeddingProvider):
             **kwargs: Should include 'api_key', 'api_version', 'azure_endpoint', 'azure_deployment', and 'model'.
         """
         self.endpoint = kwargs.get("azure_endpoint")
-        self.client = AzureOpenAI(**merge_client_options({
+        self.client = self._client_class(**merge_client_options({
             "api_key": kwargs.get("api_key"),
             "api_version": kwargs.get("api_version"),
             "azure_endpoint": self.endpoint,
@@ -377,48 +409,27 @@ class AzureOpenAIEmbeddingProvider(BaseEmbeddingProvider):
     def create(self, input: list[str], **kwargs) -> CreateEmbeddingResponse:  # noqa: A002
         """Create embeddings for the given input using Azure OpenAI."""
         try:
-            response = self.client.embeddings.create(
-                model=kwargs.pop("model", self.model),
-                input=input,
-                **kwargs,
-            )
-            data = [
-                Embedding(index=item.index, embedding=item.embedding, object=item.object)
-                for item in response.data
-            ]
-
-            usage = Usage(
-                prompt_tokens=response.usage.prompt_tokens,
-                total_tokens=response.usage.total_tokens,
-            )
-
-            extensions = provider_extensions_from_raw(
-                "azure_openai",
-                response,
-                {"object", "model", "data", "usage"},
-            )
-
-            return CreateEmbeddingResponse(
-                object=response.object,
-                created=int(time.time()),
-                model=response.model,
-                data=data,
-                usage=usage,
-                extensions=extensions,
-            )
-        except ConnectionError as e:
-            logger.error("Connection error in embedding creation: %s | Exception: %s", self.endpoint, e)
-            raise APIConnectionError(self.endpoint) from e
-        except PermissionError as e:
-            logger.error("Authentication error in embedding creation | Exception: %s", e)
-            raise AuthenticationError() from e
-        except ValueError as e:
-            logger.error("Invalid response in embedding creation | Exception: %s", e)
-            raise InvalidResponseError(str(e)) from e
+            response = self.client.embeddings.create(model=kwargs.pop("model", self.model), input=input, **kwargs)
+            return _azure_embedding_response(response)
         except Exception as e:
-            status_code = getattr(e, "status_code", 500)
-            logger.error("Embedding generation error | Exception: %s", e)
-            raise EmbeddingGenerationError(str(e), status_code=status_code) from e
+            raise _translate_azure_embedding_error(e, self.endpoint) from e
+
+
+class AsyncAzureOpenAIEmbeddingProvider(AzureOpenAIEmbeddingProvider):
+    """Native async Azure OpenAI embeddings, on ``openai.AsyncAzureOpenAI``."""
+
+    _client_class: type = AsyncAzureOpenAI
+
+    async def create(self, input: list[str], **kwargs) -> CreateEmbeddingResponse:  # noqa: A002
+        """Create embeddings for the given input using Azure OpenAI, without blocking the event loop."""
+        try:
+            response = await self.client.embeddings.create(model=kwargs.pop("model", self.model), input=input, **kwargs)
+            return _azure_embedding_response(response)
+        except Exception as e:
+            raise _translate_azure_embedding_error(e, self.endpoint) from e
+
+    async def aclose(self) -> None:
+        await self.client.close()
 
 
 class AsyncAzureOpenAIChatProvider(BaseChatProvider):

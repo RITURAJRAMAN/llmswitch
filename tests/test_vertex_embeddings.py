@@ -8,27 +8,43 @@ from llmswitch import AsyncLLMSwitch, LLMSwitch, LLMSwitchError
 from llmswitch.providers import vertexai_provider
 
 
+def _reply(model, contents):
+    vectors = [SimpleNamespace(values=[float(index), 0.5], statistics=SimpleNamespace(token_count=3))
+               for index, _ in enumerate(contents)]
+    return SimpleNamespace(embeddings=vectors)
+
+
 class FakeGenaiClient:
     created = []
     embed_calls = []
+    async_calls = []
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         FakeGenaiClient.created.append(kwargs)
         self.models = SimpleNamespace(embed_content=self.embed_content)
+        self.aio = SimpleNamespace(models=SimpleNamespace(embed_content=self.async_embed_content), aclose=_noop)
 
     @staticmethod
     def embed_content(*, model, contents, config=None):
         FakeGenaiClient.embed_calls.append({"model": model, "contents": list(contents), "config": config})
-        vectors = [SimpleNamespace(values=[float(index), 0.5], statistics=SimpleNamespace(token_count=3))
-                   for index, _ in enumerate(contents)]
-        return SimpleNamespace(embeddings=vectors)
+        return _reply(model, contents)
+
+    @staticmethod
+    async def async_embed_content(*, model, contents, config=None):
+        FakeGenaiClient.async_calls.append({"model": model, "contents": list(contents), "config": config})
+        return _reply(model, contents)
+
+
+async def _noop():
+    return None
 
 
 @pytest.fixture(autouse=True)
 def fake_google(monkeypatch):
     FakeGenaiClient.created = []
     FakeGenaiClient.embed_calls = []
+    FakeGenaiClient.async_calls = []
     monkeypatch.setattr(vertexai_provider, "load_credentials_from_file", lambda path, scopes: ("creds", "my-project"))
     monkeypatch.setattr(vertexai_provider.genai, "Client", FakeGenaiClient)
 
@@ -74,7 +90,7 @@ def test_embeddings_need_a_model():
             client.embeddings.create(["alpha"])
 
 
-def test_the_async_client_returns_the_same_vectors():
+def test_the_async_client_uses_the_native_async_client():
     async def go():
         async with AsyncLLMSwitch(provider="vertexai", location="global",
                                   credentials_path="service-account.json") as client:
@@ -82,3 +98,4 @@ def test_the_async_client_returns_the_same_vectors():
 
     reply = asyncio.run(go())
     assert len(reply.data) == 2 and reply.data[1].embedding == [1.0, 0.5]
+    assert len(FakeGenaiClient.async_calls) == 1 and FakeGenaiClient.embed_calls == []

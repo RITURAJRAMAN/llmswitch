@@ -1,5 +1,6 @@
 """Native async embeddings: the Foundry provider and the async pipeline around it."""
 import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -7,8 +8,9 @@ from conftest import StubEmbeddings, provider_for
 from test_contract import FOUNDRY, EmbeddingsResult
 
 from llmswitch import APIConnectionError, AsyncLLMSwitch, EmbeddingGenerationError
-from llmswitch.core.registry import ASYNC_EMBEDDING_PROVIDER_REGISTRY
 from llmswitch.providers.azurefoundry_provider import AsyncAzureFoundryEmbeddingProvider, AzureFoundryEmbeddingProvider
+from llmswitch.providers.azureopenai_provider import AsyncAzureOpenAIEmbeddingProvider
+from llmswitch.providers.openai_provider import AsyncOpenAIEmbeddingProvider
 
 
 def sdk_result(count=1):
@@ -67,13 +69,6 @@ async def test_foundry_connection_errors_are_retried_then_raised(monkeypatch):
         await client.embeddings.create("hello")
 
 
-async def test_a_provider_without_an_async_class_still_works_in_a_thread(stubs):
-    assert "openai" not in ASYNC_EMBEDDING_PROVIDER_REGISTRY
-    client = AsyncLLMSwitch(provider="openai", api_key="k", model="gpt-4o", user_id="aemb-fallback")
-    result = await client.embeddings.create(["a", "bb"])
-    assert [item.embedding for item in result.data] == [[1.0], [2.0]]
-
-
 async def test_failover_goes_from_a_native_async_primary_to_a_sync_backup(stubs, monkeypatch):
     client, provider = foundry_client(
         "aemb-failover", backup={"provider": "openai", "api_key": "k2", "model": "text-embedding-3-small"})
@@ -105,3 +100,39 @@ def test_the_sync_provider_still_maps_through_the_shared_mixin():
     provider = provider_for(client, AzureFoundryEmbeddingProvider)
     provider.client.embed = MagicMock(return_value=sdk_result())
     assert client.embeddings.create("hello").data[0].embedding == [0.1]
+
+
+def openai_style_reply(count, model="text-embedding-3-small"):
+    """A reply shaped like the OpenAI and Azure OpenAI SDKs return for embeddings."""
+    return SimpleNamespace(
+        object="list", model=model, usage=SimpleNamespace(prompt_tokens=2, total_tokens=2),
+        data=[SimpleNamespace(index=i, embedding=[0.1 * (i + 1)], object="embedding") for i in range(count)])
+
+
+async def test_openai_embeddings_use_the_native_async_client():
+    client = AsyncLLMSwitch(provider="openai", api_key="k", model="text-embedding-3-small", user_id="aemb-openai")
+    provider = provider_for(client, AsyncOpenAIEmbeddingProvider)
+    provider.client.embeddings.create = AsyncMock(side_effect=lambda **kw: openai_style_reply(len(kw["input"])))
+    result = await client.embeddings.create(["a", "bb"])
+    assert [item.embedding for item in result.data] == [[0.1], [0.2]]
+    assert result.usage.total_tokens == 2
+    provider.client.embeddings.create.assert_awaited_once()
+
+
+async def test_azure_openai_embeddings_use_the_native_async_client():
+    client = AsyncLLMSwitch(provider="azure_openai", api_key="k", endpoint="https://x.openai.azure.com",
+                            api_version="2024-10-21", deployment_name="emb", model="text-embedding-3-small",
+                            user_id="aemb-azure-openai")
+    provider = provider_for(client, AsyncAzureOpenAIEmbeddingProvider)
+    provider.client.embeddings.create = AsyncMock(side_effect=lambda **kw: openai_style_reply(len(kw["input"])))
+    result = await client.embeddings.create(["a", "bb"])
+    assert [item.index for item in result.data] == [0, 1]
+    provider.client.embeddings.create.assert_awaited_once()
+
+
+async def test_openai_async_close_closes_the_native_client():
+    client = AsyncLLMSwitch(provider="openai", api_key="k", model="text-embedding-3-small", user_id="aemb-openai-close")
+    provider = provider_for(client, AsyncOpenAIEmbeddingProvider)
+    provider.client.close = AsyncMock()
+    await client.aclose()
+    provider.client.close.assert_awaited_once()

@@ -330,11 +330,43 @@ class OpenAIChatProvider(BaseChatProvider):
                 close_stream(stream)
 
 
+def _openai_embedding_response(response: Any) -> CreateEmbeddingResponse:
+    """Map an OpenAI embeddings reply to the unified response."""
+    data = [Embedding(index=item.index, embedding=item.embedding, object=item.object) for item in response.data]
+    usage = Usage(prompt_tokens=response.usage.prompt_tokens, total_tokens=response.usage.total_tokens)
+    extensions = provider_extensions_from_raw("openai", response, {"object", "model", "data", "usage"})
+    return CreateEmbeddingResponse(
+        object=response.object,
+        created=int(time.time()),
+        model=response.model,
+        data=data,
+        usage=usage,
+        extensions=extensions,
+    )
+
+
+def _translate_embedding_error(exc: Exception, endpoint: str) -> Exception:
+    """Return the library error for a failed embeddings call, so it can be raised with the original as its cause."""
+    if isinstance(exc, ConnectionError):
+        logger.error("Connection error in embedding creation: %s | Exception: %s", endpoint, exc)
+        return APIConnectionError(endpoint)
+    if isinstance(exc, PermissionError):
+        logger.error("Authentication error in embedding creation | Exception: %s", exc)
+        return AuthenticationError()
+    if isinstance(exc, ValueError):
+        logger.error("Invalid response in embedding creation | Exception: %s", exc)
+        return InvalidResponseError(str(exc))
+    logger.error("Embedding generation error | Exception: %s", exc)
+    return EmbeddingGenerationError(str(exc), status_code=getattr(exc, "status_code", 500))
+
+
 class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
     """
     Native OpenAI Embedding Provider.
     Adapts OpenAI embedding models into the unified LLM Switch response format.
     """
+
+    _client_class: type = OpenAI
 
     def __init__(self, **kwargs: Any) -> None:
         """
@@ -350,54 +382,32 @@ class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
         self.project: Optional[str] = kwargs.get("project")
         self.timeout: Optional[float] = kwargs.get("timeout")
 
-        self.client: OpenAI = OpenAI(**merge_client_options(_openai_client_kwargs(kwargs), kwargs.get("client_options")))
+        self.client = self._client_class(**merge_client_options(_openai_client_kwargs(kwargs), kwargs.get("client_options")))
 
     def create(self, input: list[str], **kwargs: Any) -> CreateEmbeddingResponse:  # noqa: A002
         """Create embeddings for the given input using the OpenAI API."""
         try:
-            response = self.client.embeddings.create(
-                model=kwargs.pop("model", self.model),
-                input=input,
-                **kwargs,
-            )
-
-            data = [
-                Embedding(index=item.index, embedding=item.embedding, object=item.object)
-                for item in response.data
-            ]
-
-            usage = Usage(
-                prompt_tokens=response.usage.prompt_tokens,
-                total_tokens=response.usage.total_tokens,
-            )
-
-            extensions = provider_extensions_from_raw(
-                "openai",
-                response,
-                {"object", "model", "data", "usage"},
-            )
-
-            return CreateEmbeddingResponse(
-                object=response.object,
-                created=int(time.time()),
-                model=response.model,
-                data=data,
-                usage=usage,
-                extensions=extensions,
-            )
-        except ConnectionError as e:
-            logger.error("Connection error in embedding creation: %s | Exception: %s", self.endpoint, e)
-            raise APIConnectionError(self.endpoint or "https://api.openai.com") from e
-        except PermissionError as e:
-            logger.error("Authentication error in embedding creation | Exception: %s", e)
-            raise AuthenticationError() from e
-        except ValueError as e:
-            logger.error("Invalid response in embedding creation | Exception: %s", e)
-            raise InvalidResponseError(str(e)) from e
+            response = self.client.embeddings.create(model=kwargs.pop("model", self.model), input=input, **kwargs)
+            return _openai_embedding_response(response)
         except Exception as e:
-            status_code = getattr(e, "status_code", 500)
-            logger.error("Embedding generation error | Exception: %s", e)
-            raise EmbeddingGenerationError(str(e), status_code=status_code) from e
+            raise _translate_embedding_error(e, self.endpoint or "https://api.openai.com") from e
+
+
+class AsyncOpenAIEmbeddingProvider(OpenAIEmbeddingProvider):
+    """Native async OpenAI embeddings, on ``openai.AsyncOpenAI``. Same mapping and errors as the sync provider."""
+
+    _client_class: type = AsyncOpenAI
+
+    async def create(self, input: list[str], **kwargs: Any) -> CreateEmbeddingResponse:  # noqa: A002
+        """Create embeddings for the given input using the OpenAI API, without blocking the event loop."""
+        try:
+            response = await self.client.embeddings.create(model=kwargs.pop("model", self.model), input=input, **kwargs)
+            return _openai_embedding_response(response)
+        except Exception as e:
+            raise _translate_embedding_error(e, self.endpoint or "https://api.openai.com") from e
+
+    async def aclose(self) -> None:
+        await self.client.close()
 
 
 class AsyncOpenAIChatProvider(BaseChatProvider):

@@ -2,6 +2,7 @@ import pytest
 
 from llmswitch.core.registry import (
     ASYNC_CHAT_PROVIDER_REGISTRY,
+    ASYNC_EMBEDDING_PROVIDER_REGISTRY,
     CHAT_PROVIDER_REGISTRY,
     EMBEDDING_PROVIDER_REGISTRY,
 )
@@ -66,6 +67,13 @@ class StubEmbeddings:
         )
 
 
+class StubAsyncEmbeddings(StubEmbeddings):
+    """The async form of the stub: the same recorded calls and errors, awaited like a native async provider."""
+
+    async def create(self, input, **kwargs):  # noqa: A002
+        return StubEmbeddings.create(self, input, **kwargs)
+
+
 async def _agen():
     yield {"chunk": 1}
     yield {"chunk": 2}
@@ -76,6 +84,10 @@ def stubs(monkeypatch):
     """Route every provider name to the stub classes and reset recorded state."""
     StubChat.calls, StubChat.error, StubChat.closed = [], None, False
     StubEmbeddings.calls, StubEmbeddings.error = [], None
+    # Async embeddings for the stubbed providers reach the stub's async form. Azure AI Foundry keeps its real class,
+    # because some tests drive that provider's native client directly.
+    for name in ("openai", "azure_openai", "vertexai"):
+        monkeypatch.setitem(ASYNC_EMBEDDING_PROVIDER_REGISTRY, name, StubAsyncEmbeddings)
     for name in ("openai", "azure_openai", "azure_foundry", "anthropic"):
         monkeypatch.setitem(ASYNC_CHAT_PROVIDER_REGISTRY, name, StubAsyncChat)
     for name in ("openai", "azure_openai", "azure_foundry", "anthropic", "vertexai"):

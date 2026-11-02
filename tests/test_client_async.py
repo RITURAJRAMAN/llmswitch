@@ -1,4 +1,3 @@
-import threading
 
 import pytest
 
@@ -46,24 +45,6 @@ async def test_async_chat_errors_are_mapped(stubs):
     with pytest.raises(ChatCompletionError) as info:
         await openai_client().chat.completions.create(messages=MESSAGES)
     assert info.value.status_code == 400
-
-
-async def test_async_embeddings_run_the_sync_provider_off_the_event_loop(stubs):
-    _, StubEmbeddings = stubs
-    seen_threads = []
-    original_create = StubEmbeddings.create
-
-    def tracking_create(self, input, **kwargs):  # noqa: A002
-        seen_threads.append(threading.current_thread() is not threading.main_thread())
-        return original_create(self, input, **kwargs)
-
-    StubEmbeddings.create = tracking_create
-    try:
-        result = await openai_client().embeddings.create(["a", "bb"])
-    finally:
-        StubEmbeddings.create = original_create
-    assert [item.embedding for item in result.data] == [[1.0], [2.0]]
-    assert seen_threads == [True]
 
 
 async def test_async_embedding_errors_are_mapped(stubs):

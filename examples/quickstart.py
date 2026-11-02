@@ -1,5 +1,5 @@
 """
-Quickstart for llmswitch 0.1.0.
+Quickstart for llmswitch.
 
 Set the variables for the provider you want to try, then run:
 

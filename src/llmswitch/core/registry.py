@@ -75,9 +75,11 @@ EMBEDDING_PROVIDER_REGISTRY = _LazyRegistry({
     "azure_foundry": ("azurefoundry_provider", "AzureFoundryEmbeddingProvider"),
     "vertexai": ("vertexai_provider", "VertexAIEmbeddingProvider"),
 })
-# Providers without an entry here run their sync embedding provider in a worker thread.
 ASYNC_EMBEDDING_PROVIDER_REGISTRY = _LazyRegistry({
+    "openai": ("openai_provider", "AsyncOpenAIEmbeddingProvider"),
+    "azure_openai": ("azureopenai_provider", "AsyncAzureOpenAIEmbeddingProvider"),
     "azure_foundry": ("azurefoundry_provider", "AsyncAzureFoundryEmbeddingProvider"),
+    "vertexai": ("vertexai_provider", "AsyncVertexAIEmbeddingProvider"),
 })
 RESPONSES_PROVIDER_REGISTRY = _LazyRegistry({
     "openai": ("openai_provider", "OpenAIResponsesProvider"),

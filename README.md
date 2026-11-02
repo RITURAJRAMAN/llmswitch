@@ -137,8 +137,8 @@ asyncio.run(main())
 | `anthropic` | `api_key`, `model` | yes / yes | no | emulated |
 | `vertexai` | `location`, `credentials_path`, `model` | yes / yes | yes | emulated |
 
-Asynchronous embeddings use the native async client for `azure_foundry`. The other providers run their
-synchronous embedding code in a worker thread, so the event loop stays free.
+Asynchronous embeddings use each provider's native async client: `openai`, `azure_openai`, `azure_foundry` and
+`vertexai`. Every embedding provider has one, so no embedding call runs in a worker thread.
 
 **Credentials.** The library never reads environment variables or `.env` files. Load your keys in your
 application and pass them to the constructor. `credentials_path` for Vertex AI points to a service account

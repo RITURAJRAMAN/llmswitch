@@ -963,6 +963,37 @@ class AsyncVertexAIResponsesProvider(AsyncEmulatedResponsesProvider):
 _EMBED_CONFIG_KEYS = ("task_type", "title", "output_dimensionality", "auto_truncate")
 
 
+def _vertex_embedding_request(default_model: Optional[str], kwargs: dict[str, Any]) -> tuple[str, Any]:
+    """The model and embedding configuration for one request. Consumes the keyword arguments it uses."""
+    model = kwargs.pop("model", None) or default_model
+    if not model:
+        raise EmbeddingGenerationError("Vertex AI embeddings need a model, such as gemini-embedding-001.",
+                                       status_code=400, provider="vertexai")
+    config_options = {key: kwargs.pop(key) for key in _EMBED_CONFIG_KEYS if key in kwargs}
+    if kwargs:
+        raise EmbeddingGenerationError(
+            f"Unsupported embedding options for Vertex AI: {', '.join(sorted(kwargs))}.",
+            status_code=400, provider="vertexai")
+    return model, types.EmbedContentConfig(**config_options) if config_options else None
+
+
+def _vertex_embedding_response(response: Any, model: str) -> CreateEmbeddingResponse:
+    """Map a google-genai embeddings reply to the unified response, with the tokens the service counted."""
+    vectors = response.embeddings or []
+    data = [
+        Embedding(index=index, embedding=list(item.values or []), object="embedding")
+        for index, item in enumerate(vectors)
+    ]
+    tokens = sum(int(item.statistics.token_count or 0) for item in vectors if item.statistics is not None)
+    return CreateEmbeddingResponse(
+        object="list",
+        created=int(time.time()),
+        model=model,
+        data=data,
+        usage=Usage(prompt_tokens=tokens, total_tokens=tokens),
+    )
+
+
 class VertexAIEmbeddingProvider(BaseEmbeddingProvider):
     """
     Embeddings with Gemini embedding models on Vertex AI, through google-genai.
@@ -1025,31 +1056,19 @@ class VertexAIEmbeddingProvider(BaseEmbeddingProvider):
         Raises:
             EmbeddingGenerationError: No model is set, or an option is not supported for Vertex AI.
         """
-        model = kwargs.pop("model", None) or self.model
-        if not model:
-            raise EmbeddingGenerationError("Vertex AI embeddings need a model, such as gemini-embedding-001.",
-                                           status_code=400, provider="vertexai")
-        config_options = {key: kwargs.pop(key) for key in _EMBED_CONFIG_KEYS if key in kwargs}
-        if kwargs:
-            raise EmbeddingGenerationError(
-                f"Unsupported embedding options for Vertex AI: {', '.join(sorted(kwargs))}.",
-                status_code=400, provider="vertexai")
+        model, config = _vertex_embedding_request(self.model, kwargs)
+        response = self.client.models.embed_content(model=model, contents=list(input), config=config)
+        return _vertex_embedding_response(response, model)
 
-        response = self.client.models.embed_content(
-            model=model,
-            contents=list(input),
-            config=types.EmbedContentConfig(**config_options) if config_options else None,
-        )
-        vectors = response.embeddings or []
-        data = [
-            Embedding(index=index, embedding=list(item.values or []), object="embedding")
-            for index, item in enumerate(vectors)
-        ]
-        tokens = sum(int(item.statistics.token_count or 0) for item in vectors if item.statistics is not None)
-        return CreateEmbeddingResponse(
-            object="list",
-            created=int(time.time()),
-            model=model,
-            data=data,
-            usage=Usage(prompt_tokens=tokens, total_tokens=tokens),
-        )
+
+class AsyncVertexAIEmbeddingProvider(VertexAIEmbeddingProvider):
+    """Async Vertex AI embeddings, on the google-genai ``aio`` client. Same options and mapping as the sync provider."""
+
+    async def create(self, input: list[str], **kwargs: Any) -> CreateEmbeddingResponse:  # noqa: A002
+        """Create one embedding vector per input text, without blocking the event loop."""
+        model, config = _vertex_embedding_request(self.model, kwargs)
+        response = await self.client.aio.models.embed_content(model=model, contents=list(input), config=config)
+        return _vertex_embedding_response(response, model)
+
+    async def aclose(self) -> None:
+        await self.client.aio.aclose()
