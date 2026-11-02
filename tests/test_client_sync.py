@@ -125,12 +125,6 @@ def test_non_string_embedding_input_is_rejected(stubs):
         openai_client().embeddings.create(["ok", 3])
 
 
-def test_embeddings_are_unsupported_for_vertexai():
-    client = LLMSwitch(provider="vertexai", location="us-central1", credentials_path="/tmp/sa.json")
-    with pytest.raises(LLMSwitchError, match="Unsupported provider for embeddings: vertexai"):
-        client.embeddings.create("hello")
-
-
 def test_embeddings_are_unsupported_for_anthropic():
     client = LLMSwitch(provider="anthropic", api_key="k")
     with pytest.raises(LLMSwitchError, match="Unsupported provider for embeddings: anthropic"):

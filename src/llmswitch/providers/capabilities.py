@@ -103,7 +103,7 @@ _MANIFESTS: dict[str, ProviderCapabilityManifest] = {
         operations=MappingProxyType({
             "chat.sync": CapabilitySupport.SUPPORTED,
             "chat.async": CapabilitySupport.SUPPORTED,
-            "embeddings": CapabilitySupport.UNSUPPORTED,
+            "embeddings": CapabilitySupport.SUPPORTED,
             "responses": CapabilitySupport.SUPPORTED,
         }),
         features=MappingProxyType({

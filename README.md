@@ -5,7 +5,7 @@ Azure AI Foundry, Anthropic and Vertex AI. Switch providers by changing the cons
 call sites stay the same. Rate limits, retries, a circuit breaker, backup failover and context handling
 are built in, and they behave the same for every provider.
 
-Supported in 0.1.5: sync and async chat completions (streaming and structured output), embeddings, the
+Supported in 0.1.6: sync and async chat completions (streaming and structured output), embeddings, the
 Responses API, rate limiting, retries, a circuit breaker, backup failover, context truncation, batching,
 observability hooks, and the agentic features (the optional `agentic` extra): a chat model with a bounded
 tool loop, and an agent with reflection, tool execution, checkpoints and resume, model routing, specialists
@@ -135,7 +135,7 @@ asyncio.run(main())
 | `azure_openai` | `api_key`, `endpoint`, `api_version`, `deployment_name` | yes / yes | yes | native |
 | `azure_foundry` | `api_key`, `endpoint`, `api_version`, `deployment_name` | yes / yes | yes | no |
 | `anthropic` | `api_key`, `model` | yes / yes | no | emulated |
-| `vertexai` | `location`, `credentials_path`, `model` | yes / yes | no | emulated |
+| `vertexai` | `location`, `credentials_path`, `model` | yes / yes | yes | emulated |
 
 Asynchronous embeddings use the native async client for `azure_foundry`. The other providers run their
 synchronous embedding code in a worker thread, so the event loop stays free.
@@ -264,7 +264,8 @@ vectors = client.embeddings.create(texts, batching=True, batchsize=32)
 backup embeds the whole input again. Every vector then comes from one model, because mixing vectors from two
 embedding models would make them incomparable.
 
-Embeddings are available for `openai`, `azure_openai` and `azure_foundry`.
+Embeddings are available for `openai`, `azure_openai`, `azure_foundry` and `vertexai`. For Vertex AI, use an embedding
+model such as `gemini-embedding-001`, on the same `location` as chat.
 
 ## Responses API
 

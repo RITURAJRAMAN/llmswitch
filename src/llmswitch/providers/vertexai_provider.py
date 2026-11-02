@@ -13,15 +13,21 @@ import logging
 import math
 import mimetypes
 import time
-from typing import Any
+from typing import Any, Optional
 
 from google import genai
 from google.auth import load_credentials_from_file
 from google.genai import errors as google_errors
 from google.genai import types
 
-from ..base import BaseChatProvider
-from ..errors import AuthenticationError, ChatCompletionError, ContentFilterError, RateLimitExceededError
+from ..base import BaseChatProvider, BaseEmbeddingProvider
+from ..errors import (
+    AuthenticationError,
+    ChatCompletionError,
+    ContentFilterError,
+    EmbeddingGenerationError,
+    RateLimitExceededError,
+)
 from ..models import (
     ChatCompletion,
     ChatCompletionChunk,
@@ -35,9 +41,12 @@ from ..models import (
     ChoiceLogprobs,
     ChunkDelta,
     CompletionUsage,
+    CreateEmbeddingResponse,
+    Embedding,
     Function,
     ProviderExtensions,
     TopLogprob,
+    Usage,
 )
 from ..structured import (
     is_pydantic_model_class,
@@ -948,3 +957,99 @@ class AsyncVertexAIResponsesProvider(AsyncEmulatedResponsesProvider):
 
     chat_cls = AsyncVertexAIChatProvider
     provider_name = "vertexai"
+
+
+# Keyword arguments that map onto google-genai's EmbedContentConfig.
+_EMBED_CONFIG_KEYS = ("task_type", "title", "output_dimensionality", "auto_truncate")
+
+
+class VertexAIEmbeddingProvider(BaseEmbeddingProvider):
+    """
+    Embeddings with Gemini embedding models on Vertex AI, through google-genai.
+
+    It uses the same service account, project and location as the chat provider.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        """
+        Load the service account and create the Vertex AI client for embeddings.
+
+        Args:
+            credentials_path (str): Path to the service account JSON file.
+            location (str): Vertex AI region. Defaults to us-central1.
+            model (str, optional): Embedding model, such as ``gemini-embedding-001``.
+            scopes (list[str], optional): OAuth scopes.
+            timeout (float, optional): Request timeout in seconds.
+            client_options (dict, optional): Extra keyword arguments for the google-genai client.
+
+        Raises:
+            EmbeddingGenerationError: The credentials path is missing.
+        """
+        self.model: Optional[str] = kwargs.get("deployment_name") or kwargs.get("model")
+        self.location: str = kwargs.get("location") or "us-central1"
+        self.credentials_path = kwargs.get("credentials_path")
+        self.scopes = kwargs.get("scopes", ["https://www.googleapis.com/auth/cloud-platform"])
+
+        # Status 400 marks these as client errors, so the retry logic does not repeat them.
+        if not self.credentials_path:
+            raise EmbeddingGenerationError("Valid credentials_path must be provided for Vertex AI.",
+                                           status_code=400, provider="vertexai")
+
+        creds, project = load_credentials_from_file(self.credentials_path, scopes=self.scopes)
+        self.project = project
+        timeout = kwargs.get("timeout")
+        http_options = types.HttpOptions(
+            api_version="v1",
+            timeout=math.ceil(float(timeout) * 1000) if timeout is not None else None,
+        )
+        self.client = genai.Client(**merge_client_options({
+            "vertexai": True,
+            "project": self.project,
+            "location": self.location,
+            "credentials": creds,
+            "http_options": http_options,
+        }, kwargs.get("client_options")))
+
+    def create(self, input: list[str], **kwargs: Any) -> CreateEmbeddingResponse:  # noqa: A002
+        """
+        Create one embedding vector per input text.
+
+        Args:
+            input (list[str]): The texts to embed.
+            **kwargs: ``model`` overrides the configured model. ``task_type``, ``title``, ``output_dimensionality``
+                and ``auto_truncate`` are passed to the embedding configuration.
+
+        Returns:
+            CreateEmbeddingResponse: The vectors in input order. ``usage`` counts the tokens the service reported.
+
+        Raises:
+            EmbeddingGenerationError: No model is set, or an option is not supported for Vertex AI.
+        """
+        model = kwargs.pop("model", None) or self.model
+        if not model:
+            raise EmbeddingGenerationError("Vertex AI embeddings need a model, such as gemini-embedding-001.",
+                                           status_code=400, provider="vertexai")
+        config_options = {key: kwargs.pop(key) for key in _EMBED_CONFIG_KEYS if key in kwargs}
+        if kwargs:
+            raise EmbeddingGenerationError(
+                f"Unsupported embedding options for Vertex AI: {', '.join(sorted(kwargs))}.",
+                status_code=400, provider="vertexai")
+
+        response = self.client.models.embed_content(
+            model=model,
+            contents=list(input),
+            config=types.EmbedContentConfig(**config_options) if config_options else None,
+        )
+        vectors = response.embeddings or []
+        data = [
+            Embedding(index=index, embedding=list(item.values or []), object="embedding")
+            for index, item in enumerate(vectors)
+        ]
+        tokens = sum(int(item.statistics.token_count or 0) for item in vectors if item.statistics is not None)
+        return CreateEmbeddingResponse(
+            object="list",
+            created=int(time.time()),
+            model=model,
+            data=data,
+            usage=Usage(prompt_tokens=tokens, total_tokens=tokens),
+        )

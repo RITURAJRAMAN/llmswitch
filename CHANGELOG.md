@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.6] - 2026-11-02
+
+### Added
+
+- Embeddings on Vertex AI, for example `gemini-embedding-001`, through `embeddings.create`. Options `task_type`, `title`, `output_dimensionality` and `auto_truncate` are passed on; `usage` reports the tokens the service counted.
+
+### Changed
+
+- Vertex AI is listed as supporting embeddings in the provider capability table and README.
+
 ## [0.1.5] - 2026-10-30
 
 ### Added
