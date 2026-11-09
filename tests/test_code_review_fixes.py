@@ -4,14 +4,11 @@ from __future__ import annotations
 import json
 
 import pytest
-from langchain_core.messages import AIMessage, InvalidToolCall
 from pydantic import BaseModel
 
-from llmswitch.agentic.agent import Agent, AgentConfig
 from llmswitch.agentic.aggregation import JsonMergeAggregator
 from llmswitch.agentic.checkpoints import FileCheckpointStore
 from llmswitch.agentic.contracts import SharedState
-from llmswitch.agentic.messages import response_event_to_chunk, to_ai_message
 from llmswitch.core.circuit_breaker import CircuitBreaker, provider_call
 from llmswitch.core.redaction import redact_sensitive
 from llmswitch.core.responses_capabilities import ResponseCreateRequest, _validate_mcp_policy
@@ -148,6 +145,9 @@ def test_retry_excludes_non_retryable_responses_and_capability_errors() -> None:
 
 
 def test_agentic_messages_missing_id_and_dict_event_response() -> None:
+    pytest.importorskip("langchain_core")
+    from llmswitch.agentic.messages import response_event_to_chunk, to_ai_message
+
     comp = ChatCompletion(
         id="c1",
         object="chat.completion",
@@ -186,8 +186,12 @@ def test_agentic_messages_missing_id_and_dict_event_response() -> None:
 
 
 def test_agent_handles_invalid_tool_calls_without_skipping_to_reflection() -> None:
+    pytest.importorskip("langchain_core")
     from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.messages import AIMessage, InvalidToolCall
     from langchain_core.outputs import ChatGeneration, ChatResult
+
+    from llmswitch.agentic.agent import Agent, AgentConfig
 
     class _DummyModel(BaseChatModel):
         turn: int = 0
