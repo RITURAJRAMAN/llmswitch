@@ -191,7 +191,12 @@ def normalize_request(
     kwargs.pop("input", None)
     kwargs.pop("messages", None)
     kwargs.pop("embedding_input", None)
-    message_items = tuple(dict(message) for message in (messages or ()))
+    message_items = tuple(
+        message.model_dump(exclude_none=True)
+        if not isinstance(message, dict) and callable(getattr(message, "model_dump", None))
+        else dict(message)
+        for message in (messages or ())
+    )
     if isinstance(embedding_input, str):
         embedding_items = (embedding_input,)
     else:

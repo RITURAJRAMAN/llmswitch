@@ -212,7 +212,7 @@ def _call_in_process(tool: Tool, args: dict[str, Any], timeout_s: float) -> Any:
     """
     context = multiprocessing.get_context("fork")
     reader, writer = context.Pipe(duplex=False)
-    process = context.Process(target=_child_main, args=(writer, tool, args), daemon=True)
+    process = context.Process(target=_child_main, args=(writer, tool, args), daemon=False)
     try:
         process.start()
     except BaseException:
@@ -265,6 +265,8 @@ def _run_sync_call(call: Mapping[str, Any], tool_map: Mapping[str, Tool], timeou
                    handler: AgentEventHandler | None, step: int,
                    before: Callable[[], None] | None, isolation: Isolation = "thread") -> ToolExecutionResult:
     call_id, name = _call_id(call), call.get("name") or ""
+    if call.get("type") == "invalid_tool_call" or call.get("error"):
+        return _rejected(call_id, name, {}, "parse", str(call.get("error") or "Malformed arguments"), handler, step)
     ok, args, error = parse_arguments(call.get("args"))
     if not ok:
         return _rejected(call_id, name, {}, "parse", error or "Malformed arguments", handler, step)
@@ -355,11 +357,16 @@ async def _call_async(tool: Tool, args: dict[str, Any], timeout_s: float, isolat
         # The thread waits for the tool process, and that wait ends at the limit, when the process is killed.
         return await asyncio.to_thread(_call_in_process, tool, args, timeout_s)
     if isinstance(tool, BaseTool):
+        if getattr(tool, "coroutine", None) is None and type(tool)._arun is BaseTool._arun:
+            return await asyncio.to_thread(copy_context().run, tool.invoke, args)
         return await tool.ainvoke(args)
     if inspect.iscoroutinefunction(tool):
         return await tool(**args)
     # A sync callable runs on a thread, so it does not block the event loop. It cannot be cancelled once started.
-    return await asyncio.to_thread(tool, **args)
+    result = await asyncio.to_thread(copy_context().run, lambda: tool(**args))
+    if inspect.isawaitable(result):
+        result = await result
+    return result
 
 
 async def _execute_async(call: Mapping[str, Any], tool_map: Mapping[str, Tool], timeout_s: float,
@@ -377,6 +384,8 @@ async def _run_async_call(call: Mapping[str, Any], tool_map: Mapping[str, Tool],
                           handler: AgentEventHandler | None, step: int, semaphore: asyncio.Semaphore,
                           before: Callable[[], None] | None, isolation: Isolation = "thread") -> ToolExecutionResult:
     call_id, name = _call_id(call), call.get("name") or ""
+    if call.get("type") == "invalid_tool_call" or call.get("error"):
+        return _rejected(call_id, name, {}, "parse", str(call.get("error") or "Malformed arguments"), handler, step)
     ok, args, error = parse_arguments(call.get("args"))
     if not ok:
         return _rejected(call_id, name, {}, "parse", error or "Malformed arguments", handler, step)
@@ -472,6 +481,20 @@ def _mapped(hook: Callable[..., None] | None, indices: list[int]) -> Callable[..
     return lambda local, *args: hook(indices[local], *args)
 
 
+def _mapped_result(
+    hook: ResultHook | None,
+    indices: list[int],
+    current: Sequence[ToolExecutionResult],
+) -> ResultHook:
+    def _wrap(local: int, result: ToolExecutionResult) -> None:
+        orig_idx = indices[local]
+        result.attempts = current[orig_idx].attempts + 1
+        if hook is not None:
+            hook(orig_idx, result)
+
+    return _wrap
+
+
 def retry_failed_tool_calls(
     *,
     step: int,
@@ -501,10 +524,10 @@ def retry_failed_tool_calls(
         fresh = execute_tool_calls(
             step=step, tool_calls=[tool_calls[i] for i in indices], tool_map=tool_map, timeout_s=timeout_s,
             parallel=parallel, max_concurrency=max_concurrency, handler=handler,
-            on_start=_mapped(on_start, indices), on_result=_mapped(on_result, indices), isolation=isolation,
+            on_start=_mapped(on_start, indices), on_result=_mapped_result(on_result, indices, current),
+            isolation=isolation,
         )
         for index, result in zip(indices, fresh, strict=True):
-            result.attempts = current[index].attempts + 1
             current[index] = result
     return current
 
@@ -538,9 +561,9 @@ async def aretry_failed_tool_calls(
         fresh = await aexecute_tool_calls(
             step=step, tool_calls=[tool_calls[i] for i in indices], tool_map=tool_map, timeout_s=timeout_s,
             parallel=parallel, max_concurrency=max_concurrency, handler=handler,
-            on_start=_mapped(on_start, indices), on_result=_mapped(on_result, indices), isolation=isolation,
+            on_start=_mapped(on_start, indices), on_result=_mapped_result(on_result, indices, current),
+            isolation=isolation,
         )
         for index, result in zip(indices, fresh, strict=True):
-            result.attempts = current[index].attempts + 1
             current[index] = result
     return current

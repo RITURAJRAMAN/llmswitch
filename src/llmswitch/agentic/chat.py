@@ -186,7 +186,7 @@ class ChatLLMSwitch(BaseChatModel):
 
     def _responses_request(self, stop: list[str] | None, kwargs: dict[str, Any]) -> dict[str, Any]:
         """The request for the Responses API: its token limit name and flat tool shapes differ from chat."""
-        if stop or self.stop:
+        if stop or self.stop or kwargs.get("stop") or self.call_options.get("stop"):
             raise ValueError("stop sequences are not supported with api='responses'.")
         request = self._request(None, kwargs)
         for chat_name in ("max_tokens", "max_completion_tokens"):
@@ -351,7 +351,13 @@ def _success(call_id: str, result: Any) -> ToolMessage:
 def _run_sync(tool: Tool, args: dict[str, Any]) -> Any:
     if isinstance(tool, BaseTool):
         return tool.invoke(args)
-    return tool(**args)
+    result = tool(**args)
+    if inspect.isawaitable(result):
+        close = getattr(result, "close", None)
+        if callable(close):
+            close()
+        raise TypeError("This tool is async; run with arun_tool_loop.")
+    return result
 
 
 async def _run_async(tool: Tool, args: dict[str, Any]) -> Any:

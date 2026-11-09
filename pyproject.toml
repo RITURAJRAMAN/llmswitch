@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llmswitch-sdk"
-version = "0.1.6"
-description = "One Python client for chat completions, embeddings and the Responses API across OpenAI, Azure OpenAI, Azure AI Foundry, Anthropic and Vertex AI."
+version = "0.1.7"
+description = "Unified Python client for chat, embeddings and the Responses API across OpenAI, Azure OpenAI, Azure AI Foundry, Anthropic and Vertex AI, with rate limits, retries, failover, and optional agents with tools."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -22,13 +22,13 @@ classifiers = [
 ]
 
 dependencies = [
-    "pydantic>=2.14.1,<3",
-    "openai>=3.36.1,<4.0.0",
-    "anthropic>=2.1.0,<3",
-    "azure-ai-inference==1.0.0b9",
-    "aiohttp>=3.14.5,<4.0.0",
-    "google-genai>=2.32.0,<3",
-    "tiktoken>=0.14.0,<0.15",
+    "pydantic>=2.14.1",
+    "openai>=3.36.1",
+    "anthropic>=2.1.0",
+    "azure-ai-inference>=1.0.0b9",
+    "aiohttp>=3.14.5",
+    "google-genai>=2.32.0",
+    "tiktoken>=0.14.0",
 ]
 
 [project.urls]
@@ -38,16 +38,16 @@ Issues = "https://github.com/RITURAJRAMAN/llmswitch/issues"
 Changelog = "https://github.com/RITURAJRAMAN/llmswitch/blob/main/CHANGELOG.md"
 
 # Every provider SDK is a core dependency. These extras are kept, empty, so existing
-# install commands such as pip install "llmswitch-sdk[vertexai]" keep working.
+# installation commands such as pip install "llmswitch-sdk[vertexai]" keep working.
 [project.optional-dependencies]
 anthropic = []
 azure-foundry = []
 vertexai = []
 redis = [
-    "redis>=8.1.0,<9",
+    "redis>=8.1.0",
 ]
 agentic = [
-    "langchain-core>=1.6.9,<2",
+    "langchain-core>=1.6.9",
 ]
 all = [
     "llmswitch-sdk[redis,agentic]",

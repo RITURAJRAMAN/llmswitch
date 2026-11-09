@@ -1,6 +1,7 @@
 """Capability contracts and request validation for the Responses API."""
 from __future__ import annotations
 
+import ipaddress
 from enum import Enum
 from typing import Any, Literal, Mapping
 from urllib.parse import urlparse
@@ -126,6 +127,12 @@ class ResponseCreateRequest(BaseModel):
             value = getattr(self, name)
             if value is not None and not is_pydantic_model_class(value):
                 raise ValueError(f"{name} must be a Pydantic model class")
+        if isinstance(self.extra_body, Mapping):
+            reserved = {"tools", "background", "previous_response_id", "conversation", "store"} & set(self.extra_body)
+            if reserved:
+                raise ValueError(
+                    f"extra_body cannot override validated contract fields: {', '.join(sorted(reserved))}"
+                )
         return self
 
 
@@ -225,15 +232,20 @@ def resolve_response_capabilities(config: Any) -> ResponseCapabilities:
         model = getattr(config, "deployment_name", None) or getattr(config, "model", None)
         api_version = getattr(config, "responses_api_version", None) or getattr(config, "api_version", None)
     elif provider in ("anthropic", "vertexai"):
+        features = dict(_EMULATED_FEATURES)
         model = getattr(config, "deployment_name", None) or getattr(config, "model", None)
-        return ResponseCapabilities(provider=provider, model=model, features=dict(_EMULATED_FEATURES),
-                                    emulated=True)
+        api_version = None
+        emulated = True
     else:
         raise UnsupportedCapabilityError(provider=str(provider), feature="responses")
 
+    if provider not in ("anthropic", "vertexai"):
+        emulated = False
     for feature, enabled in (getattr(config, "responses_capabilities", None) or {}).items():
         features[feature] = CapabilityStatus.SUPPORTED if enabled else CapabilityStatus.UNSUPPORTED
-    return ResponseCapabilities(provider=provider, model=model, api_version=api_version, features=features)
+    return ResponseCapabilities(
+        provider=provider, model=model, api_version=api_version, features=features, emulated=emulated
+    )
 
 
 def validate_response_operation(config: Any, operation: str) -> ResponseCapabilities:
@@ -293,6 +305,42 @@ def validate_responses_create_request(
     return capabilities
 
 
+def _normalize_origin_host(origin: str) -> str:
+    raw = str(origin).strip()
+    if "://" in raw:
+        parsed = urlparse(raw)
+        return parsed.netloc.lower()
+    return raw.rstrip("/").split("/", 1)[0].lower()
+
+
+def _validate_mcp_server_url(url: str, provider: Any) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "https" or not parsed.netloc or not parsed.hostname:
+        raise InvalidResponseRequestError(
+            "MCP server_url must be a valid https:// URL", provider=provider
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise InvalidResponseRequestError(
+            "MCP server_url must not contain embedded credentials", provider=provider
+        )
+    host = parsed.hostname.lower()
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".localhost"):
+        raise InvalidResponseRequestError(
+            "MCP server_url cannot target localhost", provider=provider
+        )
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None and (
+        ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved
+    ):
+        raise InvalidResponseRequestError(
+            "MCP server_url cannot target private, loopback, or link-local IP addresses", provider=provider
+        )
+    return parsed.netloc.lower()
+
+
 def _validate_mcp_policy(config: Any, tool: dict[str, Any]) -> None:
     """Require explicit local allowlisting before exposing remote MCP/connectors."""
     policy = getattr(config, "mcp_policy", None) or {}
@@ -300,16 +348,21 @@ def _validate_mcp_policy(config: Any, tool: dict[str, Any]) -> None:
         raise InvalidResponseRequestError("remote MCP and connectors require mcp_policy={'enabled': True}", provider=config.provider)
     labels = set(policy.get("allowed_server_labels") or [])
     connector_ids = set(policy.get("allowed_connector_ids") or [])
-    origins = set(policy.get("allowed_origins") or [])
+    origins = {_normalize_origin_host(o) for o in (policy.get("allowed_origins") or []) if o}
     if not labels and not connector_ids and not origins:
         raise InvalidResponseRequestError("mcp_policy must declare an allowed server label, origin, or connector ID", provider=config.provider)
     if labels and tool.get("server_label") not in labels:
         raise InvalidResponseRequestError("MCP server label is not allowed by mcp_policy", provider=config.provider)
-    if tool.get("connector_id") and tool["connector_id"] not in connector_ids:
-        raise InvalidResponseRequestError("MCP connector ID is not allowed by mcp_policy", provider=config.provider)
+    if tool.get("connector_id"):
+        if tool["connector_id"] not in connector_ids:
+            raise InvalidResponseRequestError("MCP connector ID is not allowed by mcp_policy", provider=config.provider)
     url = tool.get("server_url")
-    if origins and url and urlparse(url).netloc not in origins:
-        raise InvalidResponseRequestError("MCP server origin is not allowed by mcp_policy", provider=config.provider)
+    if isinstance(url, str) and url:
+        netloc = _validate_mcp_server_url(url, config.provider)
+        if origins and netloc not in origins and netloc.split(":", 1)[0] not in origins:
+            raise InvalidResponseRequestError("MCP server origin is not allowed by mcp_policy", provider=config.provider)
+    elif origins and not tool.get("connector_id"):
+        raise InvalidResponseRequestError("MCP server_url is required when allowed_origins is configured", provider=config.provider)
 
 
 def normalize_response_tool_definitions(kwargs: dict[str, Any]) -> None:

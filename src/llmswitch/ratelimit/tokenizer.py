@@ -57,8 +57,10 @@ def _resolve_encoding(model_name: Optional[str]):
 
 
 def fallback_count_tokens(text: str) -> int:
-    """Estimate token count by word count * 1.3 (used when tiktoken is unavailable)."""
-    return int(len(text.split()) * 1.3)
+    """Estimate token count by word count * 1.3 or char length / 4 (used when tiktoken is unavailable)."""
+    if not text:
+        return 0
+    return max(int(len(text.split()) * 1.3), (len(text) + 3) // 4)
 
 
 def _encode_length(text: str, model_name: Optional[str]) -> int:
@@ -66,7 +68,7 @@ def _encode_length(text: str, model_name: Optional[str]) -> int:
     if encoding is None:
         return fallback_count_tokens(text)
     try:
-        return len(encoding.encode(text))
+        return len(encoding.encode(text, disallowed_special=()))
     except Exception as e:  # noqa: BLE001
         logger.warning("Unexpected error occurred during tokenization %s. Using fallback estimation.", e)
         return fallback_count_tokens(text)
@@ -102,7 +104,7 @@ def truncate_message(message: str, max_tokens: int, truncate: bool = False,
         return message
 
     try:
-        encoded_tokens = encoding.encode(message)
+        encoded_tokens = encoding.encode(message, disallowed_special=())
         if len(encoded_tokens) <= max_tokens:
             return message
         truncated_message = encoding.decode(encoded_tokens[:max_tokens])

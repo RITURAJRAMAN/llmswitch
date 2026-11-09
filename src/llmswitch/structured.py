@@ -17,7 +17,6 @@ Contents:
 
 from __future__ import annotations
 
-import json
 import logging
 from functools import lru_cache
 from typing import Any, Optional
@@ -161,21 +160,7 @@ def _strictify_json_schema(schema: Any) -> Any:
 
 
 @lru_cache(maxsize=256)
-def pydantic_to_response_format(model_cls: type[BaseModel]) -> dict[str, Any]:
-    """
-    Build a strict, OpenAI-style ``json_schema`` ``response_format`` dict from a
-    Pydantic model class.
-
-    Used by the streaming path of the OpenAI/Azure providers (where the SDK
-    ``.parse()`` helper isn't available) and by Azure Foundry. Strict mode
-    requires ``additionalProperties: false`` on every object and every property
-    listed in ``required`` — so this delegates to the OpenAI SDK's own
-    converter (identical to what ``.parse()`` sends) when available, falling
-    back to a self-contained strict transform otherwise.
-
-    Result is cached per model class — schema generation is pure and the same
-    model is typically reused across many requests.
-    """
+def _cached_response_format(model_cls: type[BaseModel]) -> dict[str, Any]:
     try:
         from openai.lib._parsing._completions import type_to_response_format_param
 
@@ -197,17 +182,33 @@ def pydantic_to_response_format(model_cls: type[BaseModel]) -> dict[str, Any]:
     }
 
 
-@lru_cache(maxsize=256)
-def pydantic_to_text_format(model_cls: type[BaseModel]) -> dict[str, Any]:
+def pydantic_to_response_format(model_cls: type[BaseModel]) -> dict[str, Any]:
     """
-    Build the Responses API ``text`` parameter from a Pydantic model class.
+    Build a strict, OpenAI-style ``json_schema`` ``response_format`` dict from a
+    Pydantic model class.
 
-    The Responses API takes ``text={"format": {"type": "json_schema", "name": ...,
-    "schema": ..., "strict": ...}}`` — a flattened shape, unlike Chat Completions'
-    nested ``response_format.json_schema``. This reuses the same strict-schema
-    transform and reshapes it.
+    Used by the streaming path of the OpenAI/Azure providers (where the SDK
+    ``.parse()`` helper isn't available) and by Azure Foundry. Strict mode
+    requires ``additionalProperties: false`` on every object and every property
+    listed in ``required`` — so this delegates to the OpenAI SDK's own
+    converter (identical to what ``.parse()`` sends) when available, falling
+    back to a self-contained strict transform otherwise.
+
+    Result is cached per model class — schema generation is pure and the same
+    model is typically reused across many requests.
     """
-    response_format = pydantic_to_response_format(model_cls)
+    cached = _cached_response_format(model_cls)
+    js = cached.get("json_schema")
+    if isinstance(js, dict):
+        schema = js.get("schema")
+        js_copy = {**js, "schema": dict(schema)} if isinstance(schema, dict) else dict(js)
+        return {**cached, "json_schema": js_copy}
+    return dict(cached)
+
+
+@lru_cache(maxsize=256)
+def _cached_text_format(model_cls: type[BaseModel]) -> dict[str, Any]:
+    response_format = _cached_response_format(model_cls)
     json_schema = response_format.get("json_schema") or {}
     return {
         "format": {
@@ -217,6 +218,39 @@ def pydantic_to_text_format(model_cls: type[BaseModel]) -> dict[str, Any]:
             "strict": json_schema.get("strict", False),
         }
     }
+
+
+def pydantic_to_text_format(model_cls: type[BaseModel]) -> dict[str, Any]:
+    """
+    Build the Responses API ``text`` parameter from a Pydantic model class.
+
+    The Responses API takes ``text={"format": {"type": "json_schema", "name": ...,
+    "schema": ..., "strict": ...}}`` — a flattened shape, unlike Chat Completions'
+    nested ``response_format.json_schema``. This reuses the same strict-schema
+    transform and reshapes it.
+    """
+    cached = _cached_text_format(model_cls)
+    fmt = cached["format"]
+    schema = fmt.get("schema")
+    fmt_copy = {**fmt, "schema": dict(schema)} if isinstance(schema, dict) else dict(fmt)
+    return {"format": fmt_copy}
+
+
+def _extract_json_block(raw: str) -> Optional[str]:
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 2:
+            end_idx = len(lines) - 1 if lines[-1].strip().startswith("```") else len(lines)
+            text = "\n".join(lines[1:end_idx]).strip()
+            if text:
+                return text
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        start = text.find(open_ch)
+        end = text.rfind(close_ch)
+        if start != -1 and end > start:
+            return text[start:end + 1]
+    return None
 
 
 def deserialize_to_model(model_cls: type[BaseModel], content: Any) -> Optional[BaseModel]:
@@ -240,7 +274,10 @@ def deserialize_to_model(model_cls: type[BaseModel], content: Any) -> Optional[B
         # Some models wrap JSON in prose or code fences; try to recover a dict.
         if isinstance(content, (str, bytes, bytearray)):
             try:
-                return model_cls.model_validate(json.loads(content))
+                raw_str = content.decode("utf-8", errors="replace") if not isinstance(content, str) else content
+                extracted = _extract_json_block(raw_str)
+                if extracted:
+                    return model_cls.model_validate_json(extracted)
             except Exception:  # noqa: BLE001
                 return None
         return None

@@ -12,11 +12,11 @@ or use one of the two handlers here.
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
-
-from ..core.redaction import redact_sensitive
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +94,18 @@ class AgentEventHandler(Protocol):
         """
         ...
 
+    def on_routing_decision(self, step: int, context: dict[str, Any]) -> None:
+        """Called when a routing policy selects a model for a step.
+
+        Args:
+            step (int): The step number.
+            context (dict): Details of the routing decision.
+
+        Returns:
+            None
+        """
+        ...
+
 
 @dataclass
 class AgentEvent:
@@ -122,6 +134,11 @@ class CollectingEventHandler:
     def __init__(self) -> None:
         """Create an empty collector."""
         self.events: list[AgentEvent] = []
+        self._lock = threading.Lock()
+
+    def _record(self, event: AgentEvent) -> None:
+        with self._lock:
+            self.events.append(event)
 
     def on_step_start(self, step: int, context: dict[str, Any]) -> None:
         """Record a step start.
@@ -133,7 +150,7 @@ class CollectingEventHandler:
         Returns:
             None
         """
-        self.events.append(AgentEvent("step_start", step, context))
+        self._record(AgentEvent("step_start", step, context))
 
     def on_tool_start(self, step: int, tool_name: str, args: dict[str, Any]) -> None:
         """Record a tool call start.
@@ -146,7 +163,7 @@ class CollectingEventHandler:
         Returns:
             None
         """
-        self.events.append(AgentEvent("tool_start", step, {"tool_name": tool_name, "args": args}))
+        self._record(AgentEvent("tool_start", step, {"tool_name": tool_name, "args": args}))
 
     def on_tool_end(self, step: int, tool_name: str, result: Any, duration_s: float) -> None:
         """Record a successful tool call.
@@ -160,8 +177,8 @@ class CollectingEventHandler:
         Returns:
             None
         """
-        self.events.append(AgentEvent("tool_end", step, {"tool_name": tool_name, "duration_s": duration_s,
-                                                         "result": result}))
+        self._record(AgentEvent("tool_end", step, {"tool_name": tool_name, "duration_s": duration_s,
+                                                   "result": result}))
 
     def on_tool_error(self, step: int, tool_name: str, error: str, duration_s: float) -> None:
         """Record a failed tool call.
@@ -175,8 +192,8 @@ class CollectingEventHandler:
         Returns:
             None
         """
-        self.events.append(AgentEvent("tool_error", step, {"tool_name": tool_name, "duration_s": duration_s,
-                                                           "error": error}))
+        self._record(AgentEvent("tool_error", step, {"tool_name": tool_name, "duration_s": duration_s,
+                                                     "error": error}))
 
     def on_step_end(self, step: int, context: dict[str, Any]) -> None:
         """Record a step end.
@@ -188,7 +205,19 @@ class CollectingEventHandler:
         Returns:
             None
         """
-        self.events.append(AgentEvent("step_end", step, context))
+        self._record(AgentEvent("step_end", step, context))
+
+    def on_routing_decision(self, step: int, context: dict[str, Any]) -> None:
+        """Record a routing decision.
+
+        Args:
+            step (int): The step number.
+            context (dict): Details of the routing decision.
+
+        Returns:
+            None
+        """
+        self._record(AgentEvent("routing_decision", step, context))
 
 
 def notify(handler: AgentEventHandler | None, name: str, *args: Any) -> None:
@@ -204,12 +233,11 @@ def notify(handler: AgentEventHandler | None, name: str, *args: Any) -> None:
 
 def _shape(value: Any) -> dict[str, Any]:
     """A summary of a value that holds no content: key names for mappings, type and size otherwise."""
-    redacted = redact_sensitive(value)
-    if isinstance(redacted, dict):
-        return {"keys": sorted(str(key) for key in redacted)}
-    if isinstance(redacted, (list, tuple)):
-        return {"type": type(redacted).__name__, "length": len(redacted)}
-    return {"type": type(redacted).__name__}
+    if isinstance(value, Mapping):
+        return {"keys": sorted(str(key) for key in value)}
+    if isinstance(value, (list, tuple)):
+        return {"type": type(value).__name__, "length": len(value)}
+    return {"type": type(value).__name__}
 
 
 class LoggingEventHandler:
@@ -294,3 +322,15 @@ class LoggingEventHandler:
             None
         """
         self.logger.info("step_end | step=%s | context=%s", step, _shape(context))
+
+    def on_routing_decision(self, step: int, context: dict[str, Any]) -> None:
+        """Log a routing decision.
+
+        Args:
+            step (int): The step number.
+            context (dict): Details of the routing decision.
+
+        Returns:
+            None
+        """
+        self.logger.info("routing_decision | step=%s | context=%s", step, _shape(context))

@@ -55,7 +55,7 @@ def _publish(shared_state: SharedState | None, rows: list[dict[str, Any]]) -> No
     if shared_state is None:
         return
     for row in rows:
-        if row["raw"] is not None:
+        if row["raw"] is not None and row.get("status") in ("completed", "completed_with_reflection_limit"):
             shared_state.set(f"specialist_outputs.{row['specialist']}", row["output"])
 
 
@@ -140,8 +140,14 @@ def invoke_specialists(
             return _error_row(name, exc)
 
     if deadline is None and (not parallel or len(items) == 1):
-        rows = [run(name, agent) for name, agent in items]
-        _publish(shared_state, rows)
+        rows: list[dict[str, Any]] = []
+        for name, agent in items:
+            row = run(name, agent)
+            rows.append(row)
+            if not parallel:
+                _publish(shared_state, [row])
+        if parallel:
+            _publish(shared_state, rows)
         return attach_contract_weights(rows, contracts)
 
     # With a time limit, every specialist runs on a worker thread, even one at a time, so the caller can stop
@@ -220,7 +226,11 @@ async def ainvoke_specialists(
             return _error_row(name, exc)
 
     if not parallel:
-        rows = [await run(name, agent) for name, agent in items]
+        rows = []
+        for name, agent in items:
+            row = await run(name, agent)
+            rows.append(row)
+            _publish(shared_state, [row])
     else:
         semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
@@ -229,7 +239,7 @@ async def ainvoke_specialists(
                 return await run(name, agent)
 
         rows = list(await asyncio.gather(*(gated(name, agent) for name, agent in items)))
-    _publish(shared_state, rows)
+        _publish(shared_state, rows)
     return attach_contract_weights(rows, contracts)
 
 

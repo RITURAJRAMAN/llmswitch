@@ -29,6 +29,7 @@ from ..errors import (
     RateLimitExceededError,
     ResponseNotFoundError,
     TimeOutError,
+    detect_content_filter_error,
 )
 from ..models import (
     ChatCompletionAudio,
@@ -172,6 +173,9 @@ def translate_openai_error(exc: Exception, endpoint: Optional[str], provider: st
     if isinstance(exc, openai.NotFoundError) and resource_id:
         return ResponseNotFoundError(resource_id, provider=provider)
     if isinstance(exc, openai.BadRequestError):
+        content_filter_error = detect_content_filter_error(exc, provider=provider)
+        if content_filter_error:
+            return content_filter_error
         return error_cls(str(exc), status_code=400, **kwargs)
     if isinstance(exc, openai.APIConnectionError | ConnectionError):
         return APIConnectionError(endpoint or "https://api.openai.com", provider=provider)
@@ -247,6 +251,8 @@ def map_compacted_response(response: Any, provider: str = "openai") -> Compacted
     data = to_jsonable(response)
     if not isinstance(data, dict):
         raise InvalidResponseError("responses.compact returned a non-object payload")
+    raw_output = data.get("output") if isinstance(response, dict) else getattr(response, "output", None)
+    raw_usage = data.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
     extensions = provider_extensions_from_raw(
         provider,
         response,
@@ -255,8 +261,8 @@ def map_compacted_response(response: Any, provider: str = "openai") -> Compacted
     data.pop("output", None)
     data.pop("usage", None)
     mapped = CompactedResponse.model_validate(data)
-    mapped.output = map_response_output(getattr(response, "output", None), provider=provider)
-    mapped.usage = build_response_usage(getattr(response, "usage", None))
+    mapped.output = map_response_output(raw_output, provider=provider)
+    mapped.usage = build_response_usage(raw_usage)
     mapped.extensions = extensions
     return mapped
 
@@ -272,14 +278,25 @@ def map_response_item(item: Any, provider: str = "openai") -> ResponseItem:
 
 def map_response_item_page(page: Any, provider: str = "openai") -> ResponseItemList:
     """Map an SDK ``SyncCursorPage[ResponseItem]`` to a unified :class:`ResponseItemList`."""
-    raw_items = getattr(page, "data", None) or []
+    if isinstance(page, dict):
+        raw_items = page.get("data") or []
+        obj = page.get("object") or "list"
+        first_id = page.get("first_id")
+        last_id = page.get("last_id")
+        has_more = bool(page.get("has_more", False))
+    else:
+        raw_items = getattr(page, "data", None) or []
+        obj = getattr(page, "object", "list") or "list"
+        first_id = getattr(page, "first_id", None)
+        last_id = getattr(page, "last_id", None)
+        has_more = bool(getattr(page, "has_more", False))
     items = [map_response_item(i, provider=provider) for i in raw_items]
     mapped = ResponseItemList(
-        object=getattr(page, "object", "list") or "list",
+        object=obj,
         data=items,
-        first_id=getattr(page, "first_id", None),
-        last_id=getattr(page, "last_id", None),
-        has_more=bool(getattr(page, "has_more", False)),
+        first_id=first_id,
+        last_id=last_id,
+        has_more=has_more,
     )
     return _attach_provider_extensions(mapped, provider, page, set(ResponseItemList.model_fields))
 
@@ -339,20 +356,27 @@ def build_openai_usage(usage: Any) -> CompletionUsage:
     chunk (``latency_checkpoint`` is absent on stream usage and resolves to None,
     matching the previous inline behavior).
     """
+    if usage is None:
+        return CompletionUsage(completion_tokens=0, prompt_tokens=0, total_tokens=0)
+    pt_details = getattr(usage, "prompt_tokens_details", None)
+    ct_details = getattr(usage, "completion_tokens_details", None)
     prompt_tokens_details = PromptTokensDetails(
-        audio_tokens=getattr(usage.prompt_tokens_details, "audio_tokens", 0),
-        cached_tokens=getattr(usage.prompt_tokens_details, "cached_tokens", 0),
+        audio_tokens=getattr(pt_details, "audio_tokens", 0) or 0,
+        cached_tokens=getattr(pt_details, "cached_tokens", 0) or 0,
     )
     completion_tokens_details = CompletionTokensDetails(
-        accepted_prediction_tokens=getattr(usage.completion_tokens_details, "accepted_prediction_tokens", 0),
-        audio_tokens=getattr(usage.completion_tokens_details, "audio_tokens", 0),
-        reasoning_tokens=getattr(usage.completion_tokens_details, "reasoning_tokens", 0),
-        rejected_prediction_tokens=getattr(usage.completion_tokens_details, "rejected_prediction_tokens", 0),
+        accepted_prediction_tokens=getattr(ct_details, "accepted_prediction_tokens", 0) or 0,
+        audio_tokens=getattr(ct_details, "audio_tokens", 0) or 0,
+        reasoning_tokens=getattr(ct_details, "reasoning_tokens", 0) or 0,
+        rejected_prediction_tokens=getattr(ct_details, "rejected_prediction_tokens", 0) or 0,
     )
+    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+    total_tokens = getattr(usage, "total_tokens", 0) or (prompt_tokens + completion_tokens)
     return CompletionUsage(
-        completion_tokens=usage.completion_tokens,
-        prompt_tokens=usage.prompt_tokens,
-        total_tokens=usage.total_tokens,
+        completion_tokens=completion_tokens,
+        prompt_tokens=prompt_tokens,
+        total_tokens=total_tokens,
         completion_tokens_details=completion_tokens_details,
         prompt_tokens_details=prompt_tokens_details,
         latency_checkpoint=getattr(usage, "latency_checkpoint", None),

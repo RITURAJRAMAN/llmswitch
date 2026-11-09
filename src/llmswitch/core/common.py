@@ -9,6 +9,7 @@ from __future__ import annotations
 import difflib
 import logging
 from collections.abc import Mapping
+from functools import lru_cache
 from typing import Any, NoReturn
 
 from ..config import CONFIG_REGISTRY
@@ -26,12 +27,13 @@ from .registry import UNAVAILABLE_PROVIDERS
 logger = logging.getLogger(__name__)
 
 
-def _known_option_names() -> set[str]:
+@lru_cache(maxsize=1)
+def _known_option_names() -> frozenset[str]:
     """Every option that some provider defines. One constructor call works for any provider."""
     names: set[str] = set()
     for config_cls in CONFIG_REGISTRY.values():
         names.update(config_cls.model_fields)
-    return names
+    return frozenset(names)
 
 
 def _reject_unknown_options(kwargs: Mapping[str, Any]) -> None:
@@ -70,10 +72,16 @@ def build_config(kwargs: Mapping[str, Any]) -> Any:
         raise ConfigurationError(f"Invalid switch configuration: {exc}", details=str(exc)) from exc
 
 
+def _is_message_obj(message: Any) -> bool:
+    return isinstance(message, dict) or (
+        not isinstance(message, type) and callable(getattr(message, "model_dump", None))
+    )
+
+
 def validate_messages(messages: Any) -> None:
     if not isinstance(messages, list) or not messages:
         raise ValueError("messages must be a non-empty list of message dicts")
-    if not all(isinstance(message, dict) for message in messages):
+    if not all(_is_message_obj(message) for message in messages):
         raise ValueError("every message must be a dict")
 
 

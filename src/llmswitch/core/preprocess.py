@@ -81,6 +81,9 @@ def apply_model_priority(config: Any, kwargs: dict[str, Any]) -> Any:
     return kwargs.get("model") or getattr(config, "model", None)
 
 
+_close_tasks: set[asyncio.Task[Any]] = set()
+
+
 def _run_close_coro(coro) -> None:
     """Drive a client close-coroutine to completion (eviction may run on or off a loop)."""
     try:
@@ -89,7 +92,9 @@ def _run_close_coro(coro) -> None:
         loop = None
     if loop is not None and loop.is_running():
         # Async-switch path runs on the loop thread — fire-and-forget the close.
-        loop.create_task(coro)
+        task = loop.create_task(coro)
+        _close_tasks.add(task)
+        task.add_done_callback(_close_tasks.discard)
     else:
         try:
             asyncio.run(coro)
@@ -334,18 +339,32 @@ def prepare_messages(
             allocations[index] = allocation
             remaining -= allocation
 
+        drop_indexes: set[int] = set()
         for index, allocation in enumerate(allocations):
-            content = prepared[index].get("content", "")
+            msg = prepared[index]
+            content = msg.get("content", "")
             if isinstance(content, str) and allocation < message_tokens[index]:
+                if (
+                    allocation == 0
+                    and msg.get("role") not in {"system", "developer"}
+                    and not (set(msg) - {"role", "content"})
+                    and len(prepared) - len(drop_indexes) > 1
+                ):
+                    drop_indexes.add(index)
+                    message_tokens[index] = 0
+                    continue
                 truncated_content = rate_limiter.truncate_message(
                     message_texts[index], allocation, truncate=True,
                     model_name=model_name,
                 )
-                prepared[index] = {**prepared[index], "content": truncated_content}
+                prepared[index] = {**msg, "content": truncated_content}
                 if isinstance(truncated_content, str) and truncated_content != content:
                     message_tokens[index] = rate_limiter.count_tokens(
                         truncated_content, model_name=model_name,
                     )
+        if drop_indexes:
+            prepared = [msg for idx, msg in enumerate(prepared) if idx not in drop_indexes]
+            message_tokens = [tok for idx, tok in enumerate(message_tokens) if idx not in drop_indexes]
 
         total_tokens = sum(message_tokens) + overhead_tokens
         if total_tokens > completion_context - reserved_output_tokens:
@@ -535,12 +554,18 @@ class ProviderCache:
 
     @staticmethod
     def _provider_cache_key(config: Any, provider_cls: type) -> tuple[type, tuple[Any, ...]]:
+        client_options = getattr(config, "client_options", None)
+        client_options_key = (
+            json.dumps(client_options, sort_keys=True, default=str, separators=(",", ":"))
+            if client_options else None
+        )
         return provider_cls, (
             getattr(config, "provider", None),
             getattr(config, "api_key", None),
             getattr(config, "endpoint", None),
             getattr(config, "api_version", None),
             getattr(config, "responses_api_version", None),
+            getattr(config, "deployment_name", None),
             getattr(config, "model", None),
             getattr(config, "location", None),
             getattr(config, "credentials_path", None),
@@ -549,6 +574,7 @@ class ProviderCache:
             getattr(config, "project", None),
             getattr(config, "timeout", None),
             getattr(config, "enable_prompt_caching", None),
+            client_options_key,
         )
 
     def _build_provider(self, config: Any, provider_cls: type) -> Any:

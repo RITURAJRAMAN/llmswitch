@@ -281,15 +281,18 @@ class JsonMergeAggregator(BaseAggregator):
                 continue
             merged_count += 1
             for key, value in payload.items():
-                if key in merged and merged[key] != value:
-                    conflicts.setdefault(key, [merged[key]]).append(value)
-                    if self.conflict_policy == "error":
-                        raise ValueError(f"JSON merge conflict for key '{key}'")
+                if key in merged:
+                    if merged[key] != value or key in conflicts:
+                        conflict_vals = conflicts.setdefault(key, [merged[key]])
+                        if value not in conflict_vals:
+                            conflict_vals.append(value)
+                        if self.conflict_policy == "error" and merged[key] != value:
+                            raise ValueError(f"JSON merge conflict for key '{key}'")
                     if self.conflict_policy == "first_writer_wins":
                         continue
                 merged[key] = value
         if merged_count == 0:
-            majority = MajorityVoteAggregator().aggregate(rows)
+            majority = MajorityVoteAggregator(include_failed=self.include_failed).aggregate(rows)
             return AggregatedResult(
                 consensus=majority.consensus,
                 inputs=rows,

@@ -4,6 +4,54 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.7] - 2026-11-09
+
+### Security
+
+- Responses `mcp_policy` now validates every MCP `server_url` before dispatch: non-HTTPS URLs, URLs with embedded credentials, `localhost`, and private, loopback, link-local, multicast or reserved IP addresses are rejected with `InvalidResponseRequestError`. `allowed_origins` comparisons normalize host and port consistently.
+- `ResponseCreateRequest.extra_body` can no longer override validated contract fields (`tools`, `background`, `previous_response_id`, `conversation`, `store`).
+- `redact_sensitive` now redacts non-`dict` mappings and Pydantic models, as well as `server_url` and `ocp-apim-subscription-key` keys.
+- Reflection requests in `Agent` wrap the conversation transcript in `<conversation_transcript>` tags and escape closing tags inside message content.
+
+### Changed
+
+- Hot-path latency improvements with zero behaviour regression:
+  - `_known_option_names` is cached once per process instead of rebuilding the union of config fields on every `LLMSwitch` / `AsyncLLMSwitch` construction.
+  - `LoggingEventHandler` (`_shape`) inspects mapping keys and container sizes directly without running a deep redaction pass on every event.
+  - `SharedState.project_for_prompt` computes byte budgets incrementally in $O(N)$ instead of re-serializing the accumulated dictionary on every key ($O(N^2)$).
+  - `pydantic_to_response_format` and `pydantic_to_text_format` return fast shallow copies of their cached schemas so caller mutations cannot poison the LRU cache.
+
+### Fixed
+
+- **Circuit breaker & streaming:**
+  - Non-health exceptions (such as `400` or `429`) raised during a half-open probe now abandon the probe (reopening the breaker) instead of marking the probe successful and closing the breaker.
+  - Streams that finish with `status="incomplete"` (for example `max_output_tokens`) now count as healthy completions for the circuit breaker rather than provider failures.
+  - Stream completion token estimation uses the client's configured `token_counter` when the provider does not report usage.
+  - The process-wide circuit-breaker registry is bounded to 256 entries (LRU).
+- **Retries, failover & clients:**
+  - `_is_retryable` no longer retries `UnsupportedCapabilityError`, `InvalidResponseError`, `status_code=501`, or bare `LLMSwitchError` instances, while retrying 5xx `ResponsesError` failures.
+  - Backup failover inherits `retry_deadline`, `context_output_reserve_tokens`, `context_overhead_tokens`, `mcp_policy` and `responses_capabilities`, and preserves a per-call `model` when failing over to a backup on the same provider without a configured model override.
+  - `LLMSwitch` and `AsyncLLMSwitch` no longer mutate `self.live_logs` across concurrent calls when a per-call `live_logs` argument is passed, and backup stream factories release their rate-limit reservation if the backup stream fails to open.
+  - Sync and async `embeddings.create` only fail over to the backup provider on failover-eligible errors.
+- **Tokenizer & truncation:**
+  - `tiktoken` calls pass `disallowed_special=()` so inputs containing special token strings (such as `<|endoftext|>`) do not raise `ValueError`.
+  - `fallback_count_tokens` includes a character-length floor (`(len(text) + 3) // 4`) for continuous or CJK text without spaces.
+  - `prepare_messages(..., truncate=True)` drops non-system text messages that shrink to 0 budget instead of sending empty messages.
+- **Providers:**
+  - **Anthropic:** Consecutive messages with the same role are merged before sending; structured output via synthetic tool use (`response_format=Model` or `json_schema`) unwraps the tool input into `message.content` / streamed `delta.content` with `finish_reason="stop"`; `AsyncAnthropicChatProvider` defaults to `DEFAULT_ANTHROPIC_MODEL`.
+  - **Vertex AI:** Gemini 2.5 `thought` parts are separated into `message.thinking` / `delta.thinking` instead of concatenating into `content`; SDK `function_call.id` values are preserved when present; `project` is honoured at construction; embedding errors are mapped to `LLMSwitchError` subclasses.
+  - **Azure AI Foundry:** List content parts on `system`, `developer`, `assistant` and `tool` messages are normalized to text; `ClientAuthenticationError`, `ServiceRequestError` and HTTP 429 `HttpResponseError` map to `AuthenticationError`, `APIConnectionError` and `RateLimitExceededError`.
+  - **OpenAI & Azure OpenAI:** Streamed chunks with both `choices` and `usage` emit both; `APIConnectionError`, `AuthenticationError`, `RateLimitError` and `APITimeoutError` are mapped consistently across chat and embeddings; `close()` / `aclose()` close the underlying SDK clients across all providers.
+- **Agentic:**
+  - `Agent` routes turns with `invalid_tool_calls` through the tool execution phase so the model receives the parse error as a `ToolMessage` instead of skipping to reflection.
+  - `Agent.resume` and `Agent.aresume` persist updated routing state back to the agent instance, and tool timeouts / reflection retries respect the remaining run budget.
+  - `CollectingEventHandler` is thread-safe under parallel tool execution and records `routing_decision` events; `AgentEventHandler` and `LoggingEventHandler` include `on_routing_decision`.
+  - `retry_failed_tool_calls` updates `result.attempts` before invoking `on_result` checkpoint hooks.
+  - `invoke_specialists` and `ainvoke_specialists` publish only completed specialist outputs to `SharedState`, and publish after each specialist during sequential runs (`parallel=False`).
+  - `JsonMergeAggregator` tracks all conflicting values under `first_writer_wins` and honours `include_failed` in its majority-vote fallback.
+  - `FileCheckpointStore` serializes non-primitive values safely via `default=str` and raises `ValueError` on corrupted JSON files.
+  - `ToolLoopLimitError` preserves `max_steps` across `to_dict()` and `from_dict()`.
+
 ## [0.1.6] - 2026-11-02
 
 ### Added

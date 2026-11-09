@@ -38,6 +38,7 @@ from ..models import (
 )
 from ..structured import populate_response_parsed, pydantic_to_text_format
 from ._responses_base import _extract_text_format
+from ._shared import close_async_stream, close_stream
 
 # Request fields that are forwarded to the chat provider unchanged.
 _PASSTHROUGH = ("temperature", "top_p", "max_output_tokens", "parallel_tool_calls")
@@ -72,6 +73,9 @@ def _content(content: Any, role: str, provider: str) -> Any:
         return ""
     if isinstance(content, str):
         return content
+    content = _as_dict(content)
+    if isinstance(content, dict):
+        content = [content]
     parts: list[dict[str, Any]] = []
     for part in content:
         part = _as_dict(part)
@@ -127,6 +131,12 @@ def input_to_messages(input: Any, instructions: Any, provider: str) -> list[dict
 
     for raw in input:
         item = _as_dict(raw)
+        if isinstance(item, str):
+            flush_calls()
+            messages.append({"role": "user", "content": item})
+            continue
+        if not isinstance(item, dict):
+            raise _invalid(provider, f"unsupported input item of type '{type(item).__name__}'")
         kind = item.get("type")
         if kind == "function_call":
             pending_calls.append({"id": item["call_id"], "type": "function",
@@ -143,7 +153,10 @@ def input_to_messages(input: Any, instructions: Any, provider: str) -> list[dict
             role = _ROLES.get(item.get("role", ""))
             if role is None:
                 raise _invalid(provider, f"unsupported message role '{item.get('role')}'")
-            messages.append({"role": role, "content": _content(item.get("content"), role, provider)})
+            msg_dict: dict[str, Any] = {"role": role, "content": _content(item.get("content"), role, provider)}
+            if item.get("extensions") is not None:
+                msg_dict["extensions"] = item["extensions"]
+            messages.append(msg_dict)
         else:
             raise _invalid(provider, f"unsupported input item type '{kind}'")
     flush_calls()
@@ -291,6 +304,13 @@ def completion_to_response(completion: Any, info: _RequestInfo, provider: str) -
     response = _build_response(provider, info, response_id=_new_id("resp"), created=completion.created,
                                model=completion.model, status=status, output=output, usage=completion.usage,
                                incomplete=incomplete, finish_reason=choice.finish_reason)
+    msg_extensions = getattr(message, "extensions", None)
+    if msg_extensions is not None and getattr(msg_extensions, "fields", None):
+        if response.extensions is not None:
+            response.extensions.fields.update(msg_extensions.fields)
+        for item in response.output:
+            if hasattr(item, "extensions"):
+                item.extensions = msg_extensions
     if getattr(message, "parsed", None) is not None:
         for item in response.output:
             if item.type == "message":
@@ -467,13 +487,27 @@ class SyncEmulatedResponsesProvider(_EmulatedResponsesBase):
     def _streaming_create(self, messages: list[dict[str, Any]], chat_kwargs: dict[str, Any],
                           info: _RequestInfo) -> Generator[ResponseStreamEvent, None, None]:
         translator = StreamTranslator(info, self.provider_name)
+        chat_stream = None
         try:
             yield from translator.start()
-            for chunk in self._chat.create(messages, stream=True, **chat_kwargs):
+            chat_stream = self._chat.create(messages, stream=True, **chat_kwargs)
+            for chunk in chat_stream:
                 yield from translator.feed(chunk)
             yield from translator.finish()
         except ChatCompletionError as exc:
             raise _responses_error(exc, self.provider_name) from exc
+        finally:
+            if chat_stream is not None:
+                close_stream(chat_stream)
+
+    def close(self) -> None:
+        close = getattr(self._chat, "close", None)
+        if callable(close):
+            close()
+            return
+        client_close = getattr(getattr(self._chat, "client", None), "close", None)
+        if callable(client_close):
+            client_close()
 
 
 class AsyncEmulatedResponsesProvider(_EmulatedResponsesBase):
@@ -490,18 +524,25 @@ class AsyncEmulatedResponsesProvider(_EmulatedResponsesBase):
     async def _streaming_create(self, messages: list[dict[str, Any]], chat_kwargs: dict[str, Any],
                                 info: _RequestInfo) -> AsyncGenerator[ResponseStreamEvent, None]:
         translator = StreamTranslator(info, self.provider_name)
+        chat_stream = None
         try:
             for event in translator.start():
                 yield event
-            async for chunk in await self._chat.create(messages, stream=True, **chat_kwargs):
+            chat_stream = await self._chat.create(messages, stream=True, **chat_kwargs)
+            async for chunk in chat_stream:
                 for event in translator.feed(chunk):
                     yield event
             for event in translator.finish():
                 yield event
         except ChatCompletionError as exc:
             raise _responses_error(exc, self.provider_name) from exc
+        finally:
+            if chat_stream is not None:
+                await close_async_stream(chat_stream)
 
     async def aclose(self) -> None:
         close = getattr(self._chat, "aclose", None)
-        if close is not None:
+        if callable(close):
             await close()
+            return
+        await close_async_stream(getattr(self._chat, "client", None))

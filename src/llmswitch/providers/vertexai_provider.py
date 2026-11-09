@@ -172,10 +172,14 @@ class VertexAIChatProvider(BaseChatProvider):
         self.scopes = kwargs.get("scopes", ["https://www.googleapis.com/auth/cloud-platform"])
 
         if not self.credentials_path:
-            raise ChatCompletionError("Valid credentials_path must be provided for Vertex AI.")
+            raise ChatCompletionError(
+                "Valid credentials_path must be provided for Vertex AI.",
+                status_code=400,
+                provider="vertexai",
+            )
 
         creds, project = load_credentials_from_file(self.credentials_path, scopes=self.scopes)
-        self.project = project
+        self.project = kwargs.get("project") or project
         timeout = kwargs.get("timeout")
         http_options = types.HttpOptions(
             api_version="v1",
@@ -271,12 +275,25 @@ class VertexAIChatProvider(BaseChatProvider):
         text_parts = []
         function_calls = []
         for part in parts:
+            if getattr(part, "thought", False) is True:
+                continue
             if hasattr(part, "text") and part.text:
                 text_parts.append(part.text)
             function_call = getattr(part, "function_call", None)
             if function_call is not None:
                 function_calls.append(function_call)
         return "".join(text_parts), function_calls
+
+    def _extract_thinking(self, candidate: Any) -> str | None:
+        if candidate is None:
+            return None
+        parts = getattr(getattr(candidate, "content", None), "parts", []) or []
+        thought_parts = [
+            part.text
+            for part in parts
+            if getattr(part, "thought", False) is True and hasattr(part, "text") and part.text
+        ]
+        return "".join(thought_parts) or None
 
     def _build_usage(self, response: Any) -> CompletionUsage:
         usage = getattr(response, "usage_metadata", None)
@@ -321,11 +338,11 @@ class VertexAIChatProvider(BaseChatProvider):
         return {"content": content}
 
     def _image_part_from_url(self, url: str) -> types.Part:
-        if url.startswith("data:"):
+        if url.startswith("data:") and "," in url:
             header, encoded = url.split(",", 1)
             mime_type = header[5:].split(";", 1)[0] or "application/octet-stream"
             return types.Part.from_bytes(data=base64.b64decode(encoded), mime_type=mime_type)
-        mime_type = mimetypes.guess_type(url)[0]
+        mime_type = mimetypes.guess_type(url)[0] or "image/jpeg"
         return types.Part.from_uri(file_uri=url, mime_type=mime_type)
 
     def _convert_content_to_parts(self, content: Any, allow_images: bool = True) -> list[types.Part]:
@@ -437,7 +454,7 @@ class VertexAIChatProvider(BaseChatProvider):
 
         return [
             ChatCompletionMessageToolCall(
-                id=self._tool_call_id(index=index),
+                id=getattr(function_call, "id", None) or self._tool_call_id(index=index),
                 type="function",
                 function=Function(
                     name=getattr(function_call, "name", ""),
@@ -454,7 +471,7 @@ class VertexAIChatProvider(BaseChatProvider):
         return [
             ChoiceDeltaToolCall(
                 index=first_index + index,
-                id=self._tool_call_id(first_index + index),
+                id=getattr(function_call, "id", None) or self._tool_call_id(first_index + index),
                 type="function",
                 function=ChoiceDeltaToolCallFunction(
                     name=getattr(function_call, "name", None),
@@ -705,6 +722,7 @@ class VertexAIChatProvider(BaseChatProvider):
         choices = []
         for index, candidate in enumerate(candidates):
             text, function_calls = self._extract_text_and_function_calls(candidate)
+            thinking = self._extract_thinking(candidate)
             if len(candidates) == 1 and not function_calls:
                 function_calls = list(getattr(response, "function_calls", None) or [])
             mapped_tool_calls = self._map_tool_calls(function_calls)
@@ -714,7 +732,8 @@ class VertexAIChatProvider(BaseChatProvider):
             )
             role = self._normalize_role(getattr(getattr(candidate, "content", None), "role", None))
             signatures = {
-                self._tool_call_id(position): signature
+                (mapped_tool_calls[position].id if mapped_tool_calls and position < len(mapped_tool_calls)
+                 else self._tool_call_id(position)): signature
                 for position, signature in enumerate(_thought_signatures(candidate))
                 if signature
             }
@@ -723,6 +742,7 @@ class VertexAIChatProvider(BaseChatProvider):
                     index=getattr(candidate, "index", None) if getattr(candidate, "index", None) is not None else index,
                     message=ChatCompletionMessage(
                         role=role, content=text or None, tool_calls=mapped_tool_calls,
+                        thinking=thinking,
                         parsed=getattr(response, "parsed", None) if index == 0 else None,
                         extensions=(ProviderExtensions(provider="vertexai", fields={"thought_signatures": signatures})
                                     if signatures else None),
@@ -814,13 +834,15 @@ class VertexAIChatProvider(BaseChatProvider):
             if candidate is not None:
                 state.seen_candidates.add(index)
             text, function_calls = self._extract_text_and_function_calls(candidate) if candidate else ("", [])
+            thinking = self._extract_thinking(candidate) if candidate else None
             if len(candidates) <= 1 and not function_calls:
                 function_calls = list(getattr(response, "function_calls", None) or [])
             first_index = state.call_count
             state.call_count += len(function_calls)
             mapped_tool_calls = self._map_delta_tool_calls(function_calls, first_index)
             signatures = {
-                self._tool_call_id(first_index + position): signature
+                (mapped_tool_calls[position].id if mapped_tool_calls and position < len(mapped_tool_calls) and mapped_tool_calls[position].id
+                 else self._tool_call_id(first_index + position)): signature
                 for position, signature in enumerate(_thought_signatures(candidate) if candidate else [])
                 if signature
             }
@@ -830,13 +852,14 @@ class VertexAIChatProvider(BaseChatProvider):
             )
             role = self._normalize_role(
                 getattr(getattr(candidate, "content", None), "role", None) if candidate else None)
-            if not (text or mapped_tool_calls or finish_reason is not None):
+            if not (text or thinking or mapped_tool_calls or finish_reason is not None):
                 continue
             chunk_choices.append(
                 ChunkDelta(
                     index=index,
                     delta=ChoiceDelta(
                         role=role, content=text or None, tool_calls=mapped_tool_calls,
+                        thinking=thinking,
                         extensions=(ProviderExtensions(provider="vertexai", fields={"thought_signatures": signatures})
                                     if signatures else None),
                     ),
@@ -994,6 +1017,20 @@ def _vertex_embedding_response(response: Any, model: str) -> CreateEmbeddingResp
     )
 
 
+def _raise_mapped_vertex_embedding_error(exc: Exception) -> None:
+    if isinstance(exc, (EmbeddingGenerationError, RateLimitExceededError, AuthenticationError)):
+        raise exc
+    if isinstance(exc, google_errors.ClientError):
+        if exc.code == _HTTP_RATE_LIMIT:
+            raise RateLimitExceededError(get_retry_after_seconds(exc)) from exc
+        if exc.code in _HTTP_AUTH_CODES:
+            raise AuthenticationError(provider="vertexai") from exc
+        raise EmbeddingGenerationError(str(exc), status_code=exc.code, provider="vertexai") from exc
+    if isinstance(exc, google_errors.ServerError):
+        raise EmbeddingGenerationError(str(exc), status_code=503, provider="vertexai") from exc
+    raise EmbeddingGenerationError(str(exc), status_code=getattr(exc, "status_code", 500), provider="vertexai") from exc
+
+
 class VertexAIEmbeddingProvider(BaseEmbeddingProvider):
     """
     Embeddings with Gemini embedding models on Vertex AI, through google-genai.
@@ -1027,7 +1064,7 @@ class VertexAIEmbeddingProvider(BaseEmbeddingProvider):
                                            status_code=400, provider="vertexai")
 
         creds, project = load_credentials_from_file(self.credentials_path, scopes=self.scopes)
-        self.project = project
+        self.project = kwargs.get("project") or project
         timeout = kwargs.get("timeout")
         http_options = types.HttpOptions(
             api_version="v1",
@@ -1057,8 +1094,11 @@ class VertexAIEmbeddingProvider(BaseEmbeddingProvider):
             EmbeddingGenerationError: No model is set, or an option is not supported for Vertex AI.
         """
         model, config = _vertex_embedding_request(self.model, kwargs)
-        response = self.client.models.embed_content(model=model, contents=list(input), config=config)
-        return _vertex_embedding_response(response, model)
+        try:
+            response = self.client.models.embed_content(model=model, contents=list(input), config=config)
+            return _vertex_embedding_response(response, model)
+        except Exception as e:
+            _raise_mapped_vertex_embedding_error(e)
 
 
 class AsyncVertexAIEmbeddingProvider(VertexAIEmbeddingProvider):
@@ -1067,8 +1107,11 @@ class AsyncVertexAIEmbeddingProvider(VertexAIEmbeddingProvider):
     async def create(self, input: list[str], **kwargs: Any) -> CreateEmbeddingResponse:  # noqa: A002
         """Create one embedding vector per input text, without blocking the event loop."""
         model, config = _vertex_embedding_request(self.model, kwargs)
-        response = await self.client.aio.models.embed_content(model=model, contents=list(input), config=config)
-        return _vertex_embedding_response(response, model)
+        try:
+            response = await self.client.aio.models.embed_content(model=model, contents=list(input), config=config)
+            return _vertex_embedding_response(response, model)
+        except Exception as e:
+            _raise_mapped_vertex_embedding_error(e)
 
     async def aclose(self) -> None:
         await self.client.aio.aclose()

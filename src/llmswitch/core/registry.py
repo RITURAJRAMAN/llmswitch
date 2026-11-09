@@ -10,6 +10,7 @@ its entry is first read. If the import fails, the reason is stored in
 from __future__ import annotations
 
 import importlib
+import threading
 from collections.abc import Iterator, MutableMapping
 
 UNAVAILABLE_PROVIDERS: dict[str, str] = {}
@@ -21,19 +22,23 @@ class _LazyRegistry(MutableMapping):
     def __init__(self, entries: dict[str, tuple[str, str]]) -> None:
         self._entries = dict(entries)  # provider name -> (module, class name)
         self._loaded: dict[str, type] = {}
+        self._lock = threading.Lock()
 
     def __getitem__(self, name: str) -> type:
         if name in self._loaded:
             return self._loaded[name]
-        module_name, class_name = self._entries[name]
-        try:
-            module = importlib.import_module(f"..providers.{module_name}", package=__package__)
-        except ImportError as exc:
-            UNAVAILABLE_PROVIDERS[name] = str(exc)
-            del self._entries[name]
-            raise KeyError(name) from exc
-        self._loaded[name] = getattr(module, class_name)
-        return self._loaded[name]
+        with self._lock:
+            if name in self._loaded:
+                return self._loaded[name]
+            module_name, class_name = self._entries[name]
+            try:
+                module = importlib.import_module(f"..providers.{module_name}", package=__package__)
+            except ImportError as exc:
+                UNAVAILABLE_PROVIDERS[name] = str(exc)
+                del self._entries[name]
+                raise KeyError(name) from exc
+            self._loaded[name] = getattr(module, class_name)
+            return self._loaded[name]
 
     def __setitem__(self, name: str, provider_cls: type) -> None:
         self._loaded[name] = provider_cls

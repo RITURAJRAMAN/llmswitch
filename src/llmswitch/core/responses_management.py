@@ -51,7 +51,7 @@ def prepare_management_call(
         config, operation=f"responses.{operation}", normalized_request=normalized_request,
     )
     provider_kwargs = dict(provider_request_with_payload(plan, input_key=payload_field))
-    if operation != "count_input_tokens":
+    if operation not in {"count_input_tokens", "compact"}:
         provider_kwargs.pop("model", None)
     call_args = args if operation != "create_conversation" else ()
     return call_args, provider_kwargs, max_retries, live_logs
