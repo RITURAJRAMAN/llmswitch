@@ -35,6 +35,7 @@ from azure.ai.inference.models import (
     ImageUrl as AzureImageUrl,
 )
 from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import ClientAuthenticationError, HttpResponseError, ServiceRequestError
 
 from ..base import BaseChatProvider, BaseEmbeddingProvider
 from ..errors import (
@@ -43,6 +44,7 @@ from ..errors import (
     ChatCompletionError,
     EmbeddingGenerationError,
     InvalidResponseError,
+    RateLimitExceededError,
     detect_content_filter_error,
 )
 from ..models import (
@@ -68,7 +70,13 @@ from ..structured import (
     provider_extensions_from_raw,
     pydantic_to_response_format,
 )
-from ._shared import close_async_stream, close_stream, merge_client_options, normalize_token_limit
+from ._shared import (
+    close_async_stream,
+    close_stream,
+    get_retry_after_seconds,
+    merge_client_options,
+    normalize_token_limit,
+)
 
 # Initialize logger for this module
 # Name resolves to "llmswitch.providers.azurefoundry_provider"
@@ -119,6 +127,18 @@ class _AzureFoundryMessageConverterMixin:
         normalize_token_limit(request_kwargs, "max_tokens")
         return request_kwargs
 
+    @staticmethod
+    def _content_to_str(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(
+                p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
+            )
+        return str(content)
+
     def _convert_messages(self, messages: list[dict[str, Any]]) -> list[Any]:
         """
         Convert OpenAI-style messages to Azure Foundry format.
@@ -135,7 +155,7 @@ class _AzureFoundryMessageConverterMixin:
             role = msg.get("role")
             content = msg.get("content")
             if role in {"system", "developer"}:
-                converted.append(SystemMessage(content=content))
+                converted.append(SystemMessage(content=self._content_to_str(content)))
             elif role == "user":
                 if isinstance(content, list):
                     # Multimodal content: build Azure Foundry multi-part content
@@ -153,6 +173,7 @@ class _AzureFoundryMessageConverterMixin:
                     converted.append(UserMessage(content=content))
             elif role == "assistant":
                 raw_tool_calls = msg.get("tool_calls")
+                text_content = self._content_to_str(content) if isinstance(content, list) else content
                 if raw_tool_calls:
                     # Convert OpenAI-format tool_calls to Azure Foundry format using FunctionCall
                     azure_tool_calls = []
@@ -174,12 +195,14 @@ class _AzureFoundryMessageConverterMixin:
                                 function=FunctionCall(name=fn_name, arguments=fn_args),
                             )
                         )
-                    converted.append(AssistantMessage(content=content or "", tool_calls=azure_tool_calls))
+                    converted.append(AssistantMessage(content=text_content or "", tool_calls=azure_tool_calls))
                 else:
-                    converted.append(AssistantMessage(content=content))
+                    converted.append(AssistantMessage(content=text_content))
             elif role == "tool":
                 # Tool result message
-                converted.append(ToolMessage(content=content or "", tool_call_id=msg.get("tool_call_id", "")))
+                converted.append(
+                    ToolMessage(content=self._content_to_str(content), tool_call_id=msg.get("tool_call_id", ""))
+                )
             else:
                 logger.warning("Unknown message role: %s", role)
         return converted
@@ -294,33 +317,37 @@ class AzureFoundryChatProvider(_AzureFoundryMessageConverterMixin, BaseChatProvi
                 response,
                 {"id", "object", "created", "model", "choices", "usage", "prompt_filter_results", "moderation"},
             )
+            created_val = getattr(response, "created", None)
+            created_ts = int(created_val.timestamp()) if hasattr(created_val, "timestamp") else int(created_val or time.time())
             return ChatCompletion(
-                id=response.id,
-                created=int(response.created.timestamp()),
-                model=response.model,
-                object=response.get("object", "chat.completion"),
+                id=getattr(response, "id", None) or "azurefoundry-response",
+                created=created_ts,
+                model=getattr(response, "model", None) or self.model or "azurefoundry-model",
+                object=(response.get("object", "chat.completion") if hasattr(response, "get") else getattr(response, "object", "chat.completion")) or "chat.completion",
                 choices=choices,
                 usage=usage,
-                prompt_filter_results=response.get("prompt_filter_results", None),
+                prompt_filter_results=response.get("prompt_filter_results", None) if hasattr(response, "get") else getattr(response, "prompt_filter_results", None),
                 moderation=getattr(response, "moderation", None),
                 extensions=extensions,
             )
-        except ConnectionError as e:
+        except (ConnectionError, ServiceRequestError) as e:
             logger.error("Connection error in chat completion: %s | Exception: %s", self.endpoint, e)
-            raise APIConnectionError(self.endpoint) from e
-        except PermissionError as e:
+            raise APIConnectionError(self.endpoint, provider="azure_foundry") from e
+        except (PermissionError, ClientAuthenticationError) as e:
             logger.error("Authentication error in chat completion | Exception: %s", e)
-            raise AuthenticationError() from e
+            raise AuthenticationError(provider="azure_foundry") from e
         except ValueError as e:
             logger.error("Invalid response in chat completion | Exception: %s", e)
-            raise InvalidResponseError(str(e)) from e
+            raise InvalidResponseError(str(e), provider="azure_foundry") from e
         except Exception as e:
+            if isinstance(e, HttpResponseError) and getattr(e, "status_code", None) == 429:
+                raise RateLimitExceededError(get_retry_after_seconds(e)) from e
             content_filter_error = detect_content_filter_error(e, provider="azure_foundry")
             if content_filter_error:
                 raise content_filter_error from e
             status_code = getattr(e, 'status_code', 500)
             logger.error("Error in AzureFoundryChatProvider._create_non_streaming | Exception: %s", e)
-            raise ChatCompletionError(str(e), status_code=status_code) from e
+            raise ChatCompletionError(str(e), status_code=status_code, provider="azure_foundry") from e
 
     def _create_streaming(self, azure_messages: list, **kwargs) -> Generator[ChatCompletionChunk, Any, None]:
         """
@@ -389,11 +416,12 @@ class AzureFoundryChatProvider(_AzureFoundryMessageConverterMixin, BaseChatProvi
                     )
 
                 chunk_usage = last_usage if getattr(chunk, "usage", None) else None
+                chunk_created = getattr(chunk, "created", None)
                 yield ChatCompletionChunk(
-                    id=getattr(chunk, "id", None),
-                    object=getattr(chunk, "object", "chat.completion.chunk"),
-                    created=int(chunk.created.timestamp()) if hasattr(chunk, "created") and chunk.created else None,
-                    model=getattr(chunk, "model", None),
+                    id=getattr(chunk, "id", None) or "azurefoundry-chunk",
+                    object=getattr(chunk, "object", None) or "chat.completion.chunk",
+                    created=int(chunk_created.timestamp()) if hasattr(chunk_created, "timestamp") else int(chunk_created or time.time()),
+                    model=getattr(chunk, "model", None) or self.model or "azurefoundry-model",
                     choices=chunk_choices,
                     usage=chunk_usage,
                     extensions=provider_extensions_for("azure_foundry"),
@@ -403,35 +431,42 @@ class AzureFoundryChatProvider(_AzureFoundryMessageConverterMixin, BaseChatProvi
 
             if usage_pending:
                 yield ChatCompletionChunk(
-                    id=getattr(last_chunk_with_metadata, "id", "default_id"),
+                    id=getattr(last_chunk_with_metadata, "id", None) or "default_id",
                     object="chat.completion.chunk",
                     created=int(last_chunk_with_metadata.created.timestamp())
                     if (last_chunk_with_metadata is not None and getattr(last_chunk_with_metadata, "created",
                                                                          None)) else 0,
-                    model=getattr(last_chunk_with_metadata, "model", "default_model"),
+                    model=getattr(last_chunk_with_metadata, "model", None) or self.model or "default_model",
                     choices=[],
                     usage=last_usage,
                     extensions=provider_extensions_for("azure_foundry"),
                 )
-        except ConnectionError as e:
+        except (ConnectionError, ServiceRequestError) as e:
             logger.error("Connection error in streaming chat completion: %s | Exception: %s", self.endpoint, e)
-            raise APIConnectionError(self.endpoint) from e
-        except PermissionError as e:
+            raise APIConnectionError(self.endpoint, provider="azure_foundry") from e
+        except (PermissionError, ClientAuthenticationError) as e:
             logger.error("Authentication error in streaming chat completion | Exception: %s", e)
-            raise AuthenticationError() from e
+            raise AuthenticationError(provider="azure_foundry") from e
         except ValueError as e:
             logger.error("Invalid response in streaming chat completion | Exception: %s", e)
-            raise InvalidResponseError(str(e)) from e
+            raise InvalidResponseError(str(e), provider="azure_foundry") from e
         except Exception as e:
+            if isinstance(e, HttpResponseError) and getattr(e, "status_code", None) == 429:
+                raise RateLimitExceededError(get_retry_after_seconds(e)) from e
             content_filter_error = detect_content_filter_error(e, provider="azure_foundry")
             if content_filter_error:
                 raise content_filter_error from e
             status_code = getattr(e, 'status_code', 500)
             logger.error("Error in AzureFoundryChatProvider._create_streaming | Exception: %s", e)
-            raise ChatCompletionError(str(e), status_code=status_code) from e
+            raise ChatCompletionError(str(e), status_code=status_code, provider="azure_foundry") from e
         finally:
             if stream is not None:
                 close_stream(stream)
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
 
 
 class AsyncAzureFoundryChatProvider(_AzureFoundryMessageConverterMixin, BaseChatProvider):
@@ -530,33 +565,37 @@ class AsyncAzureFoundryChatProvider(_AzureFoundryMessageConverterMixin, BaseChat
                 response,
                 {"id", "object", "created", "model", "choices", "usage", "prompt_filter_results", "moderation"},
             )
+            created_val = getattr(response, "created", None)
+            created_ts = int(created_val.timestamp()) if hasattr(created_val, "timestamp") else int(created_val or time.time())
             return ChatCompletion(
-                id=response.id,
-                created=int(response.created.timestamp()),
-                model=response.model,
-                object=response.get("object", "chat.completion"),
+                id=getattr(response, "id", None) or "azurefoundry-response",
+                created=created_ts,
+                model=getattr(response, "model", None) or self.model or "azurefoundry-model",
+                object=(response.get("object", "chat.completion") if hasattr(response, "get") else getattr(response, "object", "chat.completion")) or "chat.completion",
                 choices=choices,
                 usage=usage,
-                prompt_filter_results=response.get("prompt_filter_results", None),
+                prompt_filter_results=response.get("prompt_filter_results", None) if hasattr(response, "get") else getattr(response, "prompt_filter_results", None),
                 moderation=getattr(response, "moderation", None),
                 extensions=extensions,
             )
-        except ConnectionError as e:
+        except (ConnectionError, ServiceRequestError) as e:
             logger.error("Connection error in async chat completion: %s | Exception: %s", self.endpoint, e)
-            raise APIConnectionError(self.endpoint) from e
-        except PermissionError as e:
+            raise APIConnectionError(self.endpoint, provider="azure_foundry") from e
+        except (PermissionError, ClientAuthenticationError) as e:
             logger.error("Authentication error in async chat completion | Exception: %s", e)
-            raise AuthenticationError() from e
+            raise AuthenticationError(provider="azure_foundry") from e
         except ValueError as e:
             logger.error("Invalid response in async chat completion | Exception: %s", e)
-            raise InvalidResponseError(str(e)) from e
+            raise InvalidResponseError(str(e), provider="azure_foundry") from e
         except Exception as e:
+            if isinstance(e, HttpResponseError) and getattr(e, "status_code", None) == 429:
+                raise RateLimitExceededError(get_retry_after_seconds(e)) from e
             content_filter_error = detect_content_filter_error(e, provider="azure_foundry")
             if content_filter_error:
                 raise content_filter_error from e
             status_code = getattr(e, "status_code", 500)
             logger.error("Error in AsyncAzureFoundryChatProvider._create_non_streaming | Exception: %s", e)
-            raise ChatCompletionError(str(e), status_code=status_code) from e
+            raise ChatCompletionError(str(e), status_code=status_code, provider="azure_foundry") from e
 
     async def _create_streaming(self, azure_messages: list, **kwargs: Any) -> AsyncGenerator[ChatCompletionChunk, None]:
         stream = None
@@ -618,11 +657,12 @@ class AsyncAzureFoundryChatProvider(_AzureFoundryMessageConverterMixin, BaseChat
                     )
 
                 chunk_usage = last_usage if getattr(chunk, "usage", None) else None
+                chunk_created = getattr(chunk, "created", None)
                 yield ChatCompletionChunk(
-                    id=getattr(chunk, "id", None),
-                    object=getattr(chunk, "object", "chat.completion.chunk"),
-                    created=int(chunk.created.timestamp()) if hasattr(chunk, "created") and chunk.created else None,
-                    model=getattr(chunk, "model", None),
+                    id=getattr(chunk, "id", None) or "azurefoundry-chunk",
+                    object=getattr(chunk, "object", None) or "chat.completion.chunk",
+                    created=int(chunk_created.timestamp()) if hasattr(chunk_created, "timestamp") else int(chunk_created or time.time()),
+                    model=getattr(chunk, "model", None) or self.model or "azurefoundry-model",
                     choices=chunk_choices,
                     usage=chunk_usage,
                     extensions=provider_extensions_for("azure_foundry"),
@@ -632,35 +672,42 @@ class AsyncAzureFoundryChatProvider(_AzureFoundryMessageConverterMixin, BaseChat
 
             if usage_pending:
                 yield ChatCompletionChunk(
-                    id=getattr(last_chunk_with_metadata, "id", "default_id"),
+                    id=getattr(last_chunk_with_metadata, "id", None) or "default_id",
                     object="chat.completion.chunk",
                     created=int(last_chunk_with_metadata.created.timestamp())
                     if (last_chunk_with_metadata is not None and getattr(last_chunk_with_metadata, "created",
                                                                          None)) else 0,
-                    model=getattr(last_chunk_with_metadata, "model", "default_model"),
+                    model=getattr(last_chunk_with_metadata, "model", None) or self.model or "default_model",
                     choices=[],
                     usage=last_usage,
                     extensions=provider_extensions_for("azure_foundry"),
                 )
-        except ConnectionError as e:
+        except (ConnectionError, ServiceRequestError) as e:
             logger.error("Connection error in async streaming chat completion: %s | Exception: %s", self.endpoint, e)
-            raise APIConnectionError(self.endpoint) from e
-        except PermissionError as e:
+            raise APIConnectionError(self.endpoint, provider="azure_foundry") from e
+        except (PermissionError, ClientAuthenticationError) as e:
             logger.error("Authentication error in async streaming chat completion | Exception: %s", e)
-            raise AuthenticationError() from e
+            raise AuthenticationError(provider="azure_foundry") from e
         except ValueError as e:
             logger.error("Invalid response in async streaming chat completion | Exception: %s", e)
-            raise InvalidResponseError(str(e)) from e
+            raise InvalidResponseError(str(e), provider="azure_foundry") from e
         except Exception as e:
+            if isinstance(e, HttpResponseError) and getattr(e, "status_code", None) == 429:
+                raise RateLimitExceededError(get_retry_after_seconds(e)) from e
             content_filter_error = detect_content_filter_error(e, provider="azure_foundry")
             if content_filter_error:
                 raise content_filter_error from e
             status_code = getattr(e, "status_code", 500)
             logger.error("Error in AsyncAzureFoundryChatProvider._create_streaming | Exception: %s", e)
-            raise ChatCompletionError(str(e), status_code=status_code) from e
+            raise ChatCompletionError(str(e), status_code=status_code, provider="azure_foundry") from e
         finally:
             if stream is not None:
                 await close_async_stream(stream)
+
+    async def aclose(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            await close()
 
 
 class _AzureFoundryEmbeddingMixin:
@@ -708,18 +755,20 @@ class _AzureFoundryEmbeddingMixin:
         )
 
     def _translate_error(self, e: Exception) -> Exception:
-        if isinstance(e, ConnectionError):
+        if isinstance(e, (ConnectionError, ServiceRequestError)):
             logger.error("Connection error in embedding creation: %s | Exception: %s", self.endpoint, e)
-            return APIConnectionError(self.endpoint)
-        if isinstance(e, PermissionError):
+            return APIConnectionError(self.endpoint, provider="azure_foundry")
+        if isinstance(e, (PermissionError, ClientAuthenticationError)):
             logger.error("Authentication error in embedding creation | Exception: %s", e)
-            return AuthenticationError()
+            return AuthenticationError(provider="azure_foundry")
         if isinstance(e, ValueError):
             logger.error("Invalid response in embedding creation | Exception: %s", e)
-            return InvalidResponseError(str(e))
+            return InvalidResponseError(str(e), provider="azure_foundry")
+        if isinstance(e, HttpResponseError) and getattr(e, "status_code", None) == 429:
+            return RateLimitExceededError(get_retry_after_seconds(e))
         status_code = getattr(e, "status_code", 500)
         logger.error("Embedding generation error | Exception: %s", e)
-        return EmbeddingGenerationError(str(e), status_code=status_code)
+        return EmbeddingGenerationError(str(e), status_code=status_code, provider="azure_foundry")
 
 
 class AzureFoundryEmbeddingProvider(_AzureFoundryEmbeddingMixin, BaseEmbeddingProvider):

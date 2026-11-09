@@ -140,7 +140,7 @@ class InMemoryCheckpointStore:
 
 
 def _digest(payload: dict[str, Any]) -> str:
-    body = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
@@ -180,7 +180,7 @@ class FileCheckpointStore:
         path = self._path(checkpoint_id)
         payload = {"schema_version": SCHEMA_VERSION, "state": state}
         envelope = {"checksum": _digest(payload), "payload": payload}
-        text = json.dumps(envelope, sort_keys=True, ensure_ascii=False)
+        text = json.dumps(envelope, sort_keys=True, ensure_ascii=False, default=str)
         with self._lock:
             descriptor, temporary = tempfile.mkstemp(dir=self.directory, prefix=".checkpoint-", suffix=".tmp")
             try:
@@ -209,7 +209,12 @@ class FileCheckpointStore:
         with self._lock:
             if not path.exists():
                 return None
-            envelope = json.loads(path.read_text(encoding="utf-8"))
+            try:
+                envelope = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValueError("Invalid checkpoint JSON.") from exc
+        if not isinstance(envelope, dict):
+            raise ValueError("Unsupported or invalid checkpoint schema.")
         payload = envelope.get("payload")
         if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:
             raise ValueError("Unsupported or invalid checkpoint schema.")

@@ -102,18 +102,23 @@ class SharedState:
         """
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
+        if max_bytes < 2:
+            return {}
         allowed = set(allowed_keys) if allowed_keys is not None else None
         with self._lock:
             source = {k: v for k, v in self._data.items() if allowed is None or k in allowed}
         projected: dict[str, Any] = {}
+        used_bytes = 2  # "{}"
         for key, value in source.items():
-            candidate = {**projected, key: value}
             try:
-                size = len(json.dumps(candidate, default=str, sort_keys=True).encode("utf-8"))
+                key_bytes = len(json.dumps(key, default=str).encode("utf-8"))
+                val_bytes = len(json.dumps(value, default=str, sort_keys=True).encode("utf-8"))
             except (TypeError, ValueError):
                 continue
-            if size <= max_bytes:
+            sep_bytes = 2 if not projected else 4  # ": " vs ", " + ": "
+            if used_bytes + sep_bytes + key_bytes + val_bytes <= max_bytes:
                 projected[key] = value
+                used_bytes += sep_bytes + key_bytes + val_bytes
         return projected
 
 

@@ -116,8 +116,11 @@ class _ChatCompletions(ProviderCache):
     def _wrap_streaming(self, primary_factory, user_key: str, pre_count_tokens: int, *,
                         backup_factory=None, max_retries: int = 0, base_delay: float = 0.0):
         def on_complete(last_usage, limiter_scope, prompt_tokens, output_text):
-            actual = stream_completion_tokens(last_usage, prompt_tokens, pre_count_tokens,
-                                                  output_text, getattr(self.config, "model", None))
+            actual = stream_completion_tokens(
+                last_usage, prompt_tokens, pre_count_tokens,
+                output_text, getattr(self.config, "model", None),
+                token_counter=self.rate_limiter.count_tokens,
+            )
             self.rate_limiter.update_token_usage(
                 user_key,
                 actual,
@@ -166,13 +169,13 @@ class _ChatCompletions(ProviderCache):
             LLMSwitchError: Any other failure. Every error raised by this library is a subclass of it.
         """
         validate_messages(messages)
-        self.live_logs = kwargs.pop("live_logs", False)
+        live_logs = kwargs.pop("live_logs", False)
         _max_retries: int = kwargs.pop("max_retries", getattr(self.config, "max_retries", DEFAULT_MAX_RETRIES))
         _base_delay: float = getattr(self.config, "retry_base_delay", DEFAULT_RETRY_BASE_DELAY)
         provider_cls = provider_class(self.config.provider, CHAT_PROVIDER_REGISTRY, "chat completion")
         require_operation(self.config.provider, "chat.sync")
         validate_backup_for_registry(self.config, CHAT_PROVIDER_REGISTRY)
-        if self.live_logs:
+        if live_logs:
             logger.info(
                 json.dumps(redact_sensitive(
                     {"provider": self.config.provider, "messages": "<hidden>", "stream": stream, "kwargs": kwargs}),
@@ -210,7 +213,10 @@ class _ChatCompletions(ProviderCache):
 
             backup_stream_factory = None
             if getattr(self.config, "backup", None):
+                backup_reserved = False
+
                 def backup_stream_factory():
+                    nonlocal backup_reserved
                     backup_execution = build_backup_execution_plan(
                         self.config,
                         operation="chat.completions",
@@ -224,10 +230,12 @@ class _ChatCompletions(ProviderCache):
                     backup_messages, backup_tokens = prepare_target_messages(
                         backup_config, messages, self.rate_limiter, truncate, backup_request_kwargs_payload,
                     )
-                    reserve_rate_limit(
-                        self.rate_limiter, user_key, backup_config.rpm, backup_config.tpm,
-                        self.window_seconds, backup_tokens, scope=backup_limiter_scope,
-                    )
+                    if not backup_reserved:
+                        reserve_rate_limit(
+                            self.rate_limiter, user_key, backup_config.rpm, backup_config.tpm,
+                            self.window_seconds, backup_tokens, scope=backup_limiter_scope,
+                        )
+                        backup_reserved = True
                     backup_provider = prepare_backup_provider(self.config, CHAT_PROVIDER_REGISTRY,
                                                               self._instantiate_provider)
                     backup_breaker = (
@@ -251,7 +259,7 @@ class _ChatCompletions(ProviderCache):
                     except Exception as exc:
                         raise_chat_error(backup_config, exc, user_key)
 
-            if self.live_logs:
+            if live_logs:
                 logger.info(
                     "Chat Response: %s",
                     json.dumps(redact_sensitive({"provider": self.config.provider,
@@ -320,7 +328,7 @@ class _ChatCompletions(ProviderCache):
         except Exception as e:
             raise_chat_error(self.config, e, user_key)
 
-        if self.live_logs:
+        if live_logs:
             logger.info(
                 "Chat Response: %s",
                 json.dumps(redact_sensitive({"provider": self.config.provider,
@@ -419,13 +427,13 @@ class _Embeddings(ProviderCache):
             raise ValueError("Embedding input must contain at least one string")
         if batchsize <= 0:
             raise ValueError("batchsize must be positive")
-        self.live_logs = kwargs.pop("live_logs", False)
+        live_logs = kwargs.pop("live_logs", False)
         retry_override: int | None = kwargs.pop("max_retries", None)
         _base_delay: float = getattr(self.config, "retry_base_delay", DEFAULT_RETRY_BASE_DELAY)
         provider_cls = provider_class(self.config.provider, EMBEDDING_PROVIDER_REGISTRY, "embeddings")
         require_operation(self.config.provider, "embeddings")
         validate_backup_for_registry(self.config, EMBEDDING_PROVIDER_REGISTRY)
-        if self.live_logs:
+        if live_logs:
             logger.info(
                 "Embedding request: %s",
                 json.dumps(redact_sensitive({"provider": self.config.provider, "input": "<hidden>", "kwargs": kwargs})))
@@ -489,7 +497,7 @@ class _Embeddings(ProviderCache):
         try:
             return run_target(self.config, plan, provider_cls)
         except (EmbeddingGenerationError, APIConnectionError, RateLimitExceededError, TimeOutError) as primary_err:
-            if not getattr(self.config, "backup", None):
+            if not getattr(self.config, "backup", None) or not _fails_over(primary_err):
                 raise
             logger.warning("Primary embedding provider failed (%s), failing over to backup.", primary_err)
             emit("failover", from_provider=self.config.provider,
@@ -707,8 +715,11 @@ class _Responses(ProviderCache):
     def _wrap_streaming(self, primary_factory, user_key: str, pre_count_tokens: int, *,
                         backup_factory=None, max_retries: int = 0, base_delay: float = 0.0):
         def on_complete(last_usage, limiter_scope, prompt_tokens, output_text):
-            actual = stream_completion_tokens(last_usage, prompt_tokens, pre_count_tokens,
-                                                  output_text, getattr(self.config, "model", None))
+            actual = stream_completion_tokens(
+                last_usage, prompt_tokens, pre_count_tokens,
+                output_text, getattr(self.config, "model", None),
+                token_counter=self.rate_limiter.count_tokens,
+            )
             self.rate_limiter.update_token_usage(
                 user_key,
                 actual,
@@ -751,7 +762,7 @@ class _Responses(ProviderCache):
             InvalidResponseRequestError: The request has an option that the Responses API does not accept.
             ResponsesError: The provider failed.
         """
-        self.live_logs = kwargs.pop("live_logs", False)
+        live_logs = kwargs.pop("live_logs", False)
         _max_retries: int = kwargs.pop("max_retries", getattr(self.config, "max_retries", DEFAULT_MAX_RETRIES))
         _base_delay: float = getattr(self.config, "retry_base_delay", DEFAULT_RETRY_BASE_DELAY)
         provider_cls = self._provider_class()
@@ -763,7 +774,7 @@ class _Responses(ProviderCache):
             _max_retries = 0
         if not side_effecting_request and not stateful_request:
             validate_backup_for_registry(self.config, RESPONSES_PROVIDER_REGISTRY)
-        if self.live_logs:
+        if live_logs:
             logger.info(
                 "Responses request: %s",
                 json.dumps(redact_sensitive(
@@ -803,7 +814,10 @@ class _Responses(ProviderCache):
 
             backup_stream_factory = None
             if not side_effecting_request and not stateful_request and getattr(self.config, "backup", None):
+                backup_reserved = False
+
                 def backup_stream_factory():
+                    nonlocal backup_reserved
                     backup_execution = build_backup_execution_plan(
                         self.config,
                         operation="responses",
@@ -818,10 +832,12 @@ class _Responses(ProviderCache):
                     backup_input, backup_tokens = prepare_target_response_input(
                         backup_config, input, self.rate_limiter, truncate, backup_request_kwargs_payload,
                     )
-                    reserve_rate_limit(
-                        self.rate_limiter, user_key, backup_config.rpm, backup_config.tpm,
-                        self.window_seconds, backup_tokens, scope=backup_limiter_scope,
-                    )
+                    if not backup_reserved:
+                        reserve_rate_limit(
+                            self.rate_limiter, user_key, backup_config.rpm, backup_config.tpm,
+                            self.window_seconds, backup_tokens, scope=backup_limiter_scope,
+                        )
+                        backup_reserved = True
                     backup_provider = prepare_backup_provider(self.config, RESPONSES_PROVIDER_REGISTRY,
                                                               self._instantiate_provider)
                     backup_breaker = (
@@ -843,9 +859,9 @@ class _Responses(ProviderCache):
                             prompt_tokens=backup_tokens, probe=probe,
                         )
                     except Exception as exc:
-                        raise_response_error(self.config, exc, user_key, "create")
+                        raise_response_error(backup_config, exc, user_key, "create")
 
-            if self.live_logs:
+            if live_logs:
                 logger.info(
                     "Responses Response: %s",
                     json.dumps(redact_sensitive({
@@ -917,7 +933,7 @@ class _Responses(ProviderCache):
         except Exception as e:
             raise_response_error(self.config, e, user_key, "create")
 
-        if self.live_logs:
+        if live_logs:
             logger.info(
                 "Responses Response: %s",
                 json.dumps(redact_sensitive({

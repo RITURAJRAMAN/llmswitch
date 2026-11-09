@@ -79,7 +79,6 @@ from .registry import (
     ASYNC_CHAT_PROVIDER_REGISTRY,
     ASYNC_EMBEDDING_PROVIDER_REGISTRY,
     ASYNC_RESPONSES_PROVIDER_REGISTRY,
-    EMBEDDING_PROVIDER_REGISTRY,
 )
 from .responses_capabilities import (
     is_side_effecting_response_request,
@@ -125,6 +124,7 @@ class _AsyncChatCompletions(ProviderCache):
             actual = await asyncio.to_thread(
                 stream_completion_tokens, last_usage, prompt_tokens, pre_count_tokens,
                 output_text, getattr(self.config, "model", None),
+                self.rate_limiter.count_tokens,
             )
             await asyncio.to_thread(
                 self.rate_limiter.update_token_usage,
@@ -234,7 +234,10 @@ class _AsyncChatCompletions(ProviderCache):
 
             backup_stream_factory = None
             if getattr(self.config, "backup", None):
+                backup_reserved = False
+
                 async def backup_stream_factory():
+                    nonlocal backup_reserved
                     backup_execution = build_backup_execution_plan(
                         self.config,
                         operation="chat.completions",
@@ -249,10 +252,12 @@ class _AsyncChatCompletions(ProviderCache):
                         prepare_target_messages, backup_config, messages, self.rate_limiter,
                         truncate, backup_request_kwargs_payload,
                     )
-                    await areserve_rate_limit(
-                        self.rate_limiter, user_key, backup_config.rpm, backup_config.tpm,
-                        self.window_seconds, backup_tokens, scope=backup_limiter_scope,
-                    )
+                    if not backup_reserved:
+                        await areserve_rate_limit(
+                            self.rate_limiter, user_key, backup_config.rpm, backup_config.tpm,
+                            self.window_seconds, backup_tokens, scope=backup_limiter_scope,
+                        )
+                        backup_reserved = True
                     backup_provider = prepare_backup_provider(self.config, ASYNC_CHAT_PROVIDER_REGISTRY,
                                                               self._instantiate_provider)
                     backup_breaker = (
@@ -276,6 +281,12 @@ class _AsyncChatCompletions(ProviderCache):
                     except Exception as exc:
                         raise_chat_error(backup_config, exc, user_key)
 
+            if live_logs:
+                logger.info(
+                    "Chat Response: %s",
+                    json.dumps(redact_sensitive({"provider": self.config.provider,
+                                                 "response": "<Object(ChatCompletionChunk.Response)>"}))
+                )
             return await self._wrap_streaming(
                 primary_stream_factory,
                 user_key,
@@ -339,6 +350,13 @@ class _AsyncChatCompletions(ProviderCache):
                 raise primary_err from backup_err
         except Exception as e:
             raise_chat_error(self.config, e, user_key)
+
+        if live_logs:
+            logger.info(
+                "Chat Response: %s",
+                json.dumps(redact_sensitive({"provider": self.config.provider,
+                                             "response": "<Object(ChatCompletion.Response)>"}))
+            )
 
         openai_tokens = getattr(getattr(result, "usage", None), "total_tokens", 0)
         actual = max(0, openai_tokens - total_tokens)
@@ -547,10 +565,14 @@ class _AsyncResponses(ProviderCache):
     async def _management_call(self, operation: str, *args: Any, **kwargs: Any) -> Any:
         """Run a non-generating Responses verb through retry + error translation."""
         provider_cls = self._provider_class()
-        call_args, provider_kwargs, _max_retries, _ = prepare_management_call(
+        call_args, provider_kwargs, _max_retries, live_logs = prepare_management_call(
             self.config, operation, args, kwargs,
         )
         user_key: str = getattr(self.config, "user_id", "global")
+        if live_logs:
+            logger.info("Responses %s request: %s", operation,
+                        json.dumps(redact_sensitive({"provider": self.config.provider, "kwargs": provider_kwargs}),
+                                   default=str))
         try:
             provider = self._instantiate_provider(self.config, provider_cls)
             return await _async_retry_call(
@@ -570,6 +592,7 @@ class _AsyncResponses(ProviderCache):
             actual = await asyncio.to_thread(
                 stream_completion_tokens, last_usage, prompt_tokens, pre_count_tokens,
                 output_text, getattr(self.config, "model", None),
+                self.rate_limiter.count_tokens,
             )
             await asyncio.to_thread(
                 self.rate_limiter.update_token_usage,
@@ -674,7 +697,10 @@ class _AsyncResponses(ProviderCache):
 
             backup_stream_factory = None
             if not side_effecting_request and not stateful_request and getattr(self.config, "backup", None):
+                backup_reserved = False
+
                 async def backup_stream_factory():
+                    nonlocal backup_reserved
                     backup_execution = build_backup_execution_plan(
                         self.config,
                         operation="responses",
@@ -690,10 +716,12 @@ class _AsyncResponses(ProviderCache):
                         prepare_target_response_input, backup_config, input, self.rate_limiter,
                         truncate, backup_request_kwargs_payload,
                     )
-                    await areserve_rate_limit(
-                        self.rate_limiter, user_key, backup_config.rpm, backup_config.tpm,
-                        self.window_seconds, backup_tokens, scope=backup_limiter_scope,
-                    )
+                    if not backup_reserved:
+                        await areserve_rate_limit(
+                            self.rate_limiter, user_key, backup_config.rpm, backup_config.tpm,
+                            self.window_seconds, backup_tokens, scope=backup_limiter_scope,
+                        )
+                        backup_reserved = True
                     backup_provider = prepare_backup_provider(self.config, ASYNC_RESPONSES_PROVIDER_REGISTRY,
                                                               self._instantiate_provider)
                     backup_breaker = (
@@ -715,8 +743,15 @@ class _AsyncResponses(ProviderCache):
                             prompt_tokens=backup_tokens, probe=probe,
                         )
                     except Exception as exc:
-                        raise_response_error(self.config, exc, user_key, "create")
+                        raise_response_error(backup_config, exc, user_key, "create")
 
+            if live_logs:
+                logger.info(
+                    "Responses Response: %s",
+                    json.dumps(redact_sensitive({
+                        "provider": self.config.provider,
+                        "response": "<Object(ResponseStreamEvent)>"}))
+                )
             return await self._wrap_streaming(
                 primary_stream_factory,
                 user_key,
@@ -782,6 +817,14 @@ class _AsyncResponses(ProviderCache):
                 raise primary_err from backup_err
         except Exception as e:
             raise_response_error(self.config, e, user_key, "create")
+
+        if live_logs:
+            logger.info(
+                "Responses Response: %s",
+                json.dumps(redact_sensitive({
+                    "provider": self.config.provider,
+                    "response": "<Object(Response)>"}))
+            )
 
         provider_tokens = getattr(getattr(result, "usage", None), "total_tokens", 0)
         await asyncio.to_thread(
@@ -1016,9 +1059,9 @@ class _AsyncEmbeddings(ProviderCache):
         live_logs = kwargs.pop("live_logs", False)
         retry_override: int | None = kwargs.pop("max_retries", None)
         restore_order = kwargs.pop("restore_order", True)
-        provider_class(self.config.provider, EMBEDDING_PROVIDER_REGISTRY, "embeddings")
+        provider_class(self.config.provider, ASYNC_EMBEDDING_PROVIDER_REGISTRY, "embeddings")
         require_operation(self.config.provider, "embeddings")
-        validate_backup_for_registry(self.config, EMBEDDING_PROVIDER_REGISTRY)
+        validate_backup_for_registry(self.config, ASYNC_EMBEDDING_PROVIDER_REGISTRY)
         if live_logs:
             logger.info("Embedding request: %s", json.dumps(redact_sensitive(
                 {"provider": self.config.provider, "input": "<hidden>", "kwargs": kwargs})))
@@ -1076,7 +1119,7 @@ class _AsyncEmbeddings(ProviderCache):
         try:
             return await run_target(self.config, plan)
         except (EmbeddingGenerationError, APIConnectionError, RateLimitExceededError, TimeOutError) as primary_err:
-            if not getattr(self.config, "backup", None):
+            if not getattr(self.config, "backup", None) or not _fails_over(primary_err):
                 raise
             logger.warning("Primary embedding provider failed (%s), failing over to backup.", primary_err)
             emit("failover", from_provider=self.config.provider,

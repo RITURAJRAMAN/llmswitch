@@ -14,6 +14,7 @@ Nothing here makes a network call, so each function can be tested on its own.
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -202,17 +203,20 @@ def to_ai_message(completion: ChatCompletion) -> AIMessage:
     Tool calls whose arguments are not a JSON object go to ``invalid_tool_calls``
     with the raw string and the parse error, so the caller can decide what to do.
     """
+    if not completion.choices:
+        raise ValueError("ChatCompletion contains no choices")
     choice = completion.choices[0]
     message = choice.message
     tool_calls: list[ToolCall] = []
     invalid: list[InvalidToolCall] = []
     for call in message.tool_calls or []:
+        call_id = call.id or f"call_{uuid.uuid4().hex[:24]}"
         ok, value = _parse_arguments(call.function.arguments)
         if ok:
-            tool_calls.append(ToolCall(name=call.function.name, args=value, id=call.id))
+            tool_calls.append(ToolCall(name=call.function.name, args=value, id=call_id))
         else:
             invalid.append(InvalidToolCall(type="invalid_tool_call", name=call.function.name,
-                                           args=call.function.arguments, id=call.id, error=value))
+                                           args=call.function.arguments, id=call_id, error=value))
     return AIMessage(
         content=message.content or "",
         tool_calls=tool_calls,
@@ -373,7 +377,7 @@ def response_to_ai_message(response: Response) -> AIMessage:
             if text:
                 texts.append(text)
         elif kind == "function_call":
-            call_id = _field(item, "call_id") or _field(item, "id") or ""
+            call_id = _field(item, "call_id") or _field(item, "id") or f"call_{uuid.uuid4().hex[:24]}"
             name = _field(item, "name") or ""
             ok, value = _parse_arguments_for_response(_field(item, "arguments"))
             if ok:
@@ -430,12 +434,16 @@ def response_event_to_chunk(event: ResponseStreamEvent) -> AIMessageChunk | None
             name=None, args=event.delta or "", id=None, index=event.output_index or 0)])
     if kind in ("response.completed", "response.incomplete"):
         response = event.response
-        metadata: dict[str, Any] = {"id": getattr(response, "id", None), "status": getattr(response, "status", None)}
-        return AIMessageChunk(content="", usage_metadata=_response_usage(event.usage),
+        metadata: dict[str, Any] = {
+            "id": _field(response, "id") if response is not None else None,
+            "status": _field(response, "status") if response is not None else None,
+        }
+        usage = event.usage if event.usage is not None else (_field(response, "usage") if response is not None else None)
+        return AIMessageChunk(content="", usage_metadata=_response_usage(usage),
                               response_metadata=metadata)
     if kind == "response.failed":
-        error = event.response.error if event.response is not None else None
-        message = (getattr(error, "message", None) if error is not None else None) or "The response failed."
+        error = _field(event.response, "error") if event.response is not None else None
+        message = (_field(error, "message") if error is not None else None) or "The response failed."
         raise ResponsesError(message)
     return None
 

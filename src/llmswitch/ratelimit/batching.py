@@ -34,6 +34,8 @@ class BatchUtility:
             List of batches, each a list of original input indices.
         """
         n = len(token_counts)
+        if n == 0:
+            return []
         if not batching:
             return [list(range(n))]
         # FFD: place the largest items first.
@@ -70,6 +72,8 @@ class BatchUtility:
 
     def print_progress_bar(self, current: int, total: int, bar_length: int = 60) -> None:
         """Log a simple progress bar for batching operations."""
+        if total <= 0:
+            return
         percent = float(current) / total
         completed = int(percent * bar_length)
         bar = "█" * completed + " " * (bar_length - completed)

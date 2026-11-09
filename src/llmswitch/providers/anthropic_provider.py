@@ -198,7 +198,14 @@ def _openai_messages_to_anthropic(
 
         if role == "user":
             parts = _content_to_anthropic_parts(content)
-            anthropic_messages.append({"role": "user", "content": parts})
+            if (
+                anthropic_messages
+                and anthropic_messages[-1]["role"] == "user"
+                and isinstance(anthropic_messages[-1]["content"], list)
+            ):
+                anthropic_messages[-1]["content"].extend(parts)
+            else:
+                anthropic_messages.append({"role": "user", "content": parts})
             continue
 
         if role == "assistant":
@@ -223,7 +230,14 @@ def _openai_messages_to_anthropic(
                     "input": input_dict,
                 })
             if parts:
-                anthropic_messages.append({"role": "assistant", "content": parts})
+                if (
+                    anthropic_messages
+                    and anthropic_messages[-1]["role"] == "assistant"
+                    and isinstance(anthropic_messages[-1]["content"], list)
+                ):
+                    anthropic_messages[-1]["content"].extend(parts)
+                else:
+                    anthropic_messages.append({"role": "assistant", "content": parts})
             continue
 
         if role == "tool":
@@ -309,7 +323,7 @@ def _content_to_anthropic_parts(content: Any) -> list[dict[str, Any]]:
                 parts.append({"type": "text", "text": p.get("text", "")})
             elif p.get("type") == "image_url":
                 url = p.get("image_url", {}).get("url", "")
-                if url.startswith("data:"):
+                if url.startswith("data:") and "," in url:
                     header, data = url.split(",", 1)
                     media_type = header[5:].split(";", 1)[0] or "image/jpeg"
                     parts.append({
@@ -353,33 +367,45 @@ def _convert_tools_to_anthropic(tools: list[Any]) -> list[dict[str, Any]]:
 
 def _apply_parse_model(kwargs: dict[str, Any]) -> Any:
     """
-    Translate ``response_format=MyModel`` (.parse() style) into Anthropic's
-    structured-output mechanism: a forced tool whose ``input_schema`` is the
-    model's JSON schema.
+    Translate ``response_format=MyModel`` (.parse() style) or a ``json_schema``
+    ``response_format`` dict into Anthropic's structured-output mechanism: a
+    forced tool whose ``input_schema`` is the JSON schema.
 
     Anthropic has no native parse and ignores ``response_format``; forcing a
     single tool is the documented way to guarantee a schema-conforming object,
     which is then returned as the tool's ``input``. Mutates ``kwargs`` in place
-    and returns the model class (or ``None`` when not applicable) so the caller
-    can deserialize ``message.parsed`` afterwards.
+    and returns the model class (or ``None`` when not a Pydantic class) so the
+    caller can deserialize ``message.parsed`` afterwards.
     """
     parse_model = kwargs.get("response_format")
-    if not is_pydantic_model_class(parse_model):
+    if is_pydantic_model_class(parse_model):
+        tool_name = parse_model.__name__
+        tool_schema = parse_model.model_json_schema()
+        ret_model: Any = parse_model
+    elif isinstance(parse_model, dict) and parse_model.get("type") == "json_schema":
+        js = parse_model.get("json_schema") or {}
+        if not isinstance(js, dict):
+            return None
+        tool_name = js.get("name") or "structured_output"
+        tool_schema = js.get("schema") or {"type": "object", "properties": {}}
+        ret_model = None
+    else:
         return None
     schema_tool = {
         "type": "function",
         "function": {
-            "name": parse_model.__name__,
-            "description": f"Return a JSON object that conforms to the {parse_model.__name__} schema.",
-            "parameters": parse_model.model_json_schema(),
+            "name": tool_name,
+            "description": f"Return a JSON object that conforms to the {tool_name} schema.",
+            "parameters": tool_schema,
         },
     }
     tools = list(kwargs.get("tools") or [])
     tools.append(schema_tool)
     kwargs["tools"] = tools
-    kwargs["tool_choice"] = {"function": {"name": parse_model.__name__}}
+    kwargs["tool_choice"] = {"function": {"name": tool_name}}
+    kwargs["_structured_tool_name"] = tool_name
     kwargs.pop("response_format", None)
-    return parse_model
+    return ret_model
 
 
 def _build_usage(usage: Any) -> CompletionUsage:
@@ -464,9 +490,22 @@ def _extract_message_parts(
     )
 
 
-def _to_chat_completion_response(provider: "AnthropicChatProvider", response: Any) -> ChatCompletion:
+def _to_chat_completion_response(
+    provider: "AnthropicChatProvider", response: Any, structured_tool_name: str | None = None
+) -> ChatCompletion:
     text, tool_calls, thinking, thinking_signature, citations = _extract_message_parts(response.content)
-    finish_reason = provider._map_stop_reason(response.stop_reason, bool(tool_calls))
+    stop_reason = response.stop_reason
+    if structured_tool_name and tool_calls:
+        remaining_calls: list[ChatCompletionMessageToolCall] = []
+        for tc in tool_calls:
+            if tc.function.name == structured_tool_name and not text:
+                text = tc.function.arguments
+            else:
+                remaining_calls.append(tc)
+        tool_calls = remaining_calls or None
+        if not tool_calls and stop_reason == "tool_use":
+            stop_reason = "end_turn"
+    finish_reason = provider._map_stop_reason(stop_reason, bool(tool_calls))
     extensions = provider_extensions_from_raw(
         "anthropic",
         response,
@@ -521,7 +560,12 @@ def _retry_after_from_exc(exc: Exception, default: int = 60) -> int:
 
 
 def _raise_mapped_anthropic_error(
-    exc: Exception, *, context: str, provider_name: str = "anthropic", timeout_seconds: float | None = None
+    exc: Exception,
+    *,
+    context: str,
+    provider_name: str = "anthropic",
+    timeout_seconds: float | None = None,
+    base_url: str | None = None,
 ) -> NoReturn:
     if isinstance(exc, anthropic.RateLimitError):
         raise RateLimitExceededError(_retry_after_from_exc(exc)) from exc
@@ -531,7 +575,7 @@ def _raise_mapped_anthropic_error(
         timeout_value = 60 if timeout_seconds is None or timeout_seconds <= 0 else max(1, int(math.ceil(timeout_seconds)))
         raise TimeOutError(timeout_value) from exc
     if isinstance(exc, anthropic.APIConnectionError):
-        raise APIConnectionError(provider_name) from exc
+        raise APIConnectionError(base_url or "https://api.anthropic.com", provider=provider_name) from exc
     if isinstance(exc, anthropic.BadRequestError):
         raise ChatCompletionError(str(exc), status_code=400, provider=provider_name) from exc
     if isinstance(exc, ChatCompletionError):
@@ -554,17 +598,29 @@ class _StreamedThinking:
     is complete at its start event.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, structured_tool_name: str | None = None) -> None:
         self.text = ""
+        self.structured_tool_name = structured_tool_name
+        self._in_structured_tool = False
 
     def delta_for(self, event: Any) -> ChoiceDelta | None:
         event_type = getattr(event, "type", None)
         if event_type == "content_block_start":
             block = getattr(event, "content_block", None)
-            if getattr(block, "type", None) == "redacted_thinking":
+            block_type = getattr(block, "type", None)
+            if block_type == "redacted_thinking":
                 blocks = [{"type": "redacted_thinking", "data": getattr(block, "data", "") or ""}]
                 return ChoiceDelta(role="assistant", extensions=ProviderExtensions(
                     provider="anthropic", fields={"thinking_blocks": blocks}))
+            if (
+                block_type == "tool_use"
+                and self.structured_tool_name
+                and getattr(block, "name", None) == self.structured_tool_name
+            ):
+                self._in_structured_tool = True
+            return None
+        if event_type == "content_block_stop":
+            self._in_structured_tool = False
             return None
         if event_type != "content_block_delta":
             return None
@@ -572,6 +628,11 @@ class _StreamedThinking:
         delta_type = getattr(delta, "type", None)
         if delta_type == "text_delta":
             return ChoiceDelta(role="assistant", content=delta.text)
+        if delta_type == "input_json_delta" and self._in_structured_tool:
+            partial = getattr(delta, "partial_json", "")
+            if partial:
+                return ChoiceDelta(role="assistant", content=partial)
+            return None
         if delta_type == "thinking_delta":
             self.text += delta.thinking
             return ChoiceDelta(role="assistant", thinking=delta.thinking)
@@ -772,12 +833,18 @@ class AnthropicChatProvider(BaseChatProvider):
             ChatCompletion with usage including cache fields.
         """
         try:
+            structured_tool_name = kwargs.pop("_structured_tool_name", None)
             req = self._prepare_request(messages, kwargs)
             response = self.client.messages.create(**req)
-            return _to_chat_completion_response(self, response)
+            return _to_chat_completion_response(self, response, structured_tool_name=structured_tool_name)
 
         except Exception as e:
-            _raise_mapped_anthropic_error(e, context="Anthropic chat completion error", timeout_seconds=self.timeout)
+            _raise_mapped_anthropic_error(
+                e,
+                context="Anthropic chat completion error",
+                timeout_seconds=self.timeout,
+                base_url=self.base_url,
+            )
 
     def _streaming_create(
             self, messages: list[dict[str, Any]], **kwargs: Any
@@ -794,6 +861,7 @@ class AnthropicChatProvider(BaseChatProvider):
             ChatCompletionChunk objects.
         """
         try:
+            structured_tool_name = kwargs.pop("_structured_tool_name", None)
             req = self._prepare_request(messages, kwargs)
 
             def _generate() -> Generator[ChatCompletionChunk, None, None]:
@@ -801,7 +869,7 @@ class AnthropicChatProvider(BaseChatProvider):
                 model = req.get("model", self.model)
                 created = int(time.time())
 
-                thinking = _StreamedThinking()
+                thinking = _StreamedThinking(structured_tool_name=structured_tool_name)
 
                 with self.client.messages.stream(**req) as stream:
                     # Stream text and thinking incrementally as deltas arrive, rather
@@ -826,7 +894,12 @@ class AnthropicChatProvider(BaseChatProvider):
                     # signature already streamed above, so they are not re-emitted here.
                     final = stream.get_final_message()
                     _, tool_calls, _, _, citations = _extract_message_parts(final.content)
-                    finish_reason = self._map_stop_reason(final.stop_reason, bool(tool_calls))
+                    stop_reason = final.stop_reason
+                    if structured_tool_name and tool_calls:
+                        tool_calls = [tc for tc in tool_calls if tc.function.name != structured_tool_name] or None
+                        if not tool_calls and stop_reason == "tool_use":
+                            stop_reason = "end_turn"
+                    finish_reason = self._map_stop_reason(stop_reason, bool(tool_calls))
 
                     if tool_calls:
                         delta_tool_calls = [
@@ -894,12 +967,27 @@ class AnthropicChatProvider(BaseChatProvider):
                 try:
                     yield from _generate()
                 except Exception as e:  # noqa: BLE001 - re-mapped to library errors
-                    _raise_mapped_anthropic_error(e, context="Anthropic streaming error", timeout_seconds=self.timeout)
+                    _raise_mapped_anthropic_error(
+                        e,
+                        context="Anthropic streaming error",
+                        timeout_seconds=self.timeout,
+                        base_url=self.base_url,
+                    )
 
             return _wrapped()
 
         except Exception as e:
-            _raise_mapped_anthropic_error(e, context="Anthropic streaming error", timeout_seconds=self.timeout)
+            _raise_mapped_anthropic_error(
+                e,
+                context="Anthropic streaming error",
+                timeout_seconds=self.timeout,
+                base_url=self.base_url,
+            )
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
 
     @staticmethod
     def _map_stop_reason(stop_reason: str | None, has_tool_calls: bool) -> _CHUNK_FINISH_REASON:
@@ -928,7 +1016,7 @@ class AsyncAnthropicChatProvider(AnthropicChatProvider):
         self.model: str = (
                 kwargs.get("deployment_name")
                 or kwargs.get("model")
-                or "claude-opus-4-5"
+                or DEFAULT_ANTHROPIC_MODEL
         )
         self.base_url: str | None = kwargs.get("endpoint") or kwargs.get("base_url")
         self.timeout: float | None = kwargs.get("timeout")
@@ -953,24 +1041,31 @@ class AsyncAnthropicChatProvider(AnthropicChatProvider):
 
     async def _non_streaming_create(self, messages: list[dict[str, Any]], **kwargs: Any) -> ChatCompletion:
         try:
+            structured_tool_name = kwargs.pop("_structured_tool_name", None)
             req = self._prepare_request(messages, kwargs)
             response = await self.client.messages.create(**req)
-            return _to_chat_completion_response(self, response)
+            return _to_chat_completion_response(self, response, structured_tool_name=structured_tool_name)
 
         except Exception as e:
-            _raise_mapped_anthropic_error(e, context="Async Anthropic chat completion error", timeout_seconds=self.timeout)
+            _raise_mapped_anthropic_error(
+                e,
+                context="Async Anthropic chat completion error",
+                timeout_seconds=self.timeout,
+                base_url=self.base_url,
+            )
 
     async def _streaming_create(
             self, messages: list[dict[str, Any]], **kwargs: Any
     ) -> AsyncGenerator[ChatCompletionChunk, None]:
         try:
+            structured_tool_name = kwargs.pop("_structured_tool_name", None)
             req = self._prepare_request(messages, kwargs)
 
             chunk_id = f"anthropic-{int(time.time())}"
             model = req.get("model", self.model)
             created = int(time.time())
 
-            thinking = _StreamedThinking()
+            thinking = _StreamedThinking(structured_tool_name=structured_tool_name)
 
             async with self.client.messages.stream(**req) as stream:
                 # Stream text and thinking incrementally as deltas arrive (see the
@@ -994,7 +1089,12 @@ class AsyncAnthropicChatProvider(AnthropicChatProvider):
                 # signature already streamed above, so they are not re-emitted here.
                 final = await stream.get_final_message()
                 _, tool_calls, _, _, citations = _extract_message_parts(final.content)
-                finish_reason = self._map_stop_reason(final.stop_reason, bool(tool_calls))
+                stop_reason = final.stop_reason
+                if structured_tool_name and tool_calls:
+                    tool_calls = [tc for tc in tool_calls if tc.function.name != structured_tool_name] or None
+                    if not tool_calls and stop_reason == "tool_use":
+                        stop_reason = "end_turn"
+                finish_reason = self._map_stop_reason(stop_reason, bool(tool_calls))
 
                 if tool_calls:
                     delta_tool_calls = [
@@ -1059,7 +1159,17 @@ class AsyncAnthropicChatProvider(AnthropicChatProvider):
                 )
 
         except Exception as e:
-            _raise_mapped_anthropic_error(e, context="Async Anthropic streaming error", timeout_seconds=self.timeout)
+            _raise_mapped_anthropic_error(
+                e,
+                context="Async Anthropic streaming error",
+                timeout_seconds=self.timeout,
+                base_url=self.base_url,
+            )
+
+    async def aclose(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            await close()
 
 
 class AnthropicResponsesProvider(SyncEmulatedResponsesProvider):

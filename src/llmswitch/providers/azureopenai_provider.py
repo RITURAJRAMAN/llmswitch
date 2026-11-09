@@ -120,7 +120,7 @@ class AzureOpenAIChatProvider(BaseChatProvider):
         self.api_version = kwargs.get("api_version")
         self._token_limit = azure_token_limit_name(self.api_version)
         self.deployment_name = kwargs.get("deployment_name")
-        self.model = kwargs.get("model")
+        self.model = self.deployment_name or kwargs.get("model")
         self.timeout = kwargs.get("timeout")
         self.client = AzureOpenAI(**merge_client_options({
             "api_key": self.api_key,
@@ -229,20 +229,20 @@ class AzureOpenAIChatProvider(BaseChatProvider):
         except openai.BadRequestError as e:
             _raise_if_content_filtered(e)
             logger.error("Azure OpenAI bad request error | Exception: %s", e)
-            raise ChatCompletionError(str(e), status_code=400) from e
-        except ConnectionError as e:
+            raise ChatCompletionError(str(e), status_code=400, provider="azure_openai") from e
+        except (openai.APIConnectionError, ConnectionError) as e:
             logger.error("Connection error in chat completion: %s | Exception: %s", self.endpoint, e)
-            raise APIConnectionError(self.endpoint) from e
+            raise APIConnectionError(self.endpoint, provider="azure_openai") from e
         except PermissionError as e:
             logger.error("Authentication error in chat completion | Exception: %s", e)
-            raise AuthenticationError() from e
+            raise AuthenticationError(provider="azure_openai") from e
         except ValueError as e:
             logger.error("Invalid response in chat completion | Exception: %s", e)
-            raise InvalidResponseError(str(e)) from e
+            raise InvalidResponseError(str(e), provider="azure_openai") from e
         except Exception as e:
             status_code = getattr(e, "status_code", 500)
             logger.error("Chat completion error | Exception: %s", e)
-            raise ChatCompletionError(str(e), status_code=status_code) from e
+            raise ChatCompletionError(str(e), status_code=status_code, provider="azure_openai") from e
 
     def _streaming_create(self, messages: list, **kwargs) -> Generator[ChatCompletionChunk, None, None]:
         """Handle streaming chat completion; yields ChatCompletionChunk objects."""
@@ -256,29 +256,6 @@ class AzureOpenAIChatProvider(BaseChatProvider):
             )
 
             for event in stream:
-                # If the event contains usage info, yield a usage-only chunk.
-                if hasattr(event, "usage") and event.usage:
-                    extensions = provider_extensions_from_raw(
-                        "azure_openai",
-                        event,
-                        {
-                            "id", "object", "created", "model", "system_fingerprint", "choices", "service_tier", "usage",
-                        },
-                    )
-                    yield ChatCompletionChunk(
-                        id=event.id,
-                        object=event.object,
-                        created=event.created,
-                        model=event.model,
-                        system_fingerprint=event.system_fingerprint,
-                        choices=[],
-                        service_tier=event.service_tier,
-                        usage=build_openai_usage(event.usage),
-                        extensions=extensions,
-                    )
-                    continue
-
-                # Otherwise, yield content chunks.
                 for ch in event.choices:
                     audio_delta = getattr(ch.delta, "audio", None)
                     delta = ChoiceDelta(
@@ -319,6 +296,26 @@ class AzureOpenAIChatProvider(BaseChatProvider):
                         extensions=extensions,
                     )
 
+                if hasattr(event, "usage") and event.usage:
+                    extensions = provider_extensions_from_raw(
+                        "azure_openai",
+                        event,
+                        {
+                            "id", "object", "created", "model", "system_fingerprint", "choices", "service_tier", "usage",
+                        },
+                    )
+                    yield ChatCompletionChunk(
+                        id=event.id,
+                        object=event.object,
+                        created=event.created,
+                        model=event.model,
+                        system_fingerprint=event.system_fingerprint,
+                        choices=[],
+                        service_tier=event.service_tier,
+                        usage=build_openai_usage(event.usage),
+                        extensions=extensions,
+                    )
+
         except openai.RateLimitError as e:
             retry_after = get_retry_after_seconds(e)
             logger.error("Azure OpenAI streaming rate limit error | Exception: %s", e)
@@ -332,23 +329,28 @@ class AzureOpenAIChatProvider(BaseChatProvider):
         except openai.BadRequestError as e:
             _raise_if_content_filtered(e)
             logger.error("Azure OpenAI streaming bad request error | Exception: %s", e)
-            raise ChatCompletionError(str(e), status_code=400) from e
-        except ConnectionError as e:
+            raise ChatCompletionError(str(e), status_code=400, provider="azure_openai") from e
+        except (openai.APIConnectionError, ConnectionError) as e:
             logger.error("Azure OpenAI streaming connection error: %s", e)
-            raise APIConnectionError(self.endpoint) from e
+            raise APIConnectionError(self.endpoint, provider="azure_openai") from e
         except PermissionError as e:
             logger.error("Azure OpenAI streaming authentication error: %s", e)
-            raise AuthenticationError() from e
+            raise AuthenticationError(provider="azure_openai") from e
         except ValueError as e:
             logger.error("Azure OpenAI streaming invalid response: %s", e)
-            raise InvalidResponseError(str(e)) from e
+            raise InvalidResponseError(str(e), provider="azure_openai") from e
         except Exception as e:
             status_code = getattr(e, "status_code", 500)
             logger.error("Azure OpenAI streaming error: %s", e)
-            raise ChatCompletionError(str(e), status_code=status_code) from e
+            raise ChatCompletionError(str(e), status_code=status_code, provider="azure_openai") from e
         finally:
             if stream is not None:
                 close_stream(stream)
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
 
 
 def _azure_embedding_response(response: Any) -> CreateEmbeddingResponse:
@@ -366,19 +368,23 @@ def _azure_embedding_response(response: Any) -> CreateEmbeddingResponse:
     )
 
 
-def _translate_azure_embedding_error(exc: Exception, endpoint: Optional[str]) -> Exception:
+def _translate_azure_embedding_error(exc: Exception, endpoint: Optional[str], timeout_seconds: Any = None) -> Exception:
     """Return the library error for a failed Azure OpenAI embeddings call."""
-    if isinstance(exc, ConnectionError):
-        logger.error("Connection error in embedding creation: %s | Exception: %s", endpoint, exc)
-        return APIConnectionError(endpoint)
-    if isinstance(exc, PermissionError):
+    if isinstance(exc, openai.RateLimitError):
+        return RateLimitExceededError(get_retry_after_seconds(exc))
+    if isinstance(exc, (openai.AuthenticationError, PermissionError)):
         logger.error("Authentication error in embedding creation | Exception: %s", exc)
-        return AuthenticationError()
+        return AuthenticationError(provider="azure_openai")
+    if isinstance(exc, openai.APITimeoutError):
+        return TimeOutError(configured_timeout_seconds(timeout_seconds))
+    if isinstance(exc, (openai.APIConnectionError, ConnectionError)):
+        logger.error("Connection error in embedding creation: %s | Exception: %s", endpoint, exc)
+        return APIConnectionError(endpoint, provider="azure_openai")
     if isinstance(exc, ValueError):
         logger.error("Invalid response in embedding creation | Exception: %s", exc)
-        return InvalidResponseError(str(exc))
+        return InvalidResponseError(str(exc), provider="azure_openai")
     logger.error("Embedding generation error | Exception: %s", exc)
-    return EmbeddingGenerationError(str(exc), status_code=getattr(exc, "status_code", 500))
+    return EmbeddingGenerationError(str(exc), status_code=getattr(exc, "status_code", 500), provider="azure_openai")
 
 
 class AzureOpenAIEmbeddingProvider(BaseEmbeddingProvider):
@@ -395,16 +401,18 @@ class AzureOpenAIEmbeddingProvider(BaseEmbeddingProvider):
         Args:
             **kwargs: Should include 'api_key', 'api_version', 'azure_endpoint', 'azure_deployment', and 'model'.
         """
-        self.endpoint = kwargs.get("azure_endpoint")
+        self.endpoint = kwargs.get("azure_endpoint") or kwargs.get("endpoint")
+        deployment = kwargs.get("azure_deployment") or kwargs.get("deployment_name")
+        self.timeout = kwargs.get("timeout")
         self.client = self._client_class(**merge_client_options({
             "api_key": kwargs.get("api_key"),
             "api_version": kwargs.get("api_version"),
             "azure_endpoint": self.endpoint,
-            "azure_deployment": kwargs.get("azure_deployment"),
+            "azure_deployment": deployment,
             "max_retries": 0,
-            "timeout": kwargs.get("timeout"),
+            "timeout": self.timeout,
         }, kwargs.get("client_options")))
-        self.model = kwargs.get("model")
+        self.model = deployment or kwargs.get("model")
 
     def create(self, input: list[str], **kwargs) -> CreateEmbeddingResponse:  # noqa: A002
         """Create embeddings for the given input using Azure OpenAI."""
@@ -412,7 +420,12 @@ class AzureOpenAIEmbeddingProvider(BaseEmbeddingProvider):
             response = self.client.embeddings.create(model=kwargs.pop("model", self.model), input=input, **kwargs)
             return _azure_embedding_response(response)
         except Exception as e:
-            raise _translate_azure_embedding_error(e, self.endpoint) from e
+            raise _translate_azure_embedding_error(e, self.endpoint, self.timeout) from e
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
 
 
 class AsyncAzureOpenAIEmbeddingProvider(AzureOpenAIEmbeddingProvider):
@@ -426,7 +439,7 @@ class AsyncAzureOpenAIEmbeddingProvider(AzureOpenAIEmbeddingProvider):
             response = await self.client.embeddings.create(model=kwargs.pop("model", self.model), input=input, **kwargs)
             return _azure_embedding_response(response)
         except Exception as e:
-            raise _translate_azure_embedding_error(e, self.endpoint) from e
+            raise _translate_azure_embedding_error(e, self.endpoint, self.timeout) from e
 
     async def aclose(self) -> None:
         await self.client.close()
@@ -445,7 +458,7 @@ class AsyncAzureOpenAIChatProvider(BaseChatProvider):
         self.api_version = kwargs.get("api_version")
         self._token_limit = azure_token_limit_name(self.api_version)
         self.deployment_name = kwargs.get("deployment_name")
-        self.model = kwargs.get("model")
+        self.model = self.deployment_name or kwargs.get("model")
         self.timeout = kwargs.get("timeout")
         self.client = AsyncAzureOpenAI(**merge_client_options({
             "api_key": self.api_key,
@@ -534,9 +547,15 @@ class AsyncAzureOpenAIChatProvider(BaseChatProvider):
             raise TimeOutError(configured_timeout_seconds(self.timeout)) from e
         except openai.BadRequestError as e:
             _raise_if_content_filtered(e)
-            raise ChatCompletionError(str(e), status_code=400) from e
+            raise ChatCompletionError(str(e), status_code=400, provider="azure_openai") from e
+        except (openai.APIConnectionError, ConnectionError) as e:
+            raise APIConnectionError(self.endpoint, provider="azure_openai") from e
+        except PermissionError as e:
+            raise AuthenticationError(provider="azure_openai") from e
+        except ValueError as e:
+            raise InvalidResponseError(str(e), provider="azure_openai") from e
         except Exception as e:
-            raise ChatCompletionError(str(e), status_code=getattr(e, "status_code", 500)) from e
+            raise ChatCompletionError(str(e), status_code=getattr(e, "status_code", 500), provider="azure_openai") from e
 
     async def _streaming_create(self, messages: list, **kwargs) -> AsyncGenerator[ChatCompletionChunk, None]:
         stream = None
@@ -548,21 +567,6 @@ class AsyncAzureOpenAIChatProvider(BaseChatProvider):
                 **kwargs,
             )
             async for event in stream:
-                if hasattr(event, "usage") and event.usage:
-                    extensions = provider_extensions_from_raw(
-                        "azure_openai",
-                        event,
-                        {
-                            "id", "object", "created", "model", "system_fingerprint", "choices", "service_tier", "usage",
-                        },
-                    )
-                    yield ChatCompletionChunk(
-                        id=event.id, object=event.object, created=event.created, model=event.model,
-                        system_fingerprint=event.system_fingerprint, choices=[], service_tier=event.service_tier,
-                        usage=build_openai_usage(event.usage),
-                        extensions=extensions,
-                    )
-                    continue
                 for ch in event.choices:
                     audio_delta = getattr(ch.delta, "audio", None)
                     extensions = provider_extensions_from_raw(
@@ -597,6 +601,20 @@ class AsyncAzureOpenAIChatProvider(BaseChatProvider):
                         )],
                         extensions=extensions,
                     )
+                if hasattr(event, "usage") and event.usage:
+                    extensions = provider_extensions_from_raw(
+                        "azure_openai",
+                        event,
+                        {
+                            "id", "object", "created", "model", "system_fingerprint", "choices", "service_tier", "usage",
+                        },
+                    )
+                    yield ChatCompletionChunk(
+                        id=event.id, object=event.object, created=event.created, model=event.model,
+                        system_fingerprint=event.system_fingerprint, choices=[], service_tier=event.service_tier,
+                        usage=build_openai_usage(event.usage),
+                        extensions=extensions,
+                    )
         except openai.RateLimitError as e:
             retry_after = get_retry_after_seconds(e)
             raise RateLimitExceededError(retry_after) from e
@@ -606,12 +624,23 @@ class AsyncAzureOpenAIChatProvider(BaseChatProvider):
             raise TimeOutError(configured_timeout_seconds(self.timeout)) from e
         except openai.BadRequestError as e:
             _raise_if_content_filtered(e)
-            raise ChatCompletionError(str(e), status_code=400) from e
+            raise ChatCompletionError(str(e), status_code=400, provider="azure_openai") from e
+        except (openai.APIConnectionError, ConnectionError) as e:
+            raise APIConnectionError(self.endpoint, provider="azure_openai") from e
+        except PermissionError as e:
+            raise AuthenticationError(provider="azure_openai") from e
+        except ValueError as e:
+            raise InvalidResponseError(str(e), provider="azure_openai") from e
         except Exception as e:
-            raise ChatCompletionError(str(e), status_code=getattr(e, "status_code", 500)) from e
+            raise ChatCompletionError(str(e), status_code=getattr(e, "status_code", 500), provider="azure_openai") from e
         finally:
             if stream is not None:
                 await close_async_stream(stream)
+
+    async def aclose(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            await close()
 
 
 # Azure exposes /responses only from this API version onward; older versions 404.

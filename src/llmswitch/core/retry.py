@@ -15,8 +15,12 @@ from ..errors import (
     APIConnectionError,
     ChatCompletionError,
     EmbeddingGenerationError,
+    InvalidResponseError,
+    LLMSwitchError,
     RateLimitExceededError,
+    ResponsesError,
     TimeOutError,
+    UnsupportedCapabilityError,
 )
 from .events import emit
 
@@ -29,15 +33,18 @@ def _is_retryable(exc: Exception) -> bool:
     A timeout is not retried: the provider may already have processed the request,
     so a retry could bill it twice. Connection errors and 5xx responses are retried.
     """
-    if isinstance(exc, TimeOutError):
+    if isinstance(exc, (TimeOutError, UnsupportedCapabilityError, InvalidResponseError)):
         return False
     if isinstance(exc, (RateLimitExceededError, APIConnectionError)):
         return True
-    if isinstance(exc, (ChatCompletionError, EmbeddingGenerationError)):
-        return getattr(exc, "status_code", 500) >= 500
+    if isinstance(exc, (ChatCompletionError, EmbeddingGenerationError, ResponsesError)):
+        status = getattr(exc, "status_code", 500)
+        return status >= 500 and status != 501
+    if isinstance(exc, LLMSwitchError):
+        return False
     # Also handle raw provider exceptions not yet wrapped (status_code >= 500)
     status = getattr(exc, "status_code", None)
-    return status is not None and status >= 500
+    return status is not None and status >= 500 and status != 501
 
 
 def _fails_over(exc: Exception) -> bool:

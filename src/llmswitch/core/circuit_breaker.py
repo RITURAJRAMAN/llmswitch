@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from typing import Any, Generator, Optional
 
@@ -100,8 +101,9 @@ class CircuitBreaker:
                 self._probe = None
 
 
-_breakers: dict = {}
+_breakers: OrderedDict = OrderedDict()
 _breakers_lock = threading.Lock()
+_BREAKER_CAP = 256
 
 
 def get_breaker(key, failure_threshold: int = _DEFAULT_FAILURE_THRESHOLD,
@@ -109,9 +111,13 @@ def get_breaker(key, failure_threshold: int = _DEFAULT_FAILURE_THRESHOLD,
     """Return the process-wide breaker for a target-specific key."""
     with _breakers_lock:
         breaker = _breakers.get(key)
-        if breaker is None:
-            breaker = CircuitBreaker(failure_threshold, reset_timeout)
-            _breakers[key] = breaker
+        if breaker is not None:
+            _breakers.move_to_end(key)
+            return breaker
+        if len(_breakers) >= _BREAKER_CAP:
+            _breakers.popitem(last=False)
+        breaker = CircuitBreaker(failure_threshold, reset_timeout)
+        _breakers[key] = breaker
         return breaker
 
 
@@ -155,7 +161,10 @@ def provider_call(
         yield probe
     except Exception as exc:
         if breaker is not None:
-            breaker.record(ok=not is_health_failure(exc), probe=probe)
+            if is_health_failure(exc):
+                breaker.record(ok=False, probe=probe)
+            else:
+                breaker.abandon(probe)
         raise
     except BaseException:
         if breaker is not None:

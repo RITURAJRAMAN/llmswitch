@@ -92,7 +92,8 @@ def stream_item_text(item: Any) -> str:
 
 
 def stream_completion_tokens(usage: Any, prompt_tokens: int | None, estimated_prompt_tokens: int,
-                             output_text: str, model_name: str | None) -> int:
+                             output_text: str, model_name: str | None,
+                             token_counter: Callable[[str, str | None], int] | None = None) -> int:
     """The tokens a finished stream adds to the rate limit, beyond the prompt that was already counted.
 
     The provider's usage is exact when it sends one. A stream without usage is counted from its text,
@@ -102,7 +103,8 @@ def stream_completion_tokens(usage: Any, prompt_tokens: int | None, estimated_pr
         total_tokens = getattr(usage, "total_tokens", 0) or 0
         if total_tokens:
             return max(0, total_tokens - (prompt_tokens if prompt_tokens is not None else estimated_prompt_tokens))
-    return count_tokens(output_text, model_name) if output_text else 0
+    counter = token_counter or count_tokens
+    return counter(output_text, model_name) if output_text else 0
 
 
 @dataclass
@@ -177,8 +179,8 @@ class SyncStreamSession:
 
     def _record_failure(self, handle: StreamHandle | None, exc: BaseException) -> None:
         if handle is not None and handle.breaker is not None:
-            if isinstance(exc, Exception):
-                handle.breaker.record(ok=not is_health_failure(exc), probe=handle.probe)
+            if isinstance(exc, Exception) and is_health_failure(exc):
+                handle.breaker.record(ok=False, probe=handle.probe)
             else:
                 handle.breaker.abandon(handle.probe)
         status = ExecutionStatus.FAILED_RETRYABLE if isinstance(exc, Exception) and _is_retryable(exc) else ExecutionStatus.FAILED_TERMINAL
@@ -219,7 +221,10 @@ class SyncStreamSession:
         handle = self._active
         try:
             if handle is not None and handle.breaker is not None:
-                handle.breaker.record(ok=status == ExecutionStatus.COMPLETED, probe=handle.probe)
+                handle.breaker.record(
+                    ok=status in (ExecutionStatus.COMPLETED, ExecutionStatus.INCOMPLETE),
+                    probe=handle.probe,
+                )
             if self._on_complete is not None:
                 self._on_complete(
                     self._last_usage,
@@ -427,8 +432,8 @@ class AsyncStreamSession:
 
     async def _record_failure(self, handle: StreamHandle | None, exc: BaseException) -> None:
         if handle is not None and handle.breaker is not None:
-            if isinstance(exc, Exception):
-                handle.breaker.record(ok=not is_health_failure(exc), probe=handle.probe)
+            if isinstance(exc, Exception) and is_health_failure(exc):
+                handle.breaker.record(ok=False, probe=handle.probe)
             else:
                 handle.breaker.abandon(handle.probe)
         status = (
@@ -473,7 +478,10 @@ class AsyncStreamSession:
         handle = self._active
         try:
             if handle is not None and handle.breaker is not None:
-                handle.breaker.record(ok=status == ExecutionStatus.COMPLETED, probe=handle.probe)
+                handle.breaker.record(
+                    ok=status in (ExecutionStatus.COMPLETED, ExecutionStatus.INCOMPLETE),
+                    probe=handle.probe,
+                )
             if self._on_complete is not None:
                 result = self._on_complete(
                     self._last_usage,

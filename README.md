@@ -5,7 +5,7 @@ Azure AI Foundry, Anthropic and Vertex AI. Switch providers by changing the cons
 call sites stay the same. Rate limits, retries, a circuit breaker, backup failover and context handling
 are built in, and they behave the same for every provider.
 
-Supported in 0.1.6: sync and async chat completions (streaming and structured output), embeddings, the
+Supported in 0.1.7: sync and async chat completions (streaming and structured output), embeddings, the
 Responses API, rate limiting, retries, a circuit breaker, backup failover, context truncation, batching,
 observability hooks, and the agentic features (the optional `agentic` extra): a chat model with a bounded
 tool loop, and an agent with reflection, tool execution, checkpoints and resume, model routing, specialists
@@ -302,8 +302,11 @@ Which of these work depends on the model and the endpoint. Token counting and th
 provided by the service and may return an error for a given deployment. Service errors are raised as
 `ResponsesError` with the service's message.
 
-**Checks before sending.** Responses requests are validated first. Unknown request fields raise
-`InvalidResponseRequestError`. Remote MCP servers and connectors are rejected unless you allow them:
+**Checks before sending.** Responses requests are validated first. Unknown request fields, or `extra_body`
+keys that would override validated contract fields (`tools`, `background`, `previous_response_id`,
+`conversation`, `store`), raise `InvalidResponseRequestError`. Remote MCP servers and connectors are
+rejected unless you allow them, and MCP `server_url` values must be `https://` URLs without embedded
+credentials or private/loopback/link-local addresses:
 
 ```python
 client = LLMSwitch(

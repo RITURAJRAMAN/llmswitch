@@ -194,20 +194,20 @@ class OpenAIChatProvider(BaseChatProvider):
             raise TimeOutError(configured_timeout_seconds(self.timeout)) from e
         except openai.BadRequestError as e:
             logger.error("OpenAI bad request error | Exception: %s", e)
-            raise ChatCompletionError(str(e), status_code=400) from e
-        except ConnectionError as e:
+            raise ChatCompletionError(str(e), status_code=400, provider="openai") from e
+        except (openai.APIConnectionError, ConnectionError) as e:
             logger.error("Connection error in chat completion: %s | Exception: %s", self.endpoint, e)
-            raise APIConnectionError(self.endpoint or "https://api.openai.com") from e
+            raise APIConnectionError(self.endpoint or "https://api.openai.com", provider="openai") from e
         except PermissionError as e:
             logger.error("Authentication error in chat completion | Exception: %s", e)
-            raise AuthenticationError() from e
+            raise AuthenticationError(provider="openai") from e
         except ValueError as e:
             logger.error("Invalid response in chat completion | Exception: %s", e)
-            raise InvalidResponseError(str(e)) from e
+            raise InvalidResponseError(str(e), provider="openai") from e
         except Exception as e:
             status_code = getattr(e, "status_code", 500)
             logger.error("Chat completion error | Exception: %s", e)
-            raise ChatCompletionError(str(e), status_code=status_code) from e
+            raise ChatCompletionError(str(e), status_code=status_code, provider="openai") from e
 
     def _streaming_create(self, messages: list[dict[str, Any]], **kwargs: Any) -> Generator[
         ChatCompletionChunk, None, None]:
@@ -311,23 +311,28 @@ class OpenAIChatProvider(BaseChatProvider):
             raise TimeOutError(configured_timeout_seconds(self.timeout)) from e
         except openai.BadRequestError as e:
             logger.error("OpenAI streaming bad request error | Exception: %s", e)
-            raise ChatCompletionError(str(e), status_code=400) from e
-        except ConnectionError as e:
+            raise ChatCompletionError(str(e), status_code=400, provider="openai") from e
+        except (openai.APIConnectionError, ConnectionError) as e:
             logger.error("OpenAI streaming connection error: %s", e)
-            raise APIConnectionError(self.endpoint or "https://api.openai.com") from e
+            raise APIConnectionError(self.endpoint or "https://api.openai.com", provider="openai") from e
         except PermissionError as e:
             logger.error("OpenAI streaming authentication error: %s", e)
-            raise AuthenticationError() from e
+            raise AuthenticationError(provider="openai") from e
         except ValueError as e:
             logger.error("OpenAI streaming invalid response: %s", e)
-            raise InvalidResponseError(str(e)) from e
+            raise InvalidResponseError(str(e), provider="openai") from e
         except Exception as e:
             status_code = getattr(e, "status_code", 500)
             logger.error("OpenAI streaming error: %s", e)
-            raise ChatCompletionError(str(e), status_code=status_code) from e
+            raise ChatCompletionError(str(e), status_code=status_code, provider="openai") from e
         finally:
             if stream is not None:
                 close_stream(stream)
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
 
 
 def _openai_embedding_response(response: Any) -> CreateEmbeddingResponse:
@@ -345,19 +350,23 @@ def _openai_embedding_response(response: Any) -> CreateEmbeddingResponse:
     )
 
 
-def _translate_embedding_error(exc: Exception, endpoint: str) -> Exception:
+def _translate_embedding_error(exc: Exception, endpoint: str, timeout_seconds: Any = None) -> Exception:
     """Return the library error for a failed embeddings call, so it can be raised with the original as its cause."""
-    if isinstance(exc, ConnectionError):
-        logger.error("Connection error in embedding creation: %s | Exception: %s", endpoint, exc)
-        return APIConnectionError(endpoint)
-    if isinstance(exc, PermissionError):
+    if isinstance(exc, openai.RateLimitError):
+        return RateLimitExceededError(get_retry_after_seconds(exc))
+    if isinstance(exc, (openai.AuthenticationError, PermissionError)):
         logger.error("Authentication error in embedding creation | Exception: %s", exc)
-        return AuthenticationError()
+        return AuthenticationError(provider="openai")
+    if isinstance(exc, openai.APITimeoutError):
+        return TimeOutError(configured_timeout_seconds(timeout_seconds))
+    if isinstance(exc, (openai.APIConnectionError, ConnectionError)):
+        logger.error("Connection error in embedding creation: %s | Exception: %s", endpoint, exc)
+        return APIConnectionError(endpoint, provider="openai")
     if isinstance(exc, ValueError):
         logger.error("Invalid response in embedding creation | Exception: %s", exc)
-        return InvalidResponseError(str(exc))
+        return InvalidResponseError(str(exc), provider="openai")
     logger.error("Embedding generation error | Exception: %s", exc)
-    return EmbeddingGenerationError(str(exc), status_code=getattr(exc, "status_code", 500))
+    return EmbeddingGenerationError(str(exc), status_code=getattr(exc, "status_code", 500), provider="openai")
 
 
 class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
@@ -390,7 +399,12 @@ class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
             response = self.client.embeddings.create(model=kwargs.pop("model", self.model), input=input, **kwargs)
             return _openai_embedding_response(response)
         except Exception as e:
-            raise _translate_embedding_error(e, self.endpoint or "https://api.openai.com") from e
+            raise _translate_embedding_error(e, self.endpoint or "https://api.openai.com", self.timeout) from e
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
 
 
 class AsyncOpenAIEmbeddingProvider(OpenAIEmbeddingProvider):
@@ -404,7 +418,7 @@ class AsyncOpenAIEmbeddingProvider(OpenAIEmbeddingProvider):
             response = await self.client.embeddings.create(model=kwargs.pop("model", self.model), input=input, **kwargs)
             return _openai_embedding_response(response)
         except Exception as e:
-            raise _translate_embedding_error(e, self.endpoint or "https://api.openai.com") from e
+            raise _translate_embedding_error(e, self.endpoint or "https://api.openai.com", self.timeout) from e
 
     async def aclose(self) -> None:
         await self.client.close()
@@ -502,9 +516,15 @@ class AsyncOpenAIChatProvider(BaseChatProvider):
         except openai.APITimeoutError as e:
             raise TimeOutError(configured_timeout_seconds(self.timeout)) from e
         except openai.BadRequestError as e:
-            raise ChatCompletionError(str(e), status_code=400) from e
+            raise ChatCompletionError(str(e), status_code=400, provider="openai") from e
+        except (openai.APIConnectionError, ConnectionError) as e:
+            raise APIConnectionError(self.endpoint or "https://api.openai.com", provider="openai") from e
+        except PermissionError as e:
+            raise AuthenticationError(provider="openai") from e
+        except ValueError as e:
+            raise InvalidResponseError(str(e), provider="openai") from e
         except Exception as e:
-            raise ChatCompletionError(str(e), status_code=getattr(e, "status_code", 500)) from e
+            raise ChatCompletionError(str(e), status_code=getattr(e, "status_code", 500), provider="openai") from e
 
     async def _streaming_create(self, messages: list[dict[str, Any]], **kwargs: Any) -> AsyncGenerator[
         ChatCompletionChunk, None]:
@@ -587,12 +607,23 @@ class AsyncOpenAIChatProvider(BaseChatProvider):
         except openai.APITimeoutError as e:
             raise TimeOutError(configured_timeout_seconds(self.timeout)) from e
         except openai.BadRequestError as e:
-            raise ChatCompletionError(str(e), status_code=400) from e
+            raise ChatCompletionError(str(e), status_code=400, provider="openai") from e
+        except (openai.APIConnectionError, ConnectionError) as e:
+            raise APIConnectionError(self.endpoint or "https://api.openai.com", provider="openai") from e
+        except PermissionError as e:
+            raise AuthenticationError(provider="openai") from e
+        except ValueError as e:
+            raise InvalidResponseError(str(e), provider="openai") from e
         except Exception as e:
-            raise ChatCompletionError(str(e), status_code=getattr(e, "status_code", 500)) from e
+            raise ChatCompletionError(str(e), status_code=getattr(e, "status_code", 500), provider="openai") from e
         finally:
             if stream is not None:
                 await close_async_stream(stream)
+
+    async def aclose(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            await close()
 
 
 def _openai_client_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:

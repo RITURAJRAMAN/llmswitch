@@ -541,5 +541,15 @@ class ToolLoopLimitError(LLMSwitchError):
         Args:
             max_steps (int): The step limit that was reached.
         """
-        super().__init__(f"The model still requested tools after {max_steps} model calls.")
+        super().__init__(
+            f"The model still requested tools after {max_steps} model calls.",
+            max_steps=max_steps,
+        )
         self.max_steps = max_steps
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "max_steps":
+            ctx = self.__dict__.get("context") or {}
+            if "max_steps" in ctx:
+                return ctx["max_steps"]
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")

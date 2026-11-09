@@ -22,13 +22,18 @@ _INHERITED_KEYS = (
     "timeout",
     "max_retries",
     "retry_base_delay",
+    "retry_deadline",
     "completion_context_window",
+    "context_output_reserve_tokens",
+    "context_overhead_tokens",
     "rpm",
     "tpm",
     "embedding_rpm",
     "embedding_tpm",
     "user_id",
     "enable_prompt_caching",
+    "mcp_policy",
+    "responses_capabilities",
 )
 
 
@@ -105,7 +110,12 @@ def build_backup_execution_plan(
     if backup_config is None:
         return None
     request = dict(normalized_request)
-    request.pop("model", None)
+    if (
+        getattr(backup_config, "deployment_name", None)
+        or getattr(backup_config, "model", None)
+        or backup_config.provider != getattr(primary_config, "provider", None)
+    ):
+        request.pop("model", None)
     return backup_config, build_execution_plan(
         backup_config,
         operation=operation,

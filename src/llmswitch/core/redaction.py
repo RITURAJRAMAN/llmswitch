@@ -5,6 +5,7 @@ Helper for stripping sensitive fields out of structures before they are logged.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 # Exact (case-insensitive) key names whose values must never be logged. Exact
@@ -12,7 +13,8 @@ from typing import Any
 # ``token``.
 _SENSITIVE_KEYS: frozenset[str] = frozenset({
     "api_key", "apikey", "api-key", "x-api-key", "x-goog-api-key", "openai-api-key",
-    "endpoint", "azure_endpoint", "base_url",
+    "ocp-apim-subscription-key",
+    "endpoint", "azure_endpoint", "base_url", "server_url",
     "redis_url",
     "credentials", "credentials_path",
     "authorization", "auth", "proxy-authorization", "cookie", "set-cookie",
@@ -36,7 +38,7 @@ def redact_sensitive(data: Any) -> Any:
     input is not mutated — a redacted copy is returned (scalars pass through
     unchanged).
     """
-    if isinstance(data, dict):
+    if isinstance(data, Mapping):
         return {
             k: (_REDACTED if isinstance(k, str) and k.lower() in _SENSITIVE_KEYS
                 else redact_sensitive(v))
@@ -44,4 +46,10 @@ def redact_sensitive(data: Any) -> Any:
         }
     if isinstance(data, (list, tuple)):
         return [redact_sensitive(v) for v in data]
+    model_dump = getattr(data, "model_dump", None)
+    if callable(model_dump) and not isinstance(data, type):
+        try:
+            return redact_sensitive(model_dump(exclude_none=True))
+        except Exception:  # noqa: BLE001
+            return data
     return data

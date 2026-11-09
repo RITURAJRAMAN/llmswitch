@@ -235,7 +235,11 @@ def _text(content: Any) -> str:
         return content
     if not content:
         return ""
-    return "".join(block.get("text", "") for block in content if isinstance(block, dict))
+    return "".join(
+        block if isinstance(block, str) else block.get("text", "")
+        for block in content
+        if isinstance(block, (str, dict))
+    )
 
 
 def _transcript(messages: Sequence[BaseMessage]) -> str:
@@ -264,7 +268,16 @@ def _transcript(messages: Sequence[BaseMessage]) -> str:
 
 
 def _reflection_request(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
-    return [HumanMessage(content=f"Conversation so far:\n{_transcript(messages)}\n\n{REFLECTION_PROMPT}")]
+    escaped = _transcript(messages).replace("</conversation_transcript>", "<\\/conversation_transcript>")
+    return [
+        HumanMessage(
+            content=(
+                "Conversation so far:\n"
+                f"<conversation_transcript>\n{escaped}\n</conversation_transcript>\n\n"
+                f"{REFLECTION_PROMPT}"
+            )
+        )
+    ]
 
 
 def _verdict(reply: Any) -> tuple[bool, str] | None:
@@ -275,7 +288,14 @@ def _verdict(reply: Any) -> tuple[bool, str] | None:
     try:
         value = json.loads(text)
     except (TypeError, ValueError):
-        return None
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end <= start:
+            return None
+        try:
+            value = json.loads(text[start : end + 1])
+        except (TypeError, ValueError):
+            return None
     if not isinstance(value, dict) or not isinstance(value.get("is_sufficient"), bool):
         return None
     return value["is_sufficient"], value.get("feedback") or "Improve answer quality and correctness."
@@ -426,6 +446,7 @@ class Agent:
         if "status" in plan:  # already a final result, such as an uncertain tool execution
             return plan
         result = self._drive(**plan)
+        self._routing_state.update(plan["routing"])
         return result
 
     async def aresume(self, checkpoint_id: str, user_feedback: str | None = None) -> dict[str, Any]:
@@ -441,7 +462,9 @@ class Agent:
         plan = self._restore(checkpoint_id, user_feedback)
         if "status" in plan:
             return plan
-        return await self._adrive(**plan)
+        result = await self._adrive(**plan)
+        self._routing_state.update(plan["routing"])
+        return result
 
     # --- the loop ---------------------------------------------------------------------------
 
@@ -463,15 +486,18 @@ class Agent:
                 messages.append(answer)
                 if budget.runtime_exceeded():
                     return self._stopped("max_runtime_exceeded", messages, [*steps, record])
-                pending = _Pending("tools" if answer.tool_calls else "reflect", record, llm=llm)
+                has_tools = bool(answer.tool_calls or getattr(answer, "invalid_tool_calls", None))
+                pending = _Pending("tools" if has_tools else "reflect", record, llm=llm)
             if pending.kind == "reflect":
                 llm = pending.llm or self._choose(messages, step, had_tool_error, routing)
                 if not self.config.reflection_enabled:
                     return self._completed("completed", messages, [*steps, pending.record], step)
                 self._save(self._state_for(routing, "awaiting_reflection", messages, steps, step, budget,
                                        reflection_retries, had_tool_error, pending=pending.record))
-                verdict = self._reflect(llm, messages)
+                verdict = self._reflect(llm, messages, budget)
                 if verdict is None:
+                    if budget.runtime_exceeded():
+                        return self._stopped("max_runtime_exceeded", messages, [*steps, pending.record])
                     return self._stopped("reflection_verdict_unreadable", messages, [*steps, pending.record])
                 ok, feedback = verdict
                 if budget.runtime_exceeded():
@@ -497,7 +523,7 @@ class Agent:
                 checkpoint_id = str(uuid.uuid4())
                 pending.journal = _Journal(self.checkpoint_store, checkpoint_id, state, len(record.tool_calls))
                 self.checkpoint_store.save(checkpoint_id, state)
-            record.tool_results = self._run_tools(step, record, pending.journal, pending.prior)
+            record.tool_results = self._run_tools(step, record, pending.journal, pending.prior, budget)
             messages.extend(result.as_tool_message() for result in record.tool_results)
             steps.append(record)
             had_tool_error = any(not result.ok for result in record.tool_results)
@@ -528,15 +554,18 @@ class Agent:
                 messages.append(answer)
                 if budget.runtime_exceeded():
                     return self._stopped("max_runtime_exceeded", messages, [*steps, record])
-                pending = _Pending("tools" if answer.tool_calls else "reflect", record, llm=llm)
+                has_tools = bool(answer.tool_calls or getattr(answer, "invalid_tool_calls", None))
+                pending = _Pending("tools" if has_tools else "reflect", record, llm=llm)
             if pending.kind == "reflect":
                 llm = pending.llm or self._choose(messages, step, had_tool_error, routing)
                 if not self.config.reflection_enabled:
                     return self._completed("completed", messages, [*steps, pending.record], step)
                 self._save(self._state_for(routing, "awaiting_reflection", messages, steps, step, budget,
                                        reflection_retries, had_tool_error, pending=pending.record))
-                verdict = await self._areflect(llm, messages)
+                verdict = await self._areflect(llm, messages, budget)
                 if verdict is None:
+                    if budget.runtime_exceeded():
+                        return self._stopped("max_runtime_exceeded", messages, [*steps, pending.record])
                     return self._stopped("reflection_verdict_unreadable", messages, [*steps, pending.record])
                 ok, feedback = verdict
                 if budget.runtime_exceeded():
@@ -561,7 +590,7 @@ class Agent:
                 checkpoint_id = str(uuid.uuid4())
                 pending.journal = _Journal(self.checkpoint_store, checkpoint_id, state, len(record.tool_calls))
                 self.checkpoint_store.save(checkpoint_id, state)
-            record.tool_results = await self._arun_tools(step, record, pending.journal, pending.prior)
+            record.tool_results = await self._arun_tools(step, record, pending.journal, pending.prior, budget)
             messages.extend(result.as_tool_message() for result in record.tool_results)
             steps.append(record)
             had_tool_error = any(not result.ok for result in record.tool_results)
@@ -673,10 +702,11 @@ class Agent:
         return params.get("model")
 
     def _record(self, step_number: int, answer: AIMessage, llm: BaseChatModel) -> AgentStep:
+        all_calls = list(answer.tool_calls or []) + list(getattr(answer, "invalid_tool_calls", None) or [])
         return AgentStep(
             step=step_number,
             assistant_content=_text(answer.content),
-            tool_calls=list(answer.tool_calls or []),
+            tool_calls=all_calls,
             model_used=self._model_name(llm),
         )
 
@@ -713,43 +743,62 @@ class Agent:
             return llm.bind(max_tokens=REFLECTION_MIN_OUTPUT_TOKENS)
         return llm
 
-    def _reflect(self, llm: BaseChatModel, messages: list[BaseMessage]) -> tuple[bool, str] | None:
+    def _reflect(
+        self, llm: BaseChatModel, messages: list[BaseMessage], budget: _Budget | None = None
+    ) -> tuple[bool, str] | None:
         """The verdict, or ``None`` when the check gave no readable verdict in ``REFLECTION_ATTEMPTS`` tries."""
         checker = self._reflection_model(llm)
         for _ in range(REFLECTION_ATTEMPTS):
+            if budget is not None and budget.runtime_exceeded():
+                return None
             verdict = _verdict(checker.invoke(_reflection_request(messages)))
             if verdict is not None:
                 return verdict
         return None
 
-    async def _areflect(self, llm: BaseChatModel, messages: list[BaseMessage]) -> tuple[bool, str] | None:
+    async def _areflect(
+        self, llm: BaseChatModel, messages: list[BaseMessage], budget: _Budget | None = None
+    ) -> tuple[bool, str] | None:
         """Async :meth:`_reflect`."""
         checker = self._reflection_model(llm)
         for _ in range(REFLECTION_ATTEMPTS):
+            if budget is not None and budget.runtime_exceeded():
+                return None
             verdict = _verdict(await checker.ainvoke(_reflection_request(messages)))
             if verdict is not None:
                 return verdict
         return None
 
     def _run_tools(self, step_number: int, record: AgentStep, journal: _Journal,
-                   prior: list[ToolExecutionResult | None] | None) -> list[ToolExecutionResult]:
+                   prior: list[ToolExecutionResult | None] | None,
+                   budget: _Budget | None = None) -> list[ToolExecutionResult]:
         """Run the tools that have not finished yet, then retry the retryable failures among them."""
         cfg = self.config
+        timeout_s = (
+            min(cfg.tool_timeout_seconds, max(0.001, budget.remaining_seconds()))
+            if budget is not None
+            else cfg.tool_timeout_seconds
+        )
         calls = list(record.tool_calls)
         indices = [i for i in range(len(calls)) if prior is None or prior[i] is None]
         results: list[ToolExecutionResult | None] = list(prior) if prior is not None else [None] * len(calls)
         if indices:
             subset = [calls[i] for i in indices]
             fresh = execute_tool_calls(
-                step=step_number, tool_calls=subset, tool_map=self._tool_map, timeout_s=cfg.tool_timeout_seconds, isolation=cfg.tool_isolation,
+                step=step_number, tool_calls=subset, tool_map=self._tool_map, timeout_s=timeout_s, isolation=cfg.tool_isolation,
                 parallel=cfg.parallel_tools, max_concurrency=cfg.max_concurrency, handler=self.event_handler,
                 on_start=lambda local: journal.start(indices[local]),
                 on_result=lambda local, result: journal.result(indices[local], result),
             )
             if cfg.tool_retry_attempts and any(not result.ok for result in fresh):
+                retry_timeout = (
+                    min(cfg.tool_timeout_seconds, max(0.001, budget.remaining_seconds()))
+                    if budget is not None
+                    else cfg.tool_timeout_seconds
+                )
                 fresh = retry_failed_tool_calls(
                     step=step_number, tool_calls=subset, results=fresh, tool_map=self._tool_map,
-                    timeout_s=cfg.tool_timeout_seconds, isolation=cfg.tool_isolation, attempts=cfg.tool_retry_attempts,
+                    timeout_s=retry_timeout, isolation=cfg.tool_isolation, attempts=cfg.tool_retry_attempts,
                     backoff_seconds=cfg.tool_retry_backoff_seconds,
                     retry_on_tool_not_found=cfg.retry_on_tool_not_found,
                     retry_non_idempotent=cfg.retry_non_idempotent_tools,
@@ -762,24 +811,35 @@ class Agent:
         return [result for result in results if result is not None]
 
     async def _arun_tools(self, step_number: int, record: AgentStep, journal: _Journal,
-                          prior: list[ToolExecutionResult | None] | None) -> list[ToolExecutionResult]:
+                          prior: list[ToolExecutionResult | None] | None,
+                          budget: _Budget | None = None) -> list[ToolExecutionResult]:
         """Async :meth:`_run_tools`."""
         cfg = self.config
+        timeout_s = (
+            min(cfg.tool_timeout_seconds, max(0.001, budget.remaining_seconds()))
+            if budget is not None
+            else cfg.tool_timeout_seconds
+        )
         calls = list(record.tool_calls)
         indices = [i for i in range(len(calls)) if prior is None or prior[i] is None]
         results: list[ToolExecutionResult | None] = list(prior) if prior is not None else [None] * len(calls)
         if indices:
             subset = [calls[i] for i in indices]
             fresh = await aexecute_tool_calls(
-                step=step_number, tool_calls=subset, tool_map=self._tool_map, timeout_s=cfg.tool_timeout_seconds, isolation=cfg.tool_isolation,
+                step=step_number, tool_calls=subset, tool_map=self._tool_map, timeout_s=timeout_s, isolation=cfg.tool_isolation,
                 parallel=cfg.parallel_tools, max_concurrency=cfg.max_concurrency, handler=self.event_handler,
                 on_start=lambda local: journal.start(indices[local]),
                 on_result=lambda local, result: journal.result(indices[local], result),
             )
             if cfg.tool_retry_attempts and any(not result.ok for result in fresh):
+                retry_timeout = (
+                    min(cfg.tool_timeout_seconds, max(0.001, budget.remaining_seconds()))
+                    if budget is not None
+                    else cfg.tool_timeout_seconds
+                )
                 fresh = await aretry_failed_tool_calls(
                     step=step_number, tool_calls=subset, results=fresh, tool_map=self._tool_map,
-                    timeout_s=cfg.tool_timeout_seconds, isolation=cfg.tool_isolation, attempts=cfg.tool_retry_attempts,
+                    timeout_s=retry_timeout, isolation=cfg.tool_isolation, attempts=cfg.tool_retry_attempts,
                     backoff_seconds=cfg.tool_retry_backoff_seconds,
                     retry_on_tool_not_found=cfg.retry_on_tool_not_found,
                     retry_non_idempotent=cfg.retry_non_idempotent_tools,
